@@ -1,30 +1,45 @@
 import { loadConfig } from "./core/config.js";
 import { createLogger, setLogLevel } from "./core/logger.js";
+import type { AppConfig, Opportunity } from "./core/types.js";
+
+// Feeds
 import { BinanceFeed } from "./feeds/binance-ws.js";
 import { CoinbaseFeed } from "./feeds/coinbase-ws.js";
 import { PolymarketRestClient } from "./feeds/polymarket-rest.js";
-import { PolymarketFeed } from "./feeds/polymarket-ws.js";
+import { PolymarketWsFeed } from "./feeds/polymarket-ws.js";
 import { FeedAggregator } from "./feeds/feed-aggregator.js";
+
+// Strategies
 import { TemporalArbStrategy } from "./strategies/temporal-arb.js";
 import { CorrelatedContractsStrategy } from "./strategies/correlated-contracts.js";
+
+// Execution
 import { OrderBuilder } from "./execution/order-builder.js";
 import { OrderExecutor } from "./execution/order-executor.js";
 import { RiskManager } from "./execution/risk-manager.js";
 import { PositionTracker } from "./execution/position-tracker.js";
+
+// Monitoring
 import { TelegramNotifier } from "./monitoring/telegram.js";
 import { DiscordNotifier } from "./monitoring/discord.js";
 import { PnlTracker } from "./monitoring/pnl-tracker.js";
 import { HealthChecker } from "./monitoring/health-check.js";
 import { DailyReporter } from "./monitoring/daily-report.js";
-import type { Opportunity } from "./core/types.js";
 
 const log = createLogger("main");
 
 async function main(): Promise<void> {
   // Load and validate config
-  const config = loadConfig();
-  setLogLevel(config.logLevel);
+  let config: AppConfig;
+  try {
+    config = loadConfig();
+  } catch (err) {
+    // Can't use logger if config fails (log level not set)
+    process.stderr.write(`FATAL: Config error: ${err instanceof Error ? err.message : String(err)}\n`);
+    process.exit(1);
+  }
 
+  setLogLevel(config.logLevel);
   log.info("Project Gecko starting", {
     liveTrading: config.liveTrading,
     killSwitch: config.killSwitch,
@@ -33,174 +48,126 @@ async function main(): Promise<void> {
     minSpreadThreshold: config.minSpreadThreshold,
   });
 
-  // -- Initialize core components --
+  // Initialize feeds
+  const binance = new BinanceFeed(config.binanceWsUrl);
+  const coinbase = new CoinbaseFeed(config.coinbaseWsUrl);
+  const polyRest = new PolymarketRestClient(config.polymarketClobUrl);
+  const polyWs = new PolymarketWsFeed();
+  const aggregator = new FeedAggregator(binance, coinbase, polyWs);
 
-  const aggregator = new FeedAggregator();
-  const polymarketRest = new PolymarketRestClient(config.polymarketClobUrl);
-  const positionTracker = new PositionTracker();
-  const riskManager = new RiskManager(config, positionTracker);
-
-  // -- Initialize execution --
-
+  // Initialize execution
+  const positions = new PositionTracker();
   const orderBuilder = new OrderBuilder(config);
-  try {
-    await orderBuilder.initialize();
-  } catch (err) {
-    log.error("Failed to initialize order builder", {
-      error: err instanceof Error ? err.message : String(err),
-    });
-    // Continue in scan-only mode
-    log.warn("Running in scan-only mode due to order builder initialization failure");
+  const riskManager = new RiskManager(config, positions, aggregator);
+
+  // Only initialize order signing if live trading is possible
+  if (config.liveTrading) {
+    try {
+      await orderBuilder.initialize();
+      log.info("Order builder ready for live trading");
+    } catch (err) {
+      log.error("Failed to initialize order builder, disabling live trading", {
+        error: err instanceof Error ? err.message : String(err),
+      });
+      riskManager.activateKillSwitch("Order builder initialization failed");
+    }
   }
 
-  const orderExecutor = new OrderExecutor(orderBuilder, riskManager, positionTracker);
+  const executor = new OrderExecutor(config, orderBuilder, riskManager, positions, polyRest);
 
-  // -- Initialize monitoring --
-
+  // Initialize monitoring
   const telegram = new TelegramNotifier(config.telegramBotToken, config.telegramChatId);
   const discord = new DiscordNotifier(config.discordWebhookUrl);
-  const pnlTracker = new PnlTracker(positionTracker);
-  const healthChecker = new HealthChecker(positionTracker, riskManager);
-  const dailyReporter = new DailyReporter(pnlTracker, positionTracker, telegram, discord);
+  const pnlTracker = new PnlTracker(positions);
+  const healthChecker = new HealthChecker(binance, coinbase, polyWs, positions, riskManager);
+  const dailyReporter = new DailyReporter(config, pnlTracker, healthChecker, telegram, discord);
 
-  // -- Initialize feeds --
-
-  const binanceFeed = new BinanceFeed(config.binanceWsUrl);
-  const coinbaseFeed = new CoinbaseFeed(config.coinbaseWsUrl);
-  const polymarketFeed = new PolymarketFeed();
-
-  // Wire price handlers
-  binanceFeed.setPriceHandler((price) => {
-    aggregator.updateSpotPrice(price);
-  });
-
-  coinbaseFeed.setPriceHandler((price) => {
-    aggregator.updateSpotPrice(price);
-  });
-
-  polymarketFeed.setPriceHandler((update) => {
-    aggregator.updateContractPrice(update);
-  });
-
-  // Register feed health providers
-  healthChecker.addFeedProvider(() => binanceFeed.getHealth());
-  healthChecker.addFeedProvider(() => coinbaseFeed.getHealth());
-  healthChecker.addFeedProvider(() => polymarketFeed.getHealth());
-
-  // -- Initialize strategies --
-
-  const temporalArb = new TemporalArbStrategy(config, aggregator, polymarketRest);
-  const correlatedContracts = new CorrelatedContractsStrategy(config, polymarketRest);
-
-  // Wire opportunity handler (shared by all strategies)
-  const handleOpportunity = async (opportunity: Opportunity): Promise<void> => {
-    dailyReporter.incrementOpportunities();
-
+  // Opportunity handler: shared across all strategies
+  const handleOpportunity = async (opp: Opportunity): Promise<void> => {
     log.info("Opportunity detected", {
-      id: opportunity.id,
-      strategy: opportunity.strategy,
-      spread: opportunity.expectedSpread.toFixed(2) + "%",
-      confidence: opportunity.confidence.toFixed(3),
+      id: opp.id,
+      strategy: opp.strategy,
+      spread: opp.expectedSpread.toFixed(2),
+      confidence: opp.confidence.toFixed(2),
     });
 
-    // Execute if live trading is enabled
     if (config.liveTrading) {
-      const feedHealths = healthChecker.getFeedHealths();
-      const result = await orderExecutor.executeOpportunity(opportunity, feedHealths);
-
-      if (result && (result.status === "filled" || result.status === "partial")) {
-        await telegram.sendTradeAlert(
-          opportunity.strategy,
-          opportunity.description,
-          opportunity.params.side,
-          result.fillPrice,
-          result.fillSize,
-          result.status,
-        );
-        await discord.sendTradeAlert(
-          opportunity.strategy,
-          opportunity.description,
-          opportunity.params.side,
-          result.fillPrice,
-          result.fillSize,
-          result.status,
-        );
+      const result = await executor.executeOpportunity(opp);
+      if (result && result.status === "filled") {
+        const msg = `Trade executed: ${opp.strategy}\n${opp.description}\nFill: $${result.fillPrice} x ${result.fillSize}`;
+        await Promise.all([
+          telegram.sendAlert("Trade Executed", msg),
+          discord.sendEmbed("Trade Executed", msg, 0x00ff00),
+        ]);
       }
     }
   };
 
+  // Initialize strategies
+  const temporalArb = new TemporalArbStrategy(config, aggregator, polyRest, polyWs);
   temporalArb.setOpportunityHandler((opp) => {
     handleOpportunity(opp).catch((err) => {
-      log.error("Error handling temporal arb opportunity", {
+      log.error("Error handling temporal-arb opportunity", {
         error: err instanceof Error ? err.message : String(err),
       });
     });
   });
 
+  const correlatedContracts = new CorrelatedContractsStrategy(config, polyRest);
   correlatedContracts.setOpportunityHandler((opp) => {
     handleOpportunity(opp).catch((err) => {
-      log.error("Error handling correlated contracts opportunity", {
+      log.error("Error handling correlated-contracts opportunity", {
         error: err instanceof Error ? err.message : String(err),
       });
     });
   });
 
-  // -- Start everything --
+  // Start everything
+  log.info("Starting feeds...");
+  binance.start();
+  coinbase.start();
+  polyWs.start();
 
-  log.info("Starting data feeds");
-  binanceFeed.start();
-  coinbaseFeed.start();
-  polymarketFeed.start();
-
-  log.info("Starting strategies");
-  temporalArb.start();
+  log.info("Starting strategies...");
+  await temporalArb.start();
   correlatedContracts.start();
 
-  log.info("Starting monitoring");
+  log.info("Starting monitoring...");
+  healthChecker.start();
   dailyReporter.start();
 
-  // Health check every 60 seconds
-  const healthInterval = setInterval(() => {
-    healthChecker.check().catch((err) => {
-      log.error("Health check error", {
-        error: err instanceof Error ? err.message : String(err),
-      });
-    });
-  }, 60_000);
-
-  // P&L summary every 5 minutes
-  const pnlInterval = setInterval(() => {
-    pnlTracker.logSummary();
-  }, 5 * 60_000);
-
-  // Startup notification
-  await telegram.sendAlert("Project Gecko Started", [
+  // Send startup notification
+  const startupMsg = [
     `Mode: ${config.liveTrading ? "LIVE TRADING" : "SCAN ONLY"}`,
-    `Max position: $${config.maxPositionSize}`,
-    `Max exposure: $${config.maxTotalExposure}`,
-    `Min spread: ${config.minSpreadThreshold}%`,
-  ].join("\n"));
+    `Max Position: $${config.maxPositionSize}`,
+    `Max Exposure: $${config.maxTotalExposure}`,
+    `Min Spread: ${config.minSpreadThreshold}%`,
+    `Kill Switch: ${config.killSwitch ? "ACTIVE" : "inactive"}`,
+  ].join("\n");
 
-  log.info("Project Gecko running", {
-    mode: config.liveTrading ? "live" : "scan-only",
-  });
+  await Promise.all([
+    telegram.sendAlert("Gecko Bot Started", startupMsg),
+    discord.sendEmbed("Gecko Bot Started", startupMsg, 0x0099ff),
+  ]);
 
-  // -- Graceful shutdown --
+  log.info("Project Gecko fully initialized and running");
 
+  // Graceful shutdown
   const shutdown = async (signal: string): Promise<void> => {
-    log.info("Shutdown signal received", { signal });
+    log.info(`Shutdown signal received: ${signal}`);
 
     temporalArb.stop();
     correlatedContracts.stop();
+    healthChecker.stop();
     dailyReporter.stop();
-    clearInterval(healthInterval);
-    clearInterval(pnlInterval);
+    binance.stop();
+    coinbase.stop();
+    polyWs.stop();
 
-    binanceFeed.stop();
-    coinbaseFeed.stop();
-    polymarketFeed.stop();
-
-    await telegram.sendAlert("Project Gecko Stopped", `Signal: ${signal}`);
+    await Promise.all([
+      telegram.sendAlert("Gecko Bot Stopped", `Shutdown: ${signal}`),
+      discord.sendEmbed("Gecko Bot Stopped", `Shutdown: ${signal}`, 0xff0000),
+    ]);
 
     log.info("Shutdown complete");
     process.exit(0);
@@ -209,23 +176,23 @@ async function main(): Promise<void> {
   process.on("SIGINT", () => { shutdown("SIGINT").catch(() => process.exit(1)); });
   process.on("SIGTERM", () => { shutdown("SIGTERM").catch(() => process.exit(1)); });
 
+  // Unhandled rejection safety net
   process.on("unhandledRejection", (reason) => {
     log.error("Unhandled promise rejection", {
       error: reason instanceof Error ? reason.message : String(reason),
     });
   });
 
-  process.on("uncaughtException", (err) => {
-    log.error("Uncaught exception", { error: err.message, stack: err.stack });
-    shutdown("uncaughtException").catch(() => process.exit(1));
-  });
+  // Keep alive
+  setInterval(() => {
+    log.debug("Heartbeat", {
+      positions: positions.getOpenPositionCount(),
+      exposure: positions.getTotalExposure(),
+    });
+  }, 300_000);
 }
 
 main().catch((err) => {
-  const log = createLogger("main");
-  log.error("Fatal startup error", {
-    error: err instanceof Error ? err.message : String(err),
-    stack: err instanceof Error ? err.stack : undefined,
-  });
+  process.stderr.write(`FATAL: ${err instanceof Error ? err.message : String(err)}\n`);
   process.exit(1);
 });

@@ -5,41 +5,40 @@ import type { SpotPrice } from "../core/types.js";
 const log = createLogger("binance-ws");
 
 interface BinanceTradeMsg {
-  readonly stream?: string;
-  readonly data?: {
-    readonly e: string;
-    readonly s: string;
-    readonly p: string;
-    readonly T: number;
-  };
-  // Direct format (non-combined stream)
-  readonly e?: string;
-  readonly s?: string;
-  readonly p?: string;
-  readonly T?: number;
+  readonly e: string;
+  readonly s: string;
+  readonly p: string;
+  readonly q: string;
+  readonly T: number;
+  readonly m: boolean;
 }
+
+interface BinanceCombinedMsg {
+  readonly stream: string;
+  readonly data: BinanceTradeMsg;
+}
+
+type PriceCallback = (price: SpotPrice) => void;
 
 export class BinanceFeed {
   private readonly ws: WsManager;
-  private onPrice: ((price: SpotPrice) => void) | null = null;
+  private onPrice: PriceCallback | null = null;
 
   constructor(url: string) {
     this.ws = new WsManager({ url, name: "binance-ws" });
 
     this.ws.setMessageHandler((raw: unknown) => {
-      this.handleMessage(raw as BinanceTradeMsg);
-    });
-
-    this.ws.setConnectedHandler(() => {
-      log.info("Binance feed connected");
-    });
-
-    this.ws.setDisconnectedHandler(() => {
-      log.warn("Binance feed disconnected");
+      try {
+        this.handleMessage(raw);
+      } catch (err) {
+        log.error("Failed to handle message", {
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
     });
   }
 
-  setPriceHandler(handler: (price: SpotPrice) => void): void {
+  setPriceHandler(handler: PriceCallback): void {
     this.onPrice = handler;
   }
 
@@ -55,35 +54,23 @@ export class BinanceFeed {
     return this.ws.getHealth();
   }
 
-  private handleMessage(msg: BinanceTradeMsg): void {
-    try {
-      // Combined stream format: { stream: "btcusdt@trade", data: {...} }
-      const trade = msg.data ?? msg;
-      const eventType = trade.e ?? msg.e;
-      if (eventType !== "trade") return;
+  private handleMessage(raw: unknown): void {
+    const msg = raw as BinanceCombinedMsg;
+    const trade: BinanceTradeMsg = msg.data ?? (raw as BinanceTradeMsg);
 
-      const rawSymbol = trade.s ?? msg.s;
-      const rawPrice = trade.p ?? msg.p;
-      const rawTime = trade.T ?? msg.T;
+    if (trade.e !== "trade") return;
 
-      if (!rawSymbol || !rawPrice || !rawTime) return;
+    const symbol = this.normalizeSymbol(trade.s);
+    if (!symbol) return;
 
-      const symbol = this.normalizeSymbol(rawSymbol);
-      if (!symbol) return;
+    const price: SpotPrice = {
+      symbol,
+      price: parseFloat(trade.p),
+      timestamp: trade.T,
+      source: "binance",
+    };
 
-      const price: SpotPrice = {
-        symbol,
-        price: parseFloat(rawPrice),
-        timestamp: rawTime,
-        source: "binance",
-      };
-
-      this.onPrice?.(price);
-    } catch (err) {
-      log.warn("Failed to parse Binance message", {
-        error: err instanceof Error ? err.message : String(err),
-      });
-    }
+    this.onPrice?.(price);
   }
 
   private normalizeSymbol(raw: string): string | null {

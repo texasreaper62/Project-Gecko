@@ -1,85 +1,87 @@
 import { createLogger } from "../core/logger.js";
-import type { FeedHealth, HealthStatus } from "../core/types.js";
+import type { HealthStatus, FeedHealth } from "../core/types.js";
+import type { BinanceFeed } from "../feeds/binance-ws.js";
+import type { CoinbaseFeed } from "../feeds/coinbase-ws.js";
+import type { PolymarketWsFeed } from "../feeds/polymarket-ws.js";
 import type { PositionTracker } from "../execution/position-tracker.js";
 import type { RiskManager } from "../execution/risk-manager.js";
 
 const log = createLogger("health-check");
 
 export class HealthChecker {
-  private readonly positionTracker: PositionTracker;
+  private readonly binance: BinanceFeed;
+  private readonly coinbase: CoinbaseFeed;
+  private readonly polyWs: PolymarketWsFeed;
+  private readonly positions: PositionTracker;
   private readonly riskManager: RiskManager;
   private readonly startTime: number;
 
-  private feedProviders: (() => FeedHealth)[] = [];
-  private walletBalanceProvider: (() => Promise<number>) | null = null;
+  private timer: ReturnType<typeof setInterval> | null = null;
 
-  constructor(positionTracker: PositionTracker, riskManager: RiskManager) {
-    this.positionTracker = positionTracker;
+  constructor(
+    binance: BinanceFeed,
+    coinbase: CoinbaseFeed,
+    polyWs: PolymarketWsFeed,
+    positions: PositionTracker,
+    riskManager: RiskManager,
+  ) {
+    this.binance = binance;
+    this.coinbase = coinbase;
+    this.polyWs = polyWs;
+    this.positions = positions;
     this.riskManager = riskManager;
     this.startTime = Date.now();
   }
 
-  addFeedProvider(provider: () => FeedHealth): void {
-    this.feedProviders.push(provider);
+  start(intervalMs = 60_000): void {
+    this.timer = setInterval(() => {
+      this.check();
+    }, intervalMs);
+    log.info("Health checker started", { intervalMs });
   }
 
-  setWalletBalanceProvider(provider: () => Promise<number>): void {
-    this.walletBalanceProvider = provider;
+  stop(): void {
+    if (this.timer) {
+      clearInterval(this.timer);
+      this.timer = null;
+    }
   }
 
-  async getStatus(): Promise<HealthStatus> {
-    const feeds = this.feedProviders.map((p) => p());
-    let walletBalance = 0;
+  check(): HealthStatus {
+    const feeds: FeedHealth[] = [
+      this.binance.getHealth(),
+      this.coinbase.getHealth(),
+      this.polyWs.getHealth(),
+    ];
 
-    if (this.walletBalanceProvider) {
-      try {
-        walletBalance = await this.walletBalanceProvider();
-      } catch (err) {
-        log.warn("Failed to get wallet balance", {
-          error: err instanceof Error ? err.message : String(err),
+    const status: HealthStatus = {
+      timestamp: Date.now(),
+      feeds,
+      positions: this.positions.getOpenPositionCount(),
+      totalExposure: this.positions.getTotalExposure(),
+      walletBalance: 0, // TODO: query on-chain balance
+      killSwitch: this.riskManager.isKillSwitchActive(),
+      uptime: Date.now() - this.startTime,
+    };
+
+    // Log warnings for disconnected feeds
+    for (const feed of feeds) {
+      if (feed.status !== "connected") {
+        log.warn("Feed unhealthy", {
+          name: feed.name,
+          status: feed.status,
+          reconnectCount: feed.reconnectCount,
         });
       }
     }
 
-    return {
-      timestamp: Date.now(),
-      feeds,
-      positions: this.positionTracker.getOpenPositionCount(),
-      totalExposure: this.positionTracker.getTotalExposure(),
-      walletBalance,
-      killSwitch: this.riskManager.isKillSwitchActive(),
-      uptime: Date.now() - this.startTime,
-    };
-  }
-
-  getFeedHealths(): FeedHealth[] {
-    return this.feedProviders.map((p) => p());
-  }
-
-  async check(): Promise<void> {
-    const status = await this.getStatus();
-
-    const unhealthyFeeds = status.feeds.filter(
-      (f) => f.status !== "connected",
-    );
-
-    if (unhealthyFeeds.length > 0) {
-      log.warn("Unhealthy feeds detected", {
-        feeds: unhealthyFeeds.map((f) => ({ name: f.name, status: f.status })),
-      });
-    }
-
-    if (status.killSwitch) {
-      log.warn("Kill switch is active");
-    }
-
-    log.info("Health check complete", {
-      feeds: status.feeds.length,
-      unhealthy: unhealthyFeeds.length,
+    log.debug("Health check complete", {
+      feedsHealthy: feeds.every((f) => f.status === "connected"),
       positions: status.positions,
       exposure: status.totalExposure,
-      walletBalance: status.walletBalance,
-      uptimeMinutes: Math.round(status.uptime / 60_000),
+      uptimeHours: (status.uptime / 3_600_000).toFixed(1),
     });
+
+    return status;
   }
 }

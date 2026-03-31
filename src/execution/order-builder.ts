@@ -1,14 +1,19 @@
+import { ethers } from "ethers";
+import { ClobClient, Side } from "@polymarket/clob-client";
+import type { SignedOrder } from "@polymarket/clob-client";
 import { createLogger } from "../core/logger.js";
 import type { AppConfig, TradeParams } from "../core/types.js";
-import { ClobClient, Side, OrderType as ClobOrderType } from "@polymarket/clob-client";
-import { ethers } from "ethers";
 
 const log = createLogger("order-builder");
 
-// Ethers v6 Wallet uses `signTypedData` but the Polymarket SDK expects
-// ethers v5's `_signTypedData`. This adapter bridges the two.
-function wrapWalletAsSigner(wallet: ethers.Wallet): {
-  _signTypedData: (domain: object, types: object, value: object) => Promise<string>;
+// Adapter: ethers v6 Wallet uses signTypedData, but the Polymarket SDK
+// expects the ethers v5 interface (_signTypedData + getAddress returning Promise).
+function wrapWalletForClob(wallet: ethers.Wallet): {
+  _signTypedData: (
+    domain: Record<string, unknown>,
+    types: Record<string, Array<{ name: string; type: string }>>,
+    value: Record<string, unknown>,
+  ) => Promise<string>;
   getAddress: () => Promise<string>;
 } {
   return {
@@ -16,7 +21,7 @@ function wrapWalletAsSigner(wallet: ethers.Wallet): {
       wallet.signTypedData(
         domain as ethers.TypedDataDomain,
         types as Record<string, ethers.TypedDataField[]>,
-        value as Record<string, unknown>,
+        value,
       ),
     getAddress: () => Promise.resolve(wallet.address),
   };
@@ -24,7 +29,7 @@ function wrapWalletAsSigner(wallet: ethers.Wallet): {
 
 export class OrderBuilder {
   private readonly config: AppConfig;
-  private clobClient: ClobClient | null = null;
+  private client: ClobClient | null = null;
 
   constructor(config: AppConfig) {
     this.config = config;
@@ -32,14 +37,13 @@ export class OrderBuilder {
 
   async initialize(): Promise<void> {
     try {
-      const provider = new ethers.JsonRpcProvider(this.config.polygonRpcUrl);
-      const wallet = new ethers.Wallet(this.config.privateKey, provider);
-      const signer = wrapWalletAsSigner(wallet);
+      const wallet = new ethers.Wallet(this.config.privateKey);
+      const signer = wrapWalletForClob(wallet);
 
-      this.clobClient = new ClobClient(
+      this.client = new ClobClient(
         this.config.polymarketClobUrl,
         this.config.polymarketChainId,
-        signer as never, // ClobSigner accepts EthersSigner which matches our shape
+        signer,
         {
           key: this.config.polymarketApiKey,
           secret: this.config.polymarketSecret,
@@ -61,74 +65,52 @@ export class OrderBuilder {
     }
   }
 
-  getClobClient(): ClobClient {
-    if (!this.clobClient) {
-      throw new Error("OrderBuilder not initialized. Call initialize() first.");
+  async createOrder(params: TradeParams): Promise<{ signedOrder: SignedOrder; orderType: string }> {
+    if (!this.client) {
+      throw new Error("Order builder not initialized");
     }
-    return this.clobClient;
-  }
 
-  async createOrder(params: TradeParams): Promise<unknown> {
-    const client = this.getClobClient();
     const side = params.side === "BUY" ? Side.BUY : Side.SELL;
 
-    try {
-      const tickSize = await client.getTickSize(params.tokenId);
-      const tick = parseFloat(tickSize);
-      const roundedPrice = Math.round(params.price / tick) * tick;
-
-      if (params.orderType === "FOK" || params.orderType === "FAK") {
-        const marketOrder = await client.createMarketOrder({
-          tokenID: params.tokenId,
-          amount: params.size,
-          side,
-          price: roundedPrice,
-        });
-
-        log.info("Market order created", {
-          tokenId: params.tokenId,
-          side: params.side,
-          size: params.size,
-          price: roundedPrice,
-          orderType: params.orderType,
-        });
-
-        return marketOrder;
-      } else {
-        const order = await client.createOrder({
-          tokenID: params.tokenId,
-          price: roundedPrice,
-          size: params.size,
-          side,
-        });
-
-        log.info("Limit order created", {
-          tokenId: params.tokenId,
-          side: params.side,
-          size: params.size,
-          price: roundedPrice,
-          orderType: params.orderType,
-        });
-
-        return order;
-      }
-    } catch (err) {
-      log.error("Failed to create order", {
+    // For FOK/FAK (market orders), use createMarketOrder
+    if (params.orderType === "FOK" || params.orderType === "FAK") {
+      log.info("Creating market order", {
         tokenId: params.tokenId,
         side: params.side,
-        error: err instanceof Error ? err.message : String(err),
+        size: params.size,
+        orderType: params.orderType,
       });
-      throw err;
+
+      const signedOrder = await this.client.createMarketOrder({
+        tokenID: params.tokenId,
+        amount: params.size,
+        side,
+        price: params.price,
+      });
+
+      return { signedOrder, orderType: params.orderType };
     }
+
+    // For GTC/GTD (limit orders), use createOrder
+    log.info("Creating limit order", {
+      tokenId: params.tokenId,
+      side: params.side,
+      price: params.price,
+      size: params.size,
+      orderType: params.orderType,
+    });
+
+    const signedOrder = await this.client.createOrder({
+      tokenID: params.tokenId,
+      price: params.price,
+      size: params.size,
+      side,
+    });
+
+    return { signedOrder, orderType: params.orderType };
   }
 
-  getOrderType(type: string): ClobOrderType {
-    switch (type) {
-      case "GTC": return ClobOrderType.GTC;
-      case "FOK": return ClobOrderType.FOK;
-      case "GTD": return ClobOrderType.GTD;
-      case "FAK": return ClobOrderType.FAK;
-      default: return ClobOrderType.GTC;
-    }
+  getClient(): ClobClient | null {
+    return this.client;
   }
 }

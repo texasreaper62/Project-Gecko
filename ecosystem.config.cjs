@@ -2,7 +2,7 @@ module.exports = {
   apps: [{
     name: "predictionarb",
     script: "dist/index.js",
-    node_args: "--experimental-specifier-resolution=node",
+    cwd: __dirname,
     instances: 1,
     autorestart: true,
     watch: false,

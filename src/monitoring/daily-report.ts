@@ -1,117 +1,101 @@
 import { createLogger } from "../core/logger.js";
-import { isoDate } from "../utils/time.js";
-import { appendJsonl } from "../utils/persistence.js";
-import type { DailySummary, StrategyState } from "../core/types.js";
+import type { AppConfig, DailySummary } from "../core/types.js";
 import type { PnlTracker } from "./pnl-tracker.js";
-import type { PositionTracker } from "../execution/position-tracker.js";
+import type { HealthChecker } from "./health-check.js";
 import type { TelegramNotifier } from "./telegram.js";
 import type { DiscordNotifier } from "./discord.js";
+import { appendJsonl } from "../utils/persistence.js";
+import { isoDate } from "../utils/time.js";
 
 const log = createLogger("daily-report");
 
 export class DailyReporter {
-  private readonly pnlTracker: PnlTracker;
-  private readonly positionTracker: PositionTracker;
+  private readonly config: AppConfig;
+  private readonly pnl: PnlTracker;
+  private readonly health: HealthChecker;
   private readonly telegram: TelegramNotifier;
   private readonly discord: DiscordNotifier;
 
-  private timer: ReturnType<typeof setTimeout> | null = null;
-  private opportunityCount = 0;
+  private timer: ReturnType<typeof setInterval> | null = null;
+  private lastReportDate = "";
 
   constructor(
-    pnlTracker: PnlTracker,
-    positionTracker: PositionTracker,
+    config: AppConfig,
+    pnl: PnlTracker,
+    health: HealthChecker,
     telegram: TelegramNotifier,
     discord: DiscordNotifier,
   ) {
-    this.pnlTracker = pnlTracker;
-    this.positionTracker = positionTracker;
+    this.config = config;
+    this.pnl = pnl;
+    this.health = health;
     this.telegram = telegram;
     this.discord = discord;
   }
 
-  incrementOpportunities(): void {
-    this.opportunityCount++;
-  }
-
   start(): void {
-    this.scheduleNextReport();
+    // Check every minute if we've crossed midnight UTC
+    this.timer = setInterval(() => {
+      this.checkMidnight().catch((err) => {
+        log.error("Daily report error", {
+          error: err instanceof Error ? err.message : String(err),
+        });
+      });
+    }, 60_000);
+
+    this.lastReportDate = isoDate();
     log.info("Daily reporter started");
   }
 
   stop(): void {
     if (this.timer) {
-      clearTimeout(this.timer);
+      clearInterval(this.timer);
       this.timer = null;
     }
-    log.info("Daily reporter stopped");
   }
 
-  private scheduleNextReport(): void {
-    // Calculate ms until next midnight UTC
-    const now = new Date();
-    const tomorrow = new Date(Date.UTC(
-      now.getUTCFullYear(),
-      now.getUTCMonth(),
-      now.getUTCDate() + 1,
-      0, 0, 0, 0,
-    ));
-    const msUntilMidnight = tomorrow.getTime() - now.getTime();
+  private async checkMidnight(): Promise<void> {
+    const today = isoDate();
+    if (today === this.lastReportDate) return;
 
-    this.timer = setTimeout(() => {
-      this.generateReport().catch((err) => {
-        log.error("Failed to generate daily report", {
-          error: err instanceof Error ? err.message : String(err),
-        });
-      });
-      this.scheduleNextReport();
-    }, msUntilMidnight);
-
-    log.debug("Next daily report scheduled", {
-      msUntilMidnight,
-      nextReport: tomorrow.toISOString(),
-    });
+    // New day! Send report for previous day
+    this.lastReportDate = today;
+    await this.sendReport();
   }
 
-  async generateReport(): Promise<void> {
-    const summary: DailySummary = {
-      date: isoDate(),
-      totalTrades: this.positionTracker.getTradeCount(),
-      winningTrades: 0, // Would need trade-level tracking to compute
-      losingTrades: 0,
-      totalPnl: this.pnlTracker.getTotalPnl(),
-      totalFees: this.pnlTracker.getTotalFees(),
-      netPnl: this.pnlTracker.getNetPnl(),
-      maxDrawdown: 0, // Would need equity curve tracking
-      opportunities: this.opportunityCount,
-      strategies: {
-        "temporal-arb": { enabled: true, lastScan: 0, opportunitiesFound: 0, tradesExecuted: 0 },
-        "cross-platform": { enabled: false, lastScan: 0, opportunitiesFound: 0, tradesExecuted: 0 },
-        "correlated-contracts": { enabled: true, lastScan: 0, opportunitiesFound: 0, tradesExecuted: 0 },
-      },
-    };
+  async sendReport(): Promise<void> {
+    const summary = this.pnl.getSummary();
+    const healthStatus = this.health.check();
 
-    // Persist
-    appendJsonl("data/daily-summary.jsonl", summary);
+    const feedStatus = healthStatus.feeds
+      .map((f) => `${f.name}: ${f.status} (reconnects: ${f.reconnectCount})`)
+      .join("\n");
 
-    // Build report text
     const report = [
-      `Daily Report - ${summary.date}`,
-      `Trades: ${summary.totalTrades}`,
-      `Net P&L: $${summary.netPnl.toFixed(4)}`,
-      `Fees: $${summary.totalFees.toFixed(4)}`,
-      `Opportunities: ${summary.opportunities}`,
-      `Open positions: ${this.positionTracker.getOpenPositionCount()}`,
-      `Exposure: $${this.positionTracker.getTotalExposure().toFixed(2)}`,
+      `Daily Report - ${isoDate()}`,
+      "---",
+      summary,
+      "---",
+      "Feed Status:",
+      feedStatus,
+      "---",
+      `Kill Switch: ${healthStatus.killSwitch ? "ACTIVE" : "inactive"}`,
+      `Uptime: ${(healthStatus.uptime / 3_600_000).toFixed(1)} hours`,
     ].join("\n");
 
-    log.info("Daily report generated", { summary });
+    log.info("Sending daily report");
 
-    // Send notifications
-    await this.telegram.sendAlert("Daily Report", report);
-    await this.discord.sendEmbed(`Daily Report - ${summary.date}`, report, 0x0099ff);
+    await Promise.all([
+      this.telegram.sendAlert("Gecko Daily Report", report),
+      this.discord.sendEmbed("Gecko Daily Report", report),
+    ]);
 
-    // Reset daily counters
-    this.opportunityCount = 0;
+    // Persist summary
+    const dailySummary: Partial<DailySummary> = {
+      date: isoDate(),
+      totalPnl: this.pnl.getTotalPnl(),
+      netPnl: this.pnl.getNetPnl(),
+    };
+    appendJsonl("data/daily-summary.jsonl", dailySummary);
   }
 }

@@ -5,32 +5,31 @@ const log = createLogger("polymarket-ws");
 
 const POLYMARKET_WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market";
 
-interface PolymarketWsMessage {
-  readonly event_type?: string;
-  readonly asset_id?: string;
-  readonly market?: string;
-  readonly price?: string;
-  readonly timestamp?: string;
-  readonly changes?: readonly { price: string; size: string; side: string }[];
-}
-
-export interface PolymarketPriceUpdate {
+interface PriceUpdate {
   readonly tokenId: string;
   readonly price: number;
   readonly timestamp: number;
 }
 
-export interface PolymarketBookUpdate {
-  readonly tokenId: string;
-  readonly changes: readonly { price: number; size: number; side: "BUY" | "SELL" }[];
-  readonly timestamp: number;
+type PriceUpdateCallback = (update: PriceUpdate) => void;
+
+interface WsBookMsg {
+  readonly event_type: string;
+  readonly asset_id?: string;
+  readonly market?: string;
+  readonly price?: string;
+  readonly timestamp?: string;
+  readonly changes?: readonly [string, string, string][];
+  readonly bids?: { price: string; size: string }[];
+  readonly asks?: { price: string; size: string }[];
 }
 
-export class PolymarketFeed {
+export class PolymarketWsFeed {
   private readonly ws: WsManager;
   private subscribedTokens: Set<string> = new Set();
-  private onPriceUpdate: ((update: PolymarketPriceUpdate) => void) | null = null;
-  private onBookUpdate: ((update: PolymarketBookUpdate) => void) | null = null;
+  private onPriceUpdate: PriceUpdateCallback | null = null;
+  private bestBids: Map<string, number> = new Map();
+  private bestAsks: Map<string, number> = new Map();
 
   constructor() {
     this.ws = new WsManager({
@@ -38,29 +37,23 @@ export class PolymarketFeed {
       name: "polymarket-ws",
     });
 
-    this.ws.setMessageHandler((raw: unknown) => {
-      this.handleMessage(raw as PolymarketWsMessage);
+    this.ws.setConnectedHandler(() => {
+      this.resubscribe();
     });
 
-    this.ws.setConnectedHandler(() => {
-      log.info("Polymarket WebSocket connected");
-      // Re-subscribe to all tokens on reconnect
-      if (this.subscribedTokens.size > 0) {
-        this.resubscribeAll();
+    this.ws.setMessageHandler((raw: unknown) => {
+      try {
+        this.handleMessage(raw);
+      } catch (err) {
+        log.error("Failed to handle WS message", {
+          error: err instanceof Error ? err.message : String(err),
+        });
       }
     });
-
-    this.ws.setDisconnectedHandler(() => {
-      log.warn("Polymarket WebSocket disconnected");
-    });
   }
 
-  setPriceHandler(handler: (update: PolymarketPriceUpdate) => void): void {
+  setPriceUpdateHandler(handler: PriceUpdateCallback): void {
     this.onPriceUpdate = handler;
-  }
-
-  setBookHandler(handler: (update: PolymarketBookUpdate) => void): void {
-    this.onBookUpdate = handler;
   }
 
   start(): void {
@@ -75,78 +68,93 @@ export class PolymarketFeed {
     return this.ws.getHealth();
   }
 
-  subscribeToMarket(tokenId: string): void {
+  subscribeToToken(tokenId: string): void {
     this.subscribedTokens.add(tokenId);
     if (this.ws.getStatus() === "connected") {
-      this.sendSubscription([tokenId]);
+      this.sendSubscribe([tokenId]);
     }
   }
 
-  subscribeToMarkets(tokenIds: string[]): void {
+  subscribeToTokens(tokenIds: string[]): void {
     for (const id of tokenIds) {
       this.subscribedTokens.add(id);
     }
     if (this.ws.getStatus() === "connected") {
-      this.sendSubscription(tokenIds);
+      this.sendSubscribe(tokenIds);
     }
   }
 
-  unsubscribeFromMarket(tokenId: string): void {
+  unsubscribeFromToken(tokenId: string): void {
     this.subscribedTokens.delete(tokenId);
+    this.bestBids.delete(tokenId);
+    this.bestAsks.delete(tokenId);
     if (this.ws.getStatus() === "connected") {
-      this.ws.send({
-        type: "unsubscribe",
-        assets_ids: [tokenId],
-      });
+      this.ws.send({ type: "unsubscribe", assets_ids: [tokenId] });
     }
   }
 
-  private sendSubscription(tokenIds: string[]): void {
-    this.ws.send({
-      type: "subscribe",
-      assets_ids: tokenIds,
-    });
-    log.info("Subscribed to tokens", { count: tokenIds.length });
+  private sendSubscribe(tokenIds: string[]): void {
+    if (tokenIds.length === 0) return;
+    log.info("Subscribing to tokens", { count: tokenIds.length });
+    this.ws.send({ assets_ids: tokenIds, type: "market" });
   }
 
-  private resubscribeAll(): void {
-    const ids = Array.from(this.subscribedTokens);
-    if (ids.length > 0) {
-      this.sendSubscription(ids);
-      log.info("Re-subscribed to all tokens after reconnect", { count: ids.length });
+  private resubscribe(): void {
+    const tokens = Array.from(this.subscribedTokens);
+    if (tokens.length > 0) {
+      log.info("Resubscribing after reconnect", { count: tokens.length });
+      this.sendSubscribe(tokens);
     }
   }
 
-  private handleMessage(msg: PolymarketWsMessage): void {
-    try {
+  private handleMessage(raw: unknown): void {
+    const msg = raw as WsBookMsg;
+
+    if (msg.event_type === "book" || msg.event_type === "price_change") {
       const tokenId = msg.asset_id ?? msg.market;
       if (!tokenId) return;
 
-      // Price update
-      if (msg.price) {
+      if (msg.bids && msg.bids.length > 0) {
+        this.bestBids.set(tokenId, parseFloat(msg.bids[0].price));
+      }
+      if (msg.asks && msg.asks.length > 0) {
+        this.bestAsks.set(tokenId, parseFloat(msg.asks[0].price));
+      }
+
+      if (msg.changes) {
+        for (const [side, price, size] of msg.changes) {
+          const p = parseFloat(price);
+          const s = parseFloat(size);
+          if (side === "buy" && (s === 0 || p > (this.bestBids.get(tokenId) ?? 0))) {
+            this.bestBids.set(tokenId, s > 0 ? p : 0);
+          }
+          if (side === "sell" && (s === 0 || p < (this.bestAsks.get(tokenId) ?? Infinity))) {
+            this.bestAsks.set(tokenId, s > 0 ? p : 0);
+          }
+        }
+      }
+
+      const bid = this.bestBids.get(tokenId) ?? 0;
+      const ask = this.bestAsks.get(tokenId) ?? 0;
+      const mid = bid > 0 && ask > 0 ? (bid + ask) / 2 : bid || ask;
+
+      if (mid > 0) {
         this.onPriceUpdate?.({
           tokenId,
-          price: parseFloat(msg.price),
+          price: mid,
           timestamp: msg.timestamp ? new Date(msg.timestamp).getTime() : Date.now(),
         });
       }
+    }
 
-      // Order book delta
-      if (msg.changes && msg.changes.length > 0) {
-        const changes = msg.changes.map((c) => ({
-          price: parseFloat(c.price),
-          size: parseFloat(c.size),
-          side: c.side.toUpperCase() as "BUY" | "SELL",
-        }));
-        this.onBookUpdate?.({
-          tokenId,
-          changes,
-          timestamp: Date.now(),
-        });
-      }
-    } catch (err) {
-      log.warn("Failed to parse Polymarket WS message", {
-        error: err instanceof Error ? err.message : String(err),
+    if (msg.event_type === "last_trade_price") {
+      const tokenId = msg.asset_id ?? msg.market;
+      if (!tokenId || !msg.price) return;
+
+      this.onPriceUpdate?.({
+        tokenId,
+        price: parseFloat(msg.price),
+        timestamp: msg.timestamp ? new Date(msg.timestamp).getTime() : Date.now(),
       });
     }
   }

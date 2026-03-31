@@ -1,39 +1,34 @@
 import { createLogger } from "../core/logger.js";
+import type { AppConfig, Opportunity, PolymarketMarket } from "../core/types.js";
+import type { PolymarketRestClient } from "../feeds/polymarket-rest.js";
+import { generateOpportunityId } from "./strategy-types.js";
 import { sumProbabilities } from "../utils/math.js";
-import { PolymarketRestClient } from "../feeds/polymarket-rest.js";
-import type { AppConfig, Opportunity, StrategyState } from "../core/types.js";
-import type { CorrelatedContractSignal } from "./strategy-types.js";
 
 const log = createLogger("correlated-contracts");
 
-// Scan every 60 seconds
+// How often to scan for mispricing (ms)
 const SCAN_INTERVAL = 60_000;
-// Minimum deviation from 1.0 to flag (as decimal, e.g., 0.03 = 3%)
-const MIN_DEVIATION = 0.03;
+// Minimum deviation from 1.00 to flag an opportunity (percent)
+const SUM_DEVIATION_THRESHOLD = 2.0;
+
+interface EventOutcome {
+  readonly conditionId: string;
+  readonly question: string;
+  readonly yesPrice: number;
+  readonly yesTokenId: string;
+  readonly negRisk: boolean;
+}
 
 export class CorrelatedContractsStrategy {
-  readonly name = "correlated-contracts" as const;
   private readonly config: AppConfig;
-  private readonly restClient: PolymarketRestClient;
+  private readonly polyRest: PolymarketRestClient;
 
   private scanTimer: ReturnType<typeof setInterval> | null = null;
-
-  private _state: StrategyState = {
-    enabled: false,
-    lastScan: 0,
-    opportunitiesFound: 0,
-    tradesExecuted: 0,
-  };
-
   private onOpportunity: ((opp: Opportunity) => void) | null = null;
 
-  constructor(config: AppConfig, restClient: PolymarketRestClient) {
+  constructor(config: AppConfig, polyRest: PolymarketRestClient) {
     this.config = config;
-    this.restClient = restClient;
-  }
-
-  get state(): StrategyState {
-    return this._state;
+    this.polyRest = polyRest;
   }
 
   setOpportunityHandler(handler: (opp: Opportunity) => void): void {
@@ -41,27 +36,21 @@ export class CorrelatedContractsStrategy {
   }
 
   start(): void {
-    this._state = { ...this._state, enabled: true };
     log.info("Starting correlated contracts strategy");
 
-    // Run immediately, then on interval
+    // Initial scan
     this.scan().catch((err) => {
-      log.error("Initial scan error", {
-        error: err instanceof Error ? err.message : String(err),
-      });
+      log.error("Initial scan error", { error: err instanceof Error ? err.message : String(err) });
     });
 
     this.scanTimer = setInterval(() => {
       this.scan().catch((err) => {
-        log.error("Scan error", {
-          error: err instanceof Error ? err.message : String(err),
-        });
+        log.error("Scan error", { error: err instanceof Error ? err.message : String(err) });
       });
     }, SCAN_INTERVAL);
   }
 
   stop(): void {
-    this._state = { ...this._state, enabled: false };
     if (this.scanTimer) {
       clearInterval(this.scanTimer);
       this.scanTimer = null;
@@ -73,138 +62,103 @@ export class CorrelatedContractsStrategy {
     const opportunities: Opportunity[] = [];
 
     try {
-      const events = await this.restClient.getNegRiskEvents(50);
+      const events = await this.polyRest.getNegRiskEvents();
 
       for (const event of events) {
-        if (event.markets.length < 2) continue;
+        if (!event.markets || event.markets.length < 2) continue;
 
-        // Get YES prices for each outcome
-        const outcomes: CorrelatedContractSignal["outcomes"][number][] = [];
+        const outcomes: EventOutcome[] = [];
 
         for (const market of event.markets) {
-          const yesToken = market.tokens?.find((t) => t.outcome === "Yes" || t.outcome === "YES");
-          if (!yesToken) continue;
+          if (market.closed || !market.active) continue;
 
-          // Try to get live price from CLOB, fall back to Gamma price
-          let yesPrice = yesToken.price;
-          const livePrice = await this.restClient.getMidpoint(yesToken.token_id);
-          if (livePrice !== null) {
-            yesPrice = livePrice;
-          }
+          const yesToken = market.tokens?.find(
+            (t) => t.outcome.toUpperCase() === "YES"
+          );
+          if (!yesToken) continue;
 
           outcomes.push({
             conditionId: market.condition_id,
-            tokenId: yesToken.token_id,
             question: market.question,
-            yesPrice,
+            yesPrice: yesToken.price,
+            yesTokenId: yesToken.token_id,
+            negRisk: market.neg_risk,
           });
         }
 
         if (outcomes.length < 2) continue;
 
-        const prices = outcomes.map((o) => o.yesPrice);
-        const total = sumProbabilities(prices);
-        const deviation = total - 1.0;
+        const yesPrices = outcomes.map((o) => o.yesPrice);
+        const totalProb = sumProbabilities(yesPrices);
+        const deviation = (totalProb - 1.0) * 100; // as percentage
 
-        if (Math.abs(deviation) < MIN_DEVIATION) continue;
+        if (Math.abs(deviation) < SUM_DEVIATION_THRESHOLD) continue;
 
-        const type = deviation > 0 ? "OVERPRICED" : "UNDERPRICED";
-
-        // Find the most mispriced outcome
-        let mostMispriced = outcomes[0];
-        if (type === "UNDERPRICED") {
-          // For underpriced sum, find the cheapest outcome (most underpriced)
-          for (const o of outcomes) {
-            if (o.yesPrice < mostMispriced.yesPrice) {
-              mostMispriced = o;
-            }
-          }
-        } else {
-          // For overpriced sum, find the most expensive (to potentially sell if we hold)
-          for (const o of outcomes) {
-            if (o.yesPrice > mostMispriced.yesPrice) {
-              mostMispriced = o;
-            }
-          }
-        }
-
-        const signal: CorrelatedContractSignal = {
-          eventSlug: event.slug,
-          eventTitle: event.title,
-          outcomes,
-          sumYesPrices: total,
-          deviation,
-          type,
-          mostMispriced: {
-            conditionId: mostMispriced.conditionId,
-            tokenId: mostMispriced.tokenId,
-            question: mostMispriced.question,
-            price: mostMispriced.yesPrice,
-          },
-          timestamp: Date.now(),
-        };
-
-        log.info("Correlated contract mispricing detected", {
+        log.info("Correlated mispricing detected", {
           event: event.title,
           outcomes: outcomes.length,
-          sum: total.toFixed(4),
-          deviation: (deviation * 100).toFixed(2) + "%",
-          type,
-          mostMispriced: mostMispriced.question,
+          sum: totalProb.toFixed(4),
+          deviation: deviation.toFixed(2),
         });
 
-        // Only generate buy opportunities (we need to hold tokens to sell)
-        if (type === "UNDERPRICED") {
-          const opp = this.signalToOpportunity(signal);
-          opportunities.push(opp);
-          this.onOpportunity?.(opp);
-        } else {
-          // Log sell opportunities but don't generate trade signals unless we hold
-          log.info("Sell opportunity (requires holdings)", {
+        if (deviation < -SUM_DEVIATION_THRESHOLD) {
+          // Prices sum to < 1.0: buy opportunity
+          // Find the most underpriced outcome (lowest YES price, likely to be undervalued)
+          const sorted = [...outcomes].sort((a, b) => a.yesPrice - b.yesPrice);
+          const best = sorted[sorted.length - 1]; // Highest probability but sum < 1 means all are cheap
+
+          // Actually, in an underpriced scenario, we want the outcome we think is most likely
+          // to win. We use the highest-priced one as a proxy.
+          if (best && best.yesPrice > 0 && best.yesPrice < 1) {
+            const opp: Opportunity = {
+              id: generateOpportunityId("correlated-contracts"),
+              strategy: "correlated-contracts",
+              timestamp: Date.now(),
+              description: `${event.title}: ${outcomes.length} outcomes sum to ${(totalProb * 100).toFixed(1)}% ` +
+                `(expected 100%). Buy opportunity on "${best.question}" at ${(best.yesPrice * 100).toFixed(1)}%`,
+              expectedSpread: Math.abs(deviation),
+              confidence: Math.min(Math.abs(deviation) / 10, 1),
+              params: {
+                tokenId: best.yesTokenId,
+                side: "BUY",
+                price: best.yesPrice,
+                size: Math.min(this.config.maxPositionSize, this.config.maxPositionSize),
+                orderType: "GTC",
+                conditionId: best.conditionId,
+                negRisk: best.negRisk,
+              },
+              metadata: {
+                eventTitle: event.title,
+                eventSlug: event.slug,
+                outcomeCount: outcomes.length,
+                totalProbability: totalProb,
+                deviation,
+                allOutcomes: outcomes.map((o) => ({
+                  question: o.question,
+                  yesPrice: o.yesPrice,
+                })),
+              },
+            };
+
+            opportunities.push(opp);
+            this.onOpportunity?.(opp);
+          }
+        } else if (deviation > SUM_DEVIATION_THRESHOLD) {
+          // Prices sum to > 1.0: sell opportunity
+          // Would need to hold tokens to sell; log but skip execution
+          log.info("Sell opportunity (requires existing position)", {
             event: event.title,
-            deviation: (deviation * 100).toFixed(2) + "%",
+            sum: totalProb.toFixed(4),
+            deviation: deviation.toFixed(2),
           });
         }
       }
     } catch (err) {
-      log.error("Failed to scan correlated contracts", {
+      log.error("Scan failed", {
         error: err instanceof Error ? err.message : String(err),
       });
     }
 
-    this._state = {
-      ...this._state,
-      lastScan: Date.now(),
-      opportunitiesFound: this._state.opportunitiesFound + opportunities.length,
-    };
-
     return opportunities;
-  }
-
-  private signalToOpportunity(signal: CorrelatedContractSignal): Opportunity {
-    return {
-      id: `corr-${signal.eventSlug}-${Date.now()}`,
-      strategy: "correlated-contracts",
-      timestamp: signal.timestamp,
-      description: `${signal.type} event "${signal.eventTitle}" sum=${signal.sumYesPrices.toFixed(4)}, buy ${signal.mostMispriced.question}`,
-      expectedSpread: Math.abs(signal.deviation) * 100,
-      confidence: Math.min(Math.abs(signal.deviation) / 0.10, 1.0), // 10% deviation = max confidence
-      params: {
-        tokenId: signal.mostMispriced.tokenId,
-        side: "BUY",
-        price: signal.mostMispriced.price,
-        size: this.config.maxPositionSize,
-        orderType: "GTC",
-        conditionId: signal.mostMispriced.conditionId,
-        negRisk: true,
-      },
-      metadata: {
-        eventSlug: signal.eventSlug,
-        eventTitle: signal.eventTitle,
-        sumYesPrices: signal.sumYesPrices,
-        deviation: signal.deviation,
-        outcomesCount: signal.outcomes.length,
-      },
-    };
   }
 }

@@ -6,33 +6,36 @@ const log = createLogger("coinbase-ws");
 
 interface CoinbaseTickerMsg {
   readonly type: string;
-  readonly product_id?: string;
-  readonly price?: string;
-  readonly time?: string;
+  readonly product_id: string;
+  readonly price: string;
+  readonly time: string;
 }
+
+type PriceCallback = (price: SpotPrice) => void;
 
 export class CoinbaseFeed {
   private readonly ws: WsManager;
-  private onPrice: ((price: SpotPrice) => void) | null = null;
+  private onPrice: PriceCallback | null = null;
 
   constructor(url: string) {
     this.ws = new WsManager({ url, name: "coinbase-ws" });
 
-    this.ws.setMessageHandler((raw: unknown) => {
-      this.handleMessage(raw as CoinbaseTickerMsg);
-    });
-
     this.ws.setConnectedHandler(() => {
-      log.info("Coinbase feed connected");
       this.subscribe();
     });
 
-    this.ws.setDisconnectedHandler(() => {
-      log.warn("Coinbase feed disconnected");
+    this.ws.setMessageHandler((raw: unknown) => {
+      try {
+        this.handleMessage(raw);
+      } catch (err) {
+        log.error("Failed to handle message", {
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
     });
   }
 
-  setPriceHandler(handler: (price: SpotPrice) => void): void {
+  setPriceHandler(handler: PriceCallback): void {
     this.onPrice = handler;
   }
 
@@ -49,36 +52,30 @@ export class CoinbaseFeed {
   }
 
   private subscribe(): void {
+    log.info("Subscribing to BTC-USD and ETH-USD ticker");
     this.ws.send({
       type: "subscribe",
       channels: [
         { name: "ticker", product_ids: ["BTC-USD", "ETH-USD"] },
       ],
     });
-    log.info("Subscribed to BTC-USD, ETH-USD ticker");
   }
 
-  private handleMessage(msg: CoinbaseTickerMsg): void {
-    try {
-      if (msg.type !== "ticker") return;
-      if (!msg.product_id || !msg.price || !msg.time) return;
+  private handleMessage(raw: unknown): void {
+    const msg = raw as CoinbaseTickerMsg;
+    if (msg.type !== "ticker") return;
 
-      const symbol = this.normalizeSymbol(msg.product_id);
-      if (!symbol) return;
+    const symbol = this.normalizeSymbol(msg.product_id);
+    if (!symbol) return;
 
-      const price: SpotPrice = {
-        symbol,
-        price: parseFloat(msg.price),
-        timestamp: new Date(msg.time).getTime(),
-        source: "coinbase",
-      };
+    const price: SpotPrice = {
+      symbol,
+      price: parseFloat(msg.price),
+      timestamp: new Date(msg.time).getTime(),
+      source: "coinbase",
+    };
 
-      this.onPrice?.(price);
-    } catch (err) {
-      log.warn("Failed to parse Coinbase message", {
-        error: err instanceof Error ? err.message : String(err),
-      });
-    }
+    this.onPrice?.(price);
   }
 
   private normalizeSymbol(productId: string): string | null {

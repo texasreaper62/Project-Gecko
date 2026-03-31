@@ -1,64 +1,74 @@
 import { createLogger } from "../core/logger.js";
-import { withRetry } from "../utils/retry.js";
-import { appendJsonl } from "../utils/persistence.js";
-import { nowIso } from "../utils/time.js";
-import type { Opportunity, TradeResult, FeedHealth } from "../core/types.js";
+import type { AppConfig, Opportunity, TradeResult, StrategyType } from "../core/types.js";
 import type { OrderBuilder } from "./order-builder.js";
 import type { RiskManager } from "./risk-manager.js";
 import type { PositionTracker } from "./position-tracker.js";
+import type { PolymarketRestClient } from "../feeds/polymarket-rest.js";
+import { appendJsonl } from "../utils/persistence.js";
+import { nowIso } from "../utils/time.js";
 
 const log = createLogger("order-executor");
 
 export class OrderExecutor {
+  private readonly config: AppConfig;
   private readonly orderBuilder: OrderBuilder;
   private readonly riskManager: RiskManager;
-  private readonly positionTracker: PositionTracker;
+  private readonly positions: PositionTracker;
+  private readonly polyRest: PolymarketRestClient;
 
   constructor(
+    config: AppConfig,
     orderBuilder: OrderBuilder,
     riskManager: RiskManager,
-    positionTracker: PositionTracker,
+    positions: PositionTracker,
+    polyRest: PolymarketRestClient,
   ) {
+    this.config = config;
     this.orderBuilder = orderBuilder;
     this.riskManager = riskManager;
-    this.positionTracker = positionTracker;
+    this.positions = positions;
+    this.polyRest = polyRest;
   }
 
-  async executeOpportunity(
-    opportunity: Opportunity,
-    feedHealths: readonly FeedHealth[],
-  ): Promise<TradeResult | null> {
-    // Run risk checks
-    const riskCheck = this.riskManager.checkTrade(opportunity, feedHealths);
-    if (!riskCheck.allowed) {
+  async executeOpportunity(opportunity: Opportunity): Promise<TradeResult | null> {
+    // Log every opportunity regardless
+    appendJsonl("data/opportunities.jsonl", {
+      ts: nowIso(),
+      ...opportunity,
+    });
+
+    // Risk check
+    const riskResult = this.riskManager.checkTrade(opportunity);
+    if (!riskResult.allowed) {
       log.info("Trade blocked by risk manager", {
         opportunityId: opportunity.id,
-        reason: riskCheck.reason,
-      });
-
-      // Still log the opportunity
-      appendJsonl("data/opportunities.jsonl", {
-        ...opportunity,
-        ts: nowIso(),
-        traded: false,
-        reason: riskCheck.reason,
-      });
-
-      return null;
-    }
-
-    // Skip if we already have a position in this market
-    if (this.positionTracker.hasPosition(opportunity.params.conditionId)) {
-      log.info("Already have position in this market", {
-        conditionId: opportunity.params.conditionId,
+        reason: riskResult.reason,
       });
       return null;
     }
 
+    // Liquidity check
     try {
-      log.info("Executing trade", {
+      const book = await this.polyRest.getOrderBook(opportunity.params.tokenId);
+      if (book.depth < this.config.minLiquidity) {
+        log.warn("Insufficient liquidity", {
+          tokenId: opportunity.params.tokenId,
+          depth: book.depth,
+          required: this.config.minLiquidity,
+        });
+        return null;
+      }
+    } catch (err) {
+      log.error("Failed to check liquidity", {
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return null;
+    }
+
+    // Build and submit order
+    try {
+      log.info("Submitting order", {
         opportunityId: opportunity.id,
-        strategy: opportunity.strategy,
         tokenId: opportunity.params.tokenId,
         side: opportunity.params.side,
         price: opportunity.params.price,
@@ -66,56 +76,46 @@ export class OrderExecutor {
         orderType: opportunity.params.orderType,
       });
 
-      // Create and submit order with retry
-      const result = await withRetry(
-        async () => {
-          const signedOrder = await this.orderBuilder.createOrder(opportunity.params);
-          const client = this.orderBuilder.getClobClient();
-          const orderType = this.orderBuilder.getOrderType(opportunity.params.orderType);
-          const response = await client.postOrder(signedOrder as never, orderType);
-          return response;
-        },
-        `execute order ${opportunity.id}`,
-        { maxAttempts: 2, initialDelay: 500, timeout: 15_000 },
-      );
+      const { signedOrder, orderType } = await this.orderBuilder.createOrder(opportunity.params);
 
-      // Parse response into TradeResult
-      const tradeResult = this.parseTradeResult(result);
-
-      log.info("Trade executed", {
-        opportunityId: opportunity.id,
-        orderId: tradeResult.orderId,
-        status: tradeResult.status,
-        fillPrice: tradeResult.fillPrice,
-        fillSize: tradeResult.fillSize,
-      });
-
-      // Track position if filled
-      if (tradeResult.status === "filled" || tradeResult.status === "partial") {
-        this.positionTracker.openPosition(opportunity, tradeResult);
+      const client = this.orderBuilder.getClient();
+      if (!client) {
+        throw new Error("CLOB client not available");
       }
 
-      // Log opportunity as traded
-      appendJsonl("data/opportunities.jsonl", {
-        ...opportunity,
-        ts: nowIso(),
-        traded: true,
-        result: tradeResult,
+      // postOrder accepts SignedOrder and orderType string; response is untyped (any)
+      const response = await client.postOrder(signedOrder, orderType as never);
+
+      const result: TradeResult = {
+        orderId: response?.orderID ?? "unknown",
+        status: response?.status === "matched" ? "filled" : "rejected",
+        fillPrice: opportunity.params.price,
+        fillSize: opportunity.params.size,
+        fees: 0,
+        timestamp: Date.now(),
+      };
+
+      log.info("Order result", {
+        opportunityId: opportunity.id,
+        orderId: result.orderId,
+        status: result.status,
       });
 
-      return tradeResult;
+      if (result.status === "filled") {
+        this.positions.openPosition(
+          opportunity.params,
+          result,
+          opportunity.description,
+          opportunity.strategy,
+        );
+      }
+
+      return result;
     } catch (err) {
       const errorMsg = err instanceof Error ? err.message : String(err);
-      log.error("Trade execution failed", {
+      log.error("Order execution failed", {
         opportunityId: opportunity.id,
         error: errorMsg,
-      });
-
-      appendJsonl("data/opportunities.jsonl", {
-        ...opportunity,
-        ts: nowIso(),
-        traded: false,
-        reason: `Execution error: ${errorMsg}`,
       });
 
       return {
@@ -128,32 +128,5 @@ export class OrderExecutor {
         error: errorMsg,
       };
     }
-  }
-
-  private parseTradeResult(response: unknown): TradeResult {
-    // The CLOB client returns different shapes depending on the endpoint
-    // We handle the common fields safely
-    const resp = response as Record<string, unknown>;
-
-    const orderId = (resp.orderID ?? resp.order_id ?? resp.id ?? "") as string;
-    const status = this.normalizeStatus(resp.status as string | undefined);
-
-    return {
-      orderId,
-      status,
-      fillPrice: typeof resp.price === "number" ? resp.price : 0,
-      fillSize: typeof resp.size === "number" ? resp.size : 0,
-      fees: typeof resp.fee === "number" ? resp.fee : 0,
-      timestamp: Date.now(),
-    };
-  }
-
-  private normalizeStatus(status: string | undefined): TradeResult["status"] {
-    if (!status) return "error";
-    const lower = status.toLowerCase();
-    if (lower === "matched" || lower === "filled" || lower === "live") return "filled";
-    if (lower === "partial" || lower === "partially_filled") return "partial";
-    if (lower === "rejected" || lower === "cancelled") return "rejected";
-    return "error";
   }
 }

@@ -1,150 +1,128 @@
 import { createLogger } from "../core/logger.js";
 import type { SpotPrice, PriceState } from "../core/types.js";
-import type { PolymarketPriceUpdate } from "./polymarket-ws.js";
+import type { BinanceFeed } from "./binance-ws.js";
+import type { CoinbaseFeed } from "./coinbase-ws.js";
+import type { PolymarketWsFeed } from "./polymarket-ws.js";
 
 const log = createLogger("feed-aggregator");
 
-// Max age before a price is considered stale (5 seconds)
-const STALE_THRESHOLD_MS = 5_000;
-// Max divergence between feeds before we distrust (0.5%)
-const MAX_FEED_DIVERGENCE = 0.005;
+const STALE_THRESHOLD = 5_000;
+const MAX_DIVERGENCE_PERCENT = 0.5;
+const FEED_DISCONNECT_LIMIT = 30_000;
+
+interface PriceEntry {
+  price: number;
+  timestamp: number;
+}
 
 export class FeedAggregator {
-  // Spot prices per symbol
-  private readonly spotPrices: Map<string, PriceState> = new Map();
-  // Polymarket contract prices per tokenId
-  private readonly contractPrices: Map<string, { price: number; timestamp: number }> = new Map();
-  // Recent spot price history for momentum calculation
+  private readonly binancePrices: Map<string, PriceEntry> = new Map();
+  private readonly coinbasePrices: Map<string, PriceEntry> = new Map();
+  private readonly confirmedSpot: Map<string, PriceState> = new Map();
+  private readonly tokenPrices: Map<string, PriceEntry> = new Map();
   private readonly priceHistory: Map<string, { price: number; timestamp: number }[]> = new Map();
-  private readonly maxHistoryLength = 60; // Keep last 60 ticks
+  private readonly MAX_HISTORY = 60;
+  private readonly feedLastSeen: Map<string, number> = new Map();
 
-  constructor() {
-    // Initialize BTC and ETH price states
-    for (const symbol of ["BTC", "ETH"]) {
-      this.spotPrices.set(symbol, {
-        binance: null,
-        coinbase: null,
-        confirmedPrice: null,
-        lastUpdate: 0,
-      });
-      this.priceHistory.set(symbol, []);
-    }
+  constructor(
+    binance: BinanceFeed,
+    coinbase: CoinbaseFeed,
+    polymarketWs: PolymarketWsFeed,
+  ) {
+    binance.setPriceHandler((p) => this.handleSpotPrice(p));
+    coinbase.setPriceHandler((p) => this.handleSpotPrice(p));
+    polymarketWs.setPriceUpdateHandler((u) => this.handleTokenPrice(u.tokenId, u.price, u.timestamp));
   }
 
-  // Called by Binance/Coinbase feeds
-  updateSpotPrice(price: SpotPrice): void {
-    const current = this.spotPrices.get(price.symbol);
-    if (!current) return;
-
-    const updated: PriceState = {
-      ...current,
-      [price.source]: price,
-      lastUpdate: Date.now(),
-      confirmedPrice: this.calculateConfirmedPrice(
-        price.source === "binance" ? price : current.binance,
-        price.source === "coinbase" ? price : current.coinbase,
-      ),
-    };
-
-    this.spotPrices.set(price.symbol, updated);
-
-    // Track history for momentum
-    if (updated.confirmedPrice !== null) {
-      const history = this.priceHistory.get(price.symbol)!;
-      history.push({ price: updated.confirmedPrice, timestamp: Date.now() });
-      if (history.length > this.maxHistoryLength) {
-        history.shift();
-      }
-    }
+  getConfirmedSpotPrice(symbol: string): PriceState | null {
+    return this.confirmedSpot.get(symbol) ?? null;
   }
 
-  // Called by Polymarket WS feed
-  updateContractPrice(update: PolymarketPriceUpdate): void {
-    this.contractPrices.set(update.tokenId, {
-      price: update.price,
-      timestamp: update.timestamp,
-    });
-  }
-
-  // Get confirmed spot price for a symbol (only if both feeds agree)
-  getConfirmedSpotPrice(symbol: string): number | null {
-    const state = this.spotPrices.get(symbol);
-    if (!state) return null;
-    return state.confirmedPrice;
-  }
-
-  // Get the latest price from any feed for a symbol
-  getLatestSpotPrice(symbol: string): number | null {
-    const state = this.spotPrices.get(symbol);
-    if (!state) return null;
-
-    // Prefer confirmed, fall back to most recent single feed
-    if (state.confirmedPrice !== null) return state.confirmedPrice;
-
-    const binanceAge = state.binance ? Date.now() - state.binance.timestamp : Infinity;
-    const coinbaseAge = state.coinbase ? Date.now() - state.coinbase.timestamp : Infinity;
-
-    if (binanceAge < STALE_THRESHOLD_MS && state.binance) return state.binance.price;
-    if (coinbaseAge < STALE_THRESHOLD_MS && state.coinbase) return state.coinbase.price;
-
-    return null;
-  }
-
-  // Get contract price for a token
-  getContractPrice(tokenId: string): number | null {
-    const entry = this.contractPrices.get(tokenId);
+  getTokenPrice(tokenId: string): number | null {
+    const entry = this.tokenPrices.get(tokenId);
     if (!entry) return null;
-    if (Date.now() - entry.timestamp > STALE_THRESHOLD_MS * 6) return null; // 30s stale
+    if (Date.now() - entry.timestamp > STALE_THRESHOLD) return null;
     return entry.price;
   }
 
-  // Get price history for momentum calculations
-  getPriceHistory(symbol: string): readonly { price: number; timestamp: number }[] {
+  getSpotPriceHistory(symbol: string): readonly { price: number; timestamp: number }[] {
     return this.priceHistory.get(symbol) ?? [];
   }
 
-  // Check if both feeds are providing data
-  areBothFeedsActive(symbol: string): boolean {
-    const state = this.spotPrices.get(symbol);
-    if (!state) return false;
+  areFeedsHealthy(): boolean {
     const now = Date.now();
-    const binanceFresh = state.binance !== null && (now - state.binance.timestamp) < STALE_THRESHOLD_MS;
-    const coinbaseFresh = state.coinbase !== null && (now - state.coinbase.timestamp) < STALE_THRESHOLD_MS;
-    return binanceFresh && coinbaseFresh;
+    const binanceLast = this.feedLastSeen.get("binance-ws");
+    const coinbaseLast = this.feedLastSeen.get("coinbase-ws");
+
+    if (!binanceLast || now - binanceLast > FEED_DISCONNECT_LIMIT) return false;
+    if (!coinbaseLast || now - coinbaseLast > FEED_DISCONNECT_LIMIT) return false;
+    return true;
   }
 
-  // Get full state for a symbol (for logging/debugging)
-  getSpotState(symbol: string): PriceState | null {
-    return this.spotPrices.get(symbol) ?? null;
-  }
+  private handleSpotPrice(price: SpotPrice): void {
+    const entry: PriceEntry = { price: price.price, timestamp: price.timestamp };
 
-  private calculateConfirmedPrice(
-    binance: SpotPrice | null,
-    coinbase: SpotPrice | null,
-  ): number | null {
-    if (!binance || !coinbase) return null;
-
-    const now = Date.now();
-    // Both must be fresh
-    if (now - binance.timestamp > STALE_THRESHOLD_MS) return null;
-    if (now - coinbase.timestamp > STALE_THRESHOLD_MS) return null;
-
-    // Check divergence
-    const mid = (binance.price + coinbase.price) / 2;
-    if (mid === 0) return null;
-    const divergence = Math.abs(binance.price - coinbase.price) / mid;
-
-    if (divergence > MAX_FEED_DIVERGENCE) {
-      log.warn("Feed divergence too high", {
-        symbol: binance.symbol,
-        binancePrice: binance.price,
-        coinbasePrice: coinbase.price,
-        divergence: (divergence * 100).toFixed(3) + "%",
-      });
-      return null;
+    if (price.source === "binance") {
+      this.binancePrices.set(price.symbol, entry);
+    } else {
+      this.coinbasePrices.set(price.symbol, entry);
     }
 
-    // Use midpoint of both feeds
-    return mid;
+    this.feedLastSeen.set(`${price.source}-ws`, Date.now());
+    this.updateConfirmedPrice(price.symbol);
+  }
+
+  private handleTokenPrice(tokenId: string, price: number, timestamp: number): void {
+    this.tokenPrices.set(tokenId, { price, timestamp });
+  }
+
+  private updateConfirmedPrice(symbol: string): void {
+    const binance = this.binancePrices.get(symbol);
+    const coinbase = this.coinbasePrices.get(symbol);
+    const now = Date.now();
+
+    const binanceSpot: SpotPrice | null = binance && (now - binance.timestamp < STALE_THRESHOLD)
+      ? { symbol, price: binance.price, timestamp: binance.timestamp, source: "binance" }
+      : null;
+
+    const coinbaseSpot: SpotPrice | null = coinbase && (now - coinbase.timestamp < STALE_THRESHOLD)
+      ? { symbol, price: coinbase.price, timestamp: coinbase.timestamp, source: "coinbase" }
+      : null;
+
+    let confirmed: number | null = null;
+
+    if (binanceSpot && coinbaseSpot) {
+      const mid = (binanceSpot.price + coinbaseSpot.price) / 2;
+      const divergence = Math.abs(binanceSpot.price - coinbaseSpot.price) / mid * 100;
+
+      if (divergence <= MAX_DIVERGENCE_PERCENT) {
+        confirmed = mid;
+      } else {
+        log.warn("Feed divergence too high", {
+          symbol,
+          binance: binanceSpot.price,
+          coinbase: coinbaseSpot.price,
+          divergence: divergence.toFixed(3),
+        });
+      }
+    }
+
+    const state: PriceState = {
+      binance: binanceSpot,
+      coinbase: coinbaseSpot,
+      confirmedPrice: confirmed,
+      lastUpdate: now,
+    };
+
+    this.confirmedSpot.set(symbol, state);
+
+    if (confirmed !== null) {
+      const history = this.priceHistory.get(symbol) ?? [];
+      history.push({ price: confirmed, timestamp: now });
+      if (history.length > this.MAX_HISTORY) {
+        history.shift();
+      }
+      this.priceHistory.set(symbol, history);
+    }
   }
 }

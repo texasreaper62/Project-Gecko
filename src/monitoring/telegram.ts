@@ -14,7 +14,7 @@ export class TelegramNotifier {
     this.enabled = botToken.length > 0 && chatId.length > 0;
 
     if (!this.enabled) {
-      log.warn("Telegram notifications disabled (missing bot token or chat ID)");
+      log.warn("Telegram notifications disabled (missing token or chat ID)");
     }
   }
 
@@ -32,7 +32,7 @@ export class TelegramNotifier {
           text: message,
           parse_mode: "HTML",
         }),
-      }, { maxAttempts: 2, timeout: 5_000 });
+      });
     } catch (err) {
       log.error("Failed to send Telegram message", {
         error: err instanceof Error ? err.message : String(err),
@@ -40,31 +40,9 @@ export class TelegramNotifier {
     }
   }
 
-  async sendAlert(title: string, details: string): Promise<void> {
-    const msg = `<b>${this.escapeHtml(title)}</b>\n${this.escapeHtml(details)}`;
-    await this.send(msg);
-  }
-
-  async sendTradeAlert(
-    strategy: string,
-    market: string,
-    side: string,
-    price: number,
-    size: number,
-    status: string,
-  ): Promise<void> {
-    const msg = [
-      `<b>Trade ${status.toUpperCase()}</b>`,
-      `Strategy: ${this.escapeHtml(strategy)}`,
-      `Market: ${this.escapeHtml(market)}`,
-      `Side: ${side} | Price: ${price.toFixed(4)} | Size: $${size.toFixed(2)}`,
-    ].join("\n");
-    await this.send(msg);
-  }
-
-  async sendKillSwitchAlert(reason: string): Promise<void> {
-    const msg = `<b>KILL SWITCH ACTIVATED</b>\nReason: ${this.escapeHtml(reason)}`;
-    await this.send(msg);
+  async sendAlert(title: string, body: string): Promise<void> {
+    const message = `<b>${this.escapeHtml(title)}</b>\n\n${this.escapeHtml(body)}`;
+    await this.send(message);
   }
 
   private escapeHtml(text: string): string {

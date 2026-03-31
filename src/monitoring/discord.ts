@@ -24,7 +24,7 @@ export class DiscordNotifier {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ content }),
-      }, { maxAttempts: 2, timeout: 5_000 });
+      });
     } catch (err) {
       log.error("Failed to send Discord message", {
         error: err instanceof Error ? err.message : String(err),
@@ -32,7 +32,7 @@ export class DiscordNotifier {
     }
   }
 
-  async sendEmbed(title: string, description: string, color?: number): Promise<void> {
+  async sendEmbed(title: string, description: string, color = 0x00ff00): Promise<void> {
     if (!this.enabled) return;
 
     try {
@@ -43,33 +43,15 @@ export class DiscordNotifier {
           embeds: [{
             title,
             description,
-            color: color ?? 0x00ff00,
+            color,
             timestamp: new Date().toISOString(),
           }],
         }),
-      }, { maxAttempts: 2, timeout: 5_000 });
+      });
     } catch (err) {
       log.error("Failed to send Discord embed", {
         error: err instanceof Error ? err.message : String(err),
       });
     }
-  }
-
-  async sendTradeAlert(
-    strategy: string,
-    market: string,
-    side: string,
-    price: number,
-    size: number,
-    status: string,
-  ): Promise<void> {
-    const color = status === "filled" ? 0x00ff00 : status === "rejected" ? 0xff0000 : 0xffaa00;
-    const description = [
-      `**Strategy:** ${strategy}`,
-      `**Market:** ${market}`,
-      `**Side:** ${side} | **Price:** ${price.toFixed(4)} | **Size:** $${size.toFixed(2)}`,
-    ].join("\n");
-
-    await this.sendEmbed(`Trade ${status.toUpperCase()}`, description, color);
   }
 }
