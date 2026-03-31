@@ -115,21 +115,39 @@ export class PolymarketWsFeed {
       if (!tokenId) return;
 
       if (msg.bids && msg.bids.length > 0) {
-        this.bestBids.set(tokenId, parseFloat(msg.bids[0].price));
+        const bidPrice = parseFloat(msg.bids[0].price);
+        if (Number.isFinite(bidPrice) && bidPrice > 0) {
+          this.bestBids.set(tokenId, bidPrice);
+        }
       }
       if (msg.asks && msg.asks.length > 0) {
-        this.bestAsks.set(tokenId, parseFloat(msg.asks[0].price));
+        const askPrice = parseFloat(msg.asks[0].price);
+        if (Number.isFinite(askPrice) && askPrice > 0) {
+          this.bestAsks.set(tokenId, askPrice);
+        }
       }
 
-      if (msg.changes) {
-        for (const [side, price, size] of msg.changes) {
+      if (msg.changes && Array.isArray(msg.changes)) {
+        for (const change of msg.changes) {
+          if (!Array.isArray(change) || change.length < 3) continue;
+          const [side, price, size] = change;
           const p = parseFloat(price);
           const s = parseFloat(size);
-          if (side === "buy" && (s === 0 || p > (this.bestBids.get(tokenId) ?? 0))) {
-            this.bestBids.set(tokenId, s > 0 ? p : 0);
+          if (!Number.isFinite(p) || !Number.isFinite(s)) continue;
+
+          if (side === "buy") {
+            if (s === 0 && this.bestBids.get(tokenId) === p) {
+              this.bestBids.delete(tokenId);
+            } else if (s > 0 && p > (this.bestBids.get(tokenId) ?? 0)) {
+              this.bestBids.set(tokenId, p);
+            }
           }
-          if (side === "sell" && (s === 0 || p < (this.bestAsks.get(tokenId) ?? Infinity))) {
-            this.bestAsks.set(tokenId, s > 0 ? p : 0);
+          if (side === "sell") {
+            if (s === 0 && this.bestAsks.get(tokenId) === p) {
+              this.bestAsks.delete(tokenId);
+            } else if (s > 0 && p < (this.bestAsks.get(tokenId) ?? Infinity)) {
+              this.bestAsks.set(tokenId, p);
+            }
           }
         }
       }
@@ -151,9 +169,12 @@ export class PolymarketWsFeed {
       const tokenId = msg.asset_id ?? msg.market;
       if (!tokenId || !msg.price) return;
 
+      const lastPrice = parseFloat(msg.price);
+      if (!Number.isFinite(lastPrice) || lastPrice <= 0) return;
+
       this.onPriceUpdate?.({
         tokenId,
-        price: parseFloat(msg.price),
+        price: lastPrice,
         timestamp: msg.timestamp ? new Date(msg.timestamp).getTime() : Date.now(),
       });
     }

@@ -28,6 +28,13 @@ export class PositionTracker {
     return this.positions.get(tokenId) ?? null;
   }
 
+  getPositionByCondition(conditionId: string): Position | null {
+    for (const pos of this.positions.values()) {
+      if (pos.conditionId === conditionId) return pos;
+    }
+    return null;
+  }
+
   openPosition(
     params: TradeParams,
     result: TradeResult,

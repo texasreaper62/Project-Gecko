@@ -58,14 +58,20 @@ export class BinanceFeed {
     const msg = raw as BinanceCombinedMsg;
     const trade: BinanceTradeMsg = msg.data ?? (raw as BinanceTradeMsg);
 
-    if (trade.e !== "trade") return;
+    if (!trade || trade.e !== "trade") return;
 
     const symbol = this.normalizeSymbol(trade.s);
     if (!symbol) return;
 
+    const priceNum = parseFloat(trade.p);
+    if (!Number.isFinite(priceNum) || priceNum <= 0) {
+      log.warn("Invalid price from Binance", { raw: trade.p, symbol });
+      return;
+    }
+
     const price: SpotPrice = {
       symbol,
-      price: parseFloat(trade.p),
+      price: priceNum,
       timestamp: trade.T,
       source: "binance",
     };

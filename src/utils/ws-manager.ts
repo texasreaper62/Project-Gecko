@@ -55,14 +55,18 @@ export class WsManager {
   connect(): void {
     if (this.ws) {
       this.cleanup();
+      this.ws.removeAllListeners();
+      try { this.ws.terminate(); } catch { /* ignore */ }
+      this.ws = null;
     }
 
     this.intentionallyClosed = false;
     this.status = "connecting";
     this.log.info("Connecting", { url: this.config.url });
 
+    let ws: WebSocket;
     try {
-      this.ws = new WebSocket(this.config.url);
+      ws = new WebSocket(this.config.url);
     } catch (err) {
       this.log.error("Failed to create WebSocket", {
         error: err instanceof Error ? err.message : String(err),
@@ -70,6 +74,7 @@ export class WsManager {
       this.scheduleReconnect();
       return;
     }
+    this.ws = ws;
 
     this.ws.on("open", () => {
       this.status = "connected";
@@ -162,6 +167,8 @@ export class WsManager {
         this.ws.ping();
         this.pongTimer = setTimeout(() => {
           this.log.warn("Pong timeout, reconnecting");
+          this.pongTimer = null;
+          this.stopPing();
           this.ws?.terminate();
         }, this.config.pongTimeout);
       }
@@ -180,7 +187,10 @@ export class WsManager {
   }
 
   private scheduleReconnect(): void {
-    if (this.reconnectTimer) return;
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
 
     this.reconnectCount++;
     this.log.info(`Reconnecting in ${this.reconnectDelay}ms`, {

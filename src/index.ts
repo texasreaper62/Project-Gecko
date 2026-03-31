@@ -148,26 +148,47 @@ async function main(): Promise<void> {
   await Promise.all([
     telegram.sendAlert("Gecko Bot Started", startupMsg),
     discord.sendEmbed("Gecko Bot Started", startupMsg, 0x0099ff),
-  ]);
+  ]).catch((err) => {
+    log.warn("Startup notification failed", {
+      error: err instanceof Error ? err.message : String(err),
+    });
+  });
 
   log.info("Project Gecko fully initialized and running");
 
   // Graceful shutdown
+  let shuttingDown = false;
   const shutdown = async (signal: string): Promise<void> => {
+    if (shuttingDown) return; // Prevent double shutdown
+    shuttingDown = true;
     log.info(`Shutdown signal received: ${signal}`);
 
+    // Stop strategies first (no new trades)
     temporalArb.stop();
     correlatedContracts.stop();
+
+    // Stop monitoring
     healthChecker.stop();
     dailyReporter.stop();
+    clearInterval(heartbeatTimer);
+
+    // Stop feeds
     binance.stop();
     coinbase.stop();
     polyWs.stop();
 
-    await Promise.all([
-      telegram.sendAlert("Gecko Bot Stopped", `Shutdown: ${signal}`),
-      discord.sendEmbed("Gecko Bot Stopped", `Shutdown: ${signal}`, 0xff0000),
-    ]);
+    // Best-effort notification with timeout
+    try {
+      await Promise.race([
+        Promise.all([
+          telegram.sendAlert("Gecko Bot Stopped", `Shutdown: ${signal}`),
+          discord.sendEmbed("Gecko Bot Stopped", `Shutdown: ${signal}`, 0xff0000),
+        ]),
+        new Promise((resolve) => setTimeout(resolve, 5000)),
+      ]);
+    } catch {
+      log.warn("Shutdown notification failed");
+    }
 
     log.info("Shutdown complete");
     process.exit(0);
@@ -176,15 +197,18 @@ async function main(): Promise<void> {
   process.on("SIGINT", () => { shutdown("SIGINT").catch(() => process.exit(1)); });
   process.on("SIGTERM", () => { shutdown("SIGTERM").catch(() => process.exit(1)); });
 
-  // Unhandled rejection safety net
+  // Unhandled rejection safety net: alert and continue (PM2 will restart if needed)
   process.on("unhandledRejection", (reason) => {
     log.error("Unhandled promise rejection", {
       error: reason instanceof Error ? reason.message : String(reason),
     });
+    telegram.sendAlert("UNHANDLED REJECTION",
+      reason instanceof Error ? reason.message : String(reason),
+    ).catch(() => { /* best effort */ });
   });
 
-  // Keep alive
-  setInterval(() => {
+  // Keep alive heartbeat
+  const heartbeatTimer = setInterval(() => {
     log.debug("Heartbeat", {
       positions: positions.getOpenPositionCount(),
       exposure: positions.getTotalExposure(),

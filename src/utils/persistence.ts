@@ -24,8 +24,20 @@ export function readJsonl<T>(filePath: string): T[] {
   try {
     if (!fs.existsSync(filePath)) return [];
     const content = fs.readFileSync(filePath, "utf-8");
-    const lines = content.trim().split("\n").filter((l) => l.length > 0);
-    return lines.map((l) => JSON.parse(l) as T);
+    const lines = content.split("\n").filter((l) => l.trim().length > 0);
+    const results: T[] = [];
+    for (let i = 0; i < lines.length; i++) {
+      try {
+        results.push(JSON.parse(lines[i]) as T);
+      } catch (lineErr) {
+        log.warn("Skipping corrupt JSONL line", {
+          filePath,
+          lineNumber: i + 1,
+          error: lineErr instanceof Error ? lineErr.message : String(lineErr),
+        });
+      }
+    }
+    return results;
   } catch (err) {
     log.error("Failed to read JSONL file", {
       filePath,

@@ -53,9 +53,12 @@ export class FeedAggregator {
     const now = Date.now();
     const binanceLast = this.feedLastSeen.get("binance-ws");
     const coinbaseLast = this.feedLastSeen.get("coinbase-ws");
+    const polyLast = this.feedLastSeen.get("polymarket-ws");
 
     if (!binanceLast || now - binanceLast > FEED_DISCONNECT_LIMIT) return false;
     if (!coinbaseLast || now - coinbaseLast > FEED_DISCONNECT_LIMIT) return false;
+    // Polymarket WS is only required if we have subscribed tokens
+    if (this.tokenPrices.size > 0 && (!polyLast || now - polyLast > FEED_DISCONNECT_LIMIT)) return false;
     return true;
   }
 
@@ -73,7 +76,9 @@ export class FeedAggregator {
   }
 
   private handleTokenPrice(tokenId: string, price: number, timestamp: number): void {
+    if (!Number.isFinite(price) || price <= 0) return;
     this.tokenPrices.set(tokenId, { price, timestamp });
+    this.feedLastSeen.set("polymarket-ws", Date.now());
   }
 
   private updateConfirmedPrice(symbol: string): void {
@@ -93,17 +98,21 @@ export class FeedAggregator {
 
     if (binanceSpot && coinbaseSpot) {
       const mid = (binanceSpot.price + coinbaseSpot.price) / 2;
-      const divergence = Math.abs(binanceSpot.price - coinbaseSpot.price) / mid * 100;
-
-      if (divergence <= MAX_DIVERGENCE_PERCENT) {
-        confirmed = mid;
+      if (mid <= 0) {
+        log.warn("Invalid mid price", { binance: binanceSpot.price, coinbase: coinbaseSpot.price });
       } else {
-        log.warn("Feed divergence too high", {
-          symbol,
-          binance: binanceSpot.price,
-          coinbase: coinbaseSpot.price,
-          divergence: divergence.toFixed(3),
-        });
+        const divergence = Math.abs(binanceSpot.price - coinbaseSpot.price) / mid * 100;
+
+        if (divergence <= MAX_DIVERGENCE_PERCENT) {
+          confirmed = mid;
+        } else {
+          log.warn("Feed divergence too high", {
+            symbol,
+            binance: binanceSpot.price,
+            coinbase: coinbaseSpot.price,
+            divergence: divergence.toFixed(3),
+          });
+        }
       }
     }
 

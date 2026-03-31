@@ -70,6 +70,13 @@ export class OrderBuilder {
       throw new Error("Order builder not initialized");
     }
 
+    // Get tick size and round price to valid tick
+    const tickSizeStr = await this.client.getTickSize(params.tokenId);
+    const tick = parseFloat(tickSizeStr);
+    const roundedPrice = tick > 0
+      ? Math.round(params.price / tick) * tick
+      : params.price;
+
     const side = params.side === "BUY" ? Side.BUY : Side.SELL;
 
     // For FOK/FAK (market orders), use createMarketOrder
@@ -78,6 +85,7 @@ export class OrderBuilder {
         tokenId: params.tokenId,
         side: params.side,
         size: params.size,
+        price: roundedPrice,
         orderType: params.orderType,
       });
 
@@ -85,7 +93,7 @@ export class OrderBuilder {
         tokenID: params.tokenId,
         amount: params.size,
         side,
-        price: params.price,
+        price: roundedPrice,
       });
 
       return { signedOrder, orderType: params.orderType };
@@ -95,14 +103,14 @@ export class OrderBuilder {
     log.info("Creating limit order", {
       tokenId: params.tokenId,
       side: params.side,
-      price: params.price,
+      price: roundedPrice,
       size: params.size,
       orderType: params.orderType,
     });
 
     const signedOrder = await this.client.createOrder({
       tokenID: params.tokenId,
-      price: params.price,
+      price: roundedPrice,
       size: params.size,
       side,
     });

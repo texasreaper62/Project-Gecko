@@ -37,6 +37,23 @@ export class OrderExecutor {
       ...opportunity,
     });
 
+    // Validate params
+    if (opportunity.params.size <= 0 || opportunity.params.price <= 0) {
+      log.warn("Invalid trade params", {
+        price: opportunity.params.price,
+        size: opportunity.params.size,
+      });
+      return null;
+    }
+
+    // Position dedup: don't open a second position on the same market
+    if (this.positions.getPositionByCondition(opportunity.params.conditionId)) {
+      log.info("Already have position in this market", {
+        conditionId: opportunity.params.conditionId,
+      });
+      return null;
+    }
+
     // Risk check
     const riskResult = this.riskManager.checkTrade(opportunity);
     if (!riskResult.allowed) {
@@ -83,15 +100,16 @@ export class OrderExecutor {
         throw new Error("CLOB client not available");
       }
 
-      // postOrder accepts SignedOrder and orderType string; response is untyped (any)
+      // postOrder returns any; extract what we can from response
       const response = await client.postOrder(signedOrder, orderType as never);
+      const status = this.normalizeOrderStatus(response?.status);
 
       const result: TradeResult = {
-        orderId: response?.orderID ?? "unknown",
-        status: response?.status === "matched" ? "filled" : "rejected",
-        fillPrice: opportunity.params.price,
-        fillSize: opportunity.params.size,
-        fees: 0,
+        orderId: response?.orderID ?? response?.order_id ?? "unknown",
+        status,
+        fillPrice: typeof response?.price === "number" ? response.price : opportunity.params.price,
+        fillSize: typeof response?.size === "number" ? response.size : opportunity.params.size,
+        fees: typeof response?.fee === "number" ? response.fee : 0,
         timestamp: Date.now(),
       };
 
@@ -99,9 +117,10 @@ export class OrderExecutor {
         opportunityId: opportunity.id,
         orderId: result.orderId,
         status: result.status,
+        rawStatus: response?.status,
       });
 
-      if (result.status === "filled") {
+      if (result.status === "filled" || result.status === "partial") {
         this.positions.openPosition(
           opportunity.params,
           result,
@@ -128,5 +147,13 @@ export class OrderExecutor {
         error: errorMsg,
       };
     }
+  }
+
+  private normalizeOrderStatus(raw: unknown): "filled" | "partial" | "rejected" | "error" {
+    const s = typeof raw === "string" ? raw.toLowerCase() : "";
+    if (s === "matched" || s === "filled") return "filled";
+    if (s === "partial" || s === "partially_filled") return "partial";
+    if (s === "live" || s === "open") return "partial"; // Order resting on book
+    return "rejected";
   }
 }

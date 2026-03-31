@@ -63,15 +63,27 @@ export class CoinbaseFeed {
 
   private handleMessage(raw: unknown): void {
     const msg = raw as CoinbaseTickerMsg;
-    if (msg.type !== "ticker") return;
+    if (!msg || msg.type !== "ticker") return;
 
     const symbol = this.normalizeSymbol(msg.product_id);
     if (!symbol) return;
 
+    const priceNum = parseFloat(msg.price);
+    if (!Number.isFinite(priceNum) || priceNum <= 0) {
+      log.warn("Invalid price from Coinbase", { raw: msg.price, symbol });
+      return;
+    }
+
+    const timestamp = new Date(msg.time).getTime();
+    if (!Number.isFinite(timestamp)) {
+      log.warn("Invalid timestamp from Coinbase", { raw: msg.time });
+      return;
+    }
+
     const price: SpotPrice = {
       symbol,
-      price: parseFloat(msg.price),
-      timestamp: new Date(msg.time).getTime(),
+      price: priceNum,
+      timestamp,
       source: "coinbase",
     };
 

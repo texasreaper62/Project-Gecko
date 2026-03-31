@@ -19,12 +19,16 @@ interface EventOutcome {
   readonly negRisk: boolean;
 }
 
+// Cooldown per event slug to prevent duplicate scans
+const EVENT_COOLDOWN_MS = 60_000;
+
 export class CorrelatedContractsStrategy {
   private readonly config: AppConfig;
   private readonly polyRest: PolymarketRestClient;
 
   private scanTimer: ReturnType<typeof setInterval> | null = null;
   private onOpportunity: ((opp: Opportunity) => void) | null = null;
+  private readonly recentEvents: Map<string, number> = new Map();
 
   constructor(config: AppConfig, polyRest: PolymarketRestClient) {
     this.config = config;
@@ -67,6 +71,10 @@ export class CorrelatedContractsStrategy {
       for (const event of events) {
         if (!event.markets || event.markets.length < 2) continue;
 
+        // Dedup: skip if we recently signaled this event
+        const lastSignal = this.recentEvents.get(event.slug);
+        if (lastSignal && Date.now() - lastSignal < EVENT_COOLDOWN_MS) continue;
+
         const outcomes: EventOutcome[] = [];
 
         for (const market of event.markets) {
@@ -75,7 +83,7 @@ export class CorrelatedContractsStrategy {
           const yesToken = market.tokens?.find(
             (t) => t.outcome.toUpperCase() === "YES"
           );
-          if (!yesToken) continue;
+          if (!yesToken || yesToken.price <= 0) continue;
 
           outcomes.push({
             conditionId: market.condition_id,
@@ -102,14 +110,16 @@ export class CorrelatedContractsStrategy {
         });
 
         if (deviation < -SUM_DEVIATION_THRESHOLD) {
-          // Prices sum to < 1.0: buy opportunity
-          // Find the most underpriced outcome (lowest YES price, likely to be undervalued)
+          // Prices sum to < 1.0: all outcomes are underpriced
+          // Buy the outcome with the LOWEST YES price (most undervalued, biggest upside)
           const sorted = [...outcomes].sort((a, b) => a.yesPrice - b.yesPrice);
-          const best = sorted[sorted.length - 1]; // Highest probability but sum < 1 means all are cheap
+          const best = sorted[0]; // Lowest price = most undervalued
 
-          // Actually, in an underpriced scenario, we want the outcome we think is most likely
-          // to win. We use the highest-priced one as a proxy.
           if (best && best.yesPrice > 0 && best.yesPrice < 1) {
+            // Confidence-weighted sizing
+            const confidence = Math.min(Math.abs(deviation) / 10, 1);
+            const positionSize = this.config.maxPositionSize * Math.max(confidence, 0.2);
+
             const opp: Opportunity = {
               id: generateOpportunityId("correlated-contracts"),
               strategy: "correlated-contracts",
@@ -117,12 +127,12 @@ export class CorrelatedContractsStrategy {
               description: `${event.title}: ${outcomes.length} outcomes sum to ${(totalProb * 100).toFixed(1)}% ` +
                 `(expected 100%). Buy opportunity on "${best.question}" at ${(best.yesPrice * 100).toFixed(1)}%`,
               expectedSpread: Math.abs(deviation),
-              confidence: Math.min(Math.abs(deviation) / 10, 1),
+              confidence,
               params: {
                 tokenId: best.yesTokenId,
                 side: "BUY",
                 price: best.yesPrice,
-                size: Math.min(this.config.maxPositionSize, this.config.maxPositionSize),
+                size: positionSize,
                 orderType: "GTC",
                 conditionId: best.conditionId,
                 negRisk: best.negRisk,
@@ -140,6 +150,7 @@ export class CorrelatedContractsStrategy {
               },
             };
 
+            this.recentEvents.set(event.slug, Date.now());
             opportunities.push(opp);
             this.onOpportunity?.(opp);
           }
