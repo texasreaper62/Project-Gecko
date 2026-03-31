@@ -1,0 +1,25 @@
+{
+  "name": "predictionarb",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "dev": "node --import tsx src/index.ts",
+    "start": "node dist/index.js"
+  },
+  "dependencies": {
+    "@polymarket/clob-client": "latest",
+    "@polymarket/order-utils": "latest",
+    "dotenv": "^16",
+    "ethers": "^6",
+    "ws": "^8"
+  },
+  "devDependencies": {
+    "@types/node": "^20",
+    "@types/ws": "^8",
+    "tsx": "^4",
+    "typescript": "^5"
+  }
+}
