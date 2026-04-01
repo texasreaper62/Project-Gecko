@@ -35,14 +35,19 @@ export class DiscordNotifier {
   async sendEmbed(title: string, description: string, color = 0x00ff00): Promise<void> {
     if (!this.enabled) return;
 
+    // Discord embed description limit is 2048 chars
+    const truncated = description.length > 2048
+      ? description.slice(0, 2040) + "\n[...]"
+      : description;
+
     try {
       await fetchWithRetry(this.webhookUrl, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           embeds: [{
-            title,
-            description,
+            title: title.slice(0, 256),
+            description: truncated,
             color,
             timestamp: new Date().toISOString(),
           }],

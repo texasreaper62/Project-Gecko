@@ -52,11 +52,24 @@ function validateLogLevel(val: string): LogLevel {
   return val as LogLevel;
 }
 
+function validateHex(name: string, value: string): string {
+  if (!/^0x[0-9a-fA-F]+$/.test(value)) {
+    throw new Error(`${name} must be a hex string starting with 0x (got: ${value.slice(0, 6)}...)`);
+  }
+  return value;
+}
+
 export function loadConfig(): AppConfig {
+  const privateKey = required("PRIVATE_KEY");
+  validateHex("PRIVATE_KEY", privateKey);
+
+  const walletAddress = required("WALLET_ADDRESS");
+  validateHex("WALLET_ADDRESS", walletAddress);
+
   return {
     // Wallet
-    privateKey: required("PRIVATE_KEY"),
-    walletAddress: required("WALLET_ADDRESS"),
+    privateKey,
+    walletAddress,
     funderAddress: optional("FUNDER_ADDRESS", ""),
     signatureType: optionalNumber("SIGNATURE_TYPE", 0),
 

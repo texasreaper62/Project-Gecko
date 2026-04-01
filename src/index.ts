@@ -172,7 +172,8 @@ async function main(): Promise<void> {
     dailyReporter.stop();
     clearInterval(heartbeatTimer);
 
-    // Stop feeds
+    // Stop feeds and aggregator cleanup
+    aggregator.stop();
     binance.stop();
     coinbase.stop();
     polyWs.stop();

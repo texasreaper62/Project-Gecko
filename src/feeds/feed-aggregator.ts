@@ -9,6 +9,10 @@ const log = createLogger("feed-aggregator");
 const STALE_THRESHOLD = 5_000;
 const MAX_DIVERGENCE_PERCENT = 0.5;
 const FEED_DISCONNECT_LIMIT = 30_000;
+// Cleanup stale token entries every 5 minutes
+const CLEANUP_INTERVAL = 300_000;
+// Token entries older than 1 hour are stale
+const TOKEN_STALE_THRESHOLD = 3_600_000;
 
 interface PriceEntry {
   price: number;
@@ -23,6 +27,7 @@ export class FeedAggregator {
   private readonly priceHistory: Map<string, { price: number; timestamp: number }[]> = new Map();
   private readonly MAX_HISTORY = 60;
   private readonly feedLastSeen: Map<string, number> = new Map();
+  private cleanupTimer: ReturnType<typeof setInterval> | null = null;
 
   constructor(
     binance: BinanceFeed,
@@ -32,6 +37,16 @@ export class FeedAggregator {
     binance.setPriceHandler((p) => this.handleSpotPrice(p));
     coinbase.setPriceHandler((p) => this.handleSpotPrice(p));
     polymarketWs.setPriceUpdateHandler((u) => this.handleTokenPrice(u.tokenId, u.price, u.timestamp));
+
+    // Periodic cleanup of stale entries
+    this.cleanupTimer = setInterval(() => this.cleanupStaleEntries(), CLEANUP_INTERVAL);
+  }
+
+  stop(): void {
+    if (this.cleanupTimer) {
+      clearInterval(this.cleanupTimer);
+      this.cleanupTimer = null;
+    }
   }
 
   getConfirmedSpotPrice(symbol: string): PriceState | null {
@@ -132,6 +147,22 @@ export class FeedAggregator {
         history.shift();
       }
       this.priceHistory.set(symbol, history);
+    }
+  }
+
+  private cleanupStaleEntries(): void {
+    const now = Date.now();
+    let cleaned = 0;
+
+    for (const [tokenId, entry] of this.tokenPrices) {
+      if (now - entry.timestamp > TOKEN_STALE_THRESHOLD) {
+        this.tokenPrices.delete(tokenId);
+        cleaned++;
+      }
+    }
+
+    if (cleaned > 0) {
+      log.debug("Cleaned stale token prices", { removed: cleaned, remaining: this.tokenPrices.size });
     }
   }
 }

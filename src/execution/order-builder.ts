@@ -73,7 +73,7 @@ export class OrderBuilder {
     // Get tick size and round price to valid tick
     const tickSizeStr = await this.client.getTickSize(params.tokenId);
     const tick = parseFloat(tickSizeStr);
-    const roundedPrice = tick > 0
+    const roundedPrice = Number.isFinite(tick) && tick > 0
       ? Math.round(params.price / tick) * tick
       : params.price;
 

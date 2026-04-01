@@ -95,15 +95,13 @@ export class PolymarketRestClient {
       asks: { price: string; size: string }[];
     };
 
-    const bids: OrderBookLevel[] = (raw.bids ?? []).map((l) => ({
-      price: parseFloat(l.price),
-      size: parseFloat(l.size),
-    }));
+    const bids: OrderBookLevel[] = (raw.bids ?? [])
+      .map((l) => ({ price: parseFloat(l.price), size: parseFloat(l.size) }))
+      .filter((l) => Number.isFinite(l.price) && Number.isFinite(l.size) && l.price > 0);
 
-    const asks: OrderBookLevel[] = (raw.asks ?? []).map((l) => ({
-      price: parseFloat(l.price),
-      size: parseFloat(l.size),
-    }));
+    const asks: OrderBookLevel[] = (raw.asks ?? [])
+      .map((l) => ({ price: parseFloat(l.price), size: parseFloat(l.size) }))
+      .filter((l) => Number.isFinite(l.price) && Number.isFinite(l.size) && l.price > 0);
 
     const bestBid = bids.length > 0 ? bids[0].price : 0;
     const bestAsk = asks.length > 0 ? asks[0].price : 0;
@@ -121,14 +119,22 @@ export class PolymarketRestClient {
     const url = `${this.clobUrl}/midpoint?token_id=${tokenId}`;
     const resp = await fetchWithRetry(url);
     const data = await resp.json() as { mid: string };
-    return parseFloat(data.mid);
+    const mid = parseFloat(data.mid);
+    if (!Number.isFinite(mid)) {
+      throw new Error(`Invalid midpoint for ${tokenId}: ${data.mid}`);
+    }
+    return mid;
   }
 
   async getPrice(tokenId: string, side: "BUY" | "SELL"): Promise<number> {
     const url = `${this.clobUrl}/price?token_id=${tokenId}&side=${side}`;
     const resp = await fetchWithRetry(url);
     const data = await resp.json() as { price: string };
-    return parseFloat(data.price);
+    const price = parseFloat(data.price);
+    if (!Number.isFinite(price)) {
+      throw new Error(`Invalid price for ${tokenId} ${side}: ${data.price}`);
+    }
+    return price;
   }
 
   private mapMarket(m: GammaMarket): PolymarketMarket {
@@ -151,8 +157,8 @@ export class PolymarketRestClient {
       closed: m.closed,
       negRisk: m.neg_risk,
       endDateIso: m.end_date_iso,
-      volume: parseFloat(m.volume ?? "0"),
-      liquidity: parseFloat(m.liquidity ?? "0"),
+      volume: parseFloat(m.volume ?? "0") || 0,
+      liquidity: parseFloat(m.liquidity ?? "0") || 0,
       eventSlug: event?.slug ?? "",
       eventTitle: event?.title ?? "",
     };

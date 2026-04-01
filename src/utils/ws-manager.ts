@@ -21,6 +21,7 @@ export class WsManager {
   private reconnectCount = 0;
   private lastMessageTime = 0;
   private status: FeedStatus = "disconnected";
+  private lastError: string | null = null;
   private intentionallyClosed = false;
 
   private onMessage: MessageHandler | null = null;
@@ -118,6 +119,7 @@ export class WsManager {
     });
 
     this.ws.on("error", (err: Error) => {
+      this.lastError = err.message;
       this.log.error("WebSocket error", { error: err.message });
       this.status = "error";
       // 'close' event will follow, which triggers reconnect
@@ -149,6 +151,7 @@ export class WsManager {
       status: this.status,
       lastMessage: this.lastMessageTime,
       reconnectCount: this.reconnectCount,
+      ...(this.lastError ? { error: this.lastError } : {}),
     };
   }
 

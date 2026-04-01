@@ -18,6 +18,7 @@ export function edgePercent(trueProbability: number, marketProbability: number):
 
 // Round a price to the given tick size (e.g., 0.01 for cents)
 export function roundToTick(price: number, tickSize: number): number {
+  if (!Number.isFinite(tickSize) || tickSize <= 0) return price;
   return Math.round(price / tickSize) * tickSize;
 }
 

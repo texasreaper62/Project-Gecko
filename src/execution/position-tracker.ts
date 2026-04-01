@@ -1,12 +1,20 @@
+import * as fs from "node:fs";
+import * as path from "node:path";
 import { createLogger } from "../core/logger.js";
 import type { Position, TradeResult, TradeParams, TradeRecord, StrategyType } from "../core/types.js";
-import { appendJsonl } from "../utils/persistence.js";
+import { appendJsonl, readJsonl } from "../utils/persistence.js";
 import { nowIso } from "../utils/time.js";
 
 const log = createLogger("position-tracker");
 
+const POSITIONS_FILE = "data/positions.jsonl";
+
 export class PositionTracker {
   private readonly positions: Map<string, Position> = new Map();
+
+  constructor() {
+    this.loadOpenPositions();
+  }
 
   getOpenPositionCount(): number {
     return this.positions.size;
@@ -62,7 +70,7 @@ export class PositionTracker {
       size: result.fillSize,
     });
 
-    // Record the trade
+    // Record the trade (open)
     const record: TradeRecord = {
       ts: nowIso(),
       market: marketQuestion,
@@ -80,6 +88,7 @@ export class PositionTracker {
     };
 
     appendJsonl("data/trades.jsonl", record);
+    this.persistOpenPositions();
   }
 
   closePosition(tokenId: string, exitPrice: number, fees: number): number {
@@ -104,6 +113,26 @@ export class PositionTracker {
       pnl: pnl.toFixed(4),
     });
 
+    // Record the close event with realized P&L
+    const closeRecord: TradeRecord = {
+      ts: nowIso(),
+      market: pos.market,
+      conditionId: pos.conditionId,
+      side: pos.side === "BUY" ? "SELL" : "BUY",
+      tokenId: pos.tokenId,
+      price: exitPrice,
+      size: pos.size,
+      orderId: "",
+      status: "closed",
+      fillPrice: exitPrice,
+      fees,
+      pnl,
+      strategy: "temporal-arb", // TODO: track strategy per position
+    };
+
+    appendJsonl("data/trades.jsonl", closeRecord);
+    this.persistOpenPositions();
+
     return pnl;
   }
 
@@ -123,5 +152,44 @@ export class PositionTracker {
       total += pos.unrealizedPnl;
     }
     return total;
+  }
+
+  private persistOpenPositions(): void {
+    // Overwrite positions file with current open positions
+    try {
+      const dir = path.dirname(POSITIONS_FILE);
+      if (!fs.existsSync(dir)) {
+        fs.mkdirSync(dir, { recursive: true });
+      }
+      const lines = Array.from(this.positions.values())
+        .map((p) => JSON.stringify(p))
+        .join("\n");
+      fs.writeFileSync(POSITIONS_FILE, lines ? lines + "\n" : "", "utf-8");
+    } catch (err) {
+      log.error("Failed to persist open positions", {
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
+  private loadOpenPositions(): void {
+    try {
+      const positions = readJsonl<Position>(POSITIONS_FILE);
+      for (const pos of positions) {
+        if (pos.tokenId && pos.conditionId) {
+          this.positions.set(pos.tokenId, pos);
+        }
+      }
+      if (positions.length > 0) {
+        log.info("Restored open positions from disk", {
+          count: positions.length,
+          exposure: this.getTotalExposure().toFixed(2),
+        });
+      }
+    } catch (err) {
+      log.warn("Could not load open positions", {
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
   }
 }

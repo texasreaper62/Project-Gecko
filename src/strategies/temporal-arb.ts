@@ -255,6 +255,14 @@ export class TemporalArbStrategy {
         this.polyWs.subscribeToTokens(tokenIds);
       }
 
+      // Cleanup expired cooldown entries to prevent memory leak
+      const now = Date.now();
+      for (const [key, ts] of this.recentOpportunities) {
+        if (now - ts > OPPORTUNITY_COOLDOWN_MS * 2) {
+          this.recentOpportunities.delete(key);
+        }
+      }
+
       log.info("Refreshed target markets", {
         total: markets.length,
         targets: this.targetMarkets.length,

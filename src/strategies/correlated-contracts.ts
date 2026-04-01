@@ -66,6 +66,14 @@ export class CorrelatedContractsStrategy {
     const opportunities: Opportunity[] = [];
 
     try {
+      // Cleanup expired cooldown entries to prevent memory leak
+      const now = Date.now();
+      for (const [key, ts] of this.recentEvents) {
+        if (now - ts > EVENT_COOLDOWN_MS * 2) {
+          this.recentEvents.delete(key);
+        }
+      }
+
       const events = await this.polyRest.getNegRiskEvents();
 
       for (const event of events) {
