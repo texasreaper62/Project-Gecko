@@ -1,5 +1,11 @@
 import { createLogger } from "../core/logger.js";
 import { fetchWithRetry } from "../utils/retry.js";
+import {
+  createBookPriceLimiter,
+  createGammaEventsLimiter,
+  createGammaMarketsLimiter,
+  type RateLimiter,
+} from "../utils/rate-limiter.js";
 import type { PolymarketMarket, PolymarketToken, OrderBookSnapshot, OrderBookLevel } from "../core/types.js";
 
 const log = createLogger("polymarket-rest");
@@ -41,12 +47,19 @@ interface GammaEventResponse {
 
 export class PolymarketRestClient {
   private readonly clobUrl: string;
+  private readonly bookPriceLimiter: RateLimiter;
+  private readonly gammaEventsLimiter: RateLimiter;
+  private readonly gammaMarketsLimiter: RateLimiter;
 
   constructor(clobUrl: string) {
+    this.bookPriceLimiter = createBookPriceLimiter();
+    this.gammaEventsLimiter = createGammaEventsLimiter();
+    this.gammaMarketsLimiter = createGammaMarketsLimiter();
     this.clobUrl = clobUrl;
   }
 
   async getActiveEvents(limit = 50, offset = 0): Promise<GammaEventResponse[]> {
+    await this.gammaEventsLimiter.acquire();
     const url = `${GAMMA_BASE}/events?closed=false&active=true&limit=${limit}&offset=${offset}`;
     log.debug("Fetching active events", { url });
 
@@ -57,6 +70,7 @@ export class PolymarketRestClient {
   }
 
   async getActiveMarkets(limit = 100, offset = 0): Promise<PolymarketMarket[]> {
+    await this.gammaMarketsLimiter.acquire();
     const url = `${GAMMA_BASE}/markets?active=true&closed=false&limit=${limit}&offset=${offset}`;
     log.debug("Fetching active markets", { url });
 
@@ -66,6 +80,7 @@ export class PolymarketRestClient {
   }
 
   async getCryptoMarkets(): Promise<PolymarketMarket[]> {
+    await this.gammaMarketsLimiter.acquire();
     const url = `${GAMMA_BASE}/markets?active=true&closed=false&limit=100&tag=crypto`;
     log.debug("Fetching crypto markets", { url });
 
@@ -86,6 +101,7 @@ export class PolymarketRestClient {
   }
 
   async getOrderBook(tokenId: string): Promise<OrderBookSnapshot> {
+    await this.bookPriceLimiter.acquire();
     const url = `${this.clobUrl}/book?token_id=${tokenId}`;
     log.debug("Fetching order book", { tokenId });
 
@@ -116,6 +132,7 @@ export class PolymarketRestClient {
   }
 
   async getMidpoint(tokenId: string): Promise<number> {
+    await this.bookPriceLimiter.acquire();
     const url = `${this.clobUrl}/midpoint?token_id=${tokenId}`;
     const resp = await fetchWithRetry(url);
     const data = await resp.json() as { mid: string };
@@ -127,6 +144,7 @@ export class PolymarketRestClient {
   }
 
   async getPrice(tokenId: string, side: "BUY" | "SELL"): Promise<number> {
+    await this.bookPriceLimiter.acquire();
     const url = `${this.clobUrl}/price?token_id=${tokenId}&side=${side}`;
     const resp = await fetchWithRetry(url);
     const data = await resp.json() as { price: string };

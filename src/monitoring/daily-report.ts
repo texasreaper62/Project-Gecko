@@ -18,6 +18,7 @@ export class DailyReporter {
 
   private timer: ReturnType<typeof setInterval> | null = null;
   private lastReportDate = "";
+  private opportunityCount = 0;
 
   constructor(
     config: AppConfig,
@@ -33,8 +34,11 @@ export class DailyReporter {
     this.discord = discord;
   }
 
+  incrementOpportunities(): void {
+    this.opportunityCount++;
+  }
+
   start(): void {
-    // Check every minute if we've crossed midnight UTC
     this.timer = setInterval(() => {
       this.checkMidnight().catch((err) => {
         log.error("Daily report error", {
@@ -44,7 +48,7 @@ export class DailyReporter {
     }, 60_000);
 
     this.lastReportDate = isoDate();
-    log.info("Daily reporter started");
+    log.info("Daily reporter started (UTC midnight)");
   }
 
   stop(): void {
@@ -58,9 +62,11 @@ export class DailyReporter {
     const today = isoDate();
     if (today === this.lastReportDate) return;
 
-    // New day! Send report for previous day
     this.lastReportDate = today;
     await this.sendReport();
+
+    // Reset daily counters after report
+    this.opportunityCount = 0;
   }
 
   async sendReport(): Promise<void> {
@@ -72,7 +78,7 @@ export class DailyReporter {
       .join("\n");
 
     const report = [
-      `Daily Report - ${isoDate()}`,
+      `Daily Report (UTC) - ${isoDate()}`,
       "---",
       summary,
       "---",
@@ -81,6 +87,7 @@ export class DailyReporter {
       "---",
       `Kill Switch: ${healthStatus.killSwitch ? "ACTIVE" : "inactive"}`,
       `Uptime: ${(healthStatus.uptime / 3_600_000).toFixed(1)} hours`,
+      `Opportunities scanned: ${this.opportunityCount}`,
     ].join("\n");
 
     log.info("Sending daily report");
@@ -88,13 +95,28 @@ export class DailyReporter {
     await Promise.all([
       this.telegram.sendAlert("Gecko Daily Report", report),
       this.discord.sendEmbed("Gecko Daily Report", report),
-    ]);
+    ]).catch((err) => {
+      log.error("Failed to send daily report notifications", {
+        error: err instanceof Error ? err.message : String(err),
+      });
+    });
 
-    // Persist summary
-    const dailySummary: Partial<DailySummary> = {
+    // Persist complete summary
+    const dailySummary: DailySummary = {
       date: isoDate(),
+      totalTrades: this.pnl.getTradeCount(),
+      winningTrades: this.pnl.getWinCount(),
+      losingTrades: this.pnl.getLossCount(),
       totalPnl: this.pnl.getTotalPnl(),
+      totalFees: this.pnl.getTotalFees(),
       netPnl: this.pnl.getNetPnl(),
+      maxDrawdown: 0, // TODO: track intra-day drawdown
+      opportunities: this.opportunityCount,
+      strategies: {
+        "temporal-arb": { enabled: true, lastScan: Date.now(), opportunitiesFound: 0, tradesExecuted: 0 },
+        "cross-platform": { enabled: false, lastScan: 0, opportunitiesFound: 0, tradesExecuted: 0 },
+        "correlated-contracts": { enabled: true, lastScan: Date.now(), opportunitiesFound: 0, tradesExecuted: 0 },
+      },
     };
     appendJsonl("data/daily-summary.jsonl", dailySummary);
   }

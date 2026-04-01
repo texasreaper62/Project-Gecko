@@ -25,6 +25,10 @@ import { DiscordNotifier } from "./monitoring/discord.js";
 import { PnlTracker } from "./monitoring/pnl-tracker.js";
 import { HealthChecker } from "./monitoring/health-check.js";
 import { DailyReporter } from "./monitoring/daily-report.js";
+import { WalletMonitor } from "./monitoring/wallet-monitor.js";
+
+// Position management
+import { PositionCloser } from "./execution/position-closer.js";
 
 const log = createLogger("main");
 
@@ -75,12 +79,25 @@ async function main(): Promise<void> {
 
   const executor = new OrderExecutor(config, orderBuilder, riskManager, positions, polyRest);
 
+  // Initialize wallet monitor
+  const walletMonitor = new WalletMonitor(config, riskManager);
+  if (config.polygonRpcUrl) {
+    await walletMonitor.start().catch((err) => {
+      log.warn("Wallet monitor failed to start (balance monitoring disabled)", {
+        error: err instanceof Error ? err.message : String(err),
+      });
+    });
+  }
+
   // Initialize monitoring
   const telegram = new TelegramNotifier(config.telegramBotToken, config.telegramChatId);
   const discord = new DiscordNotifier(config.discordWebhookUrl);
   const pnlTracker = new PnlTracker(positions);
-  const healthChecker = new HealthChecker(binance, coinbase, polyWs, positions, riskManager);
+  const healthChecker = new HealthChecker(binance, coinbase, polyWs, positions, riskManager, walletMonitor);
   const dailyReporter = new DailyReporter(config, pnlTracker, healthChecker, telegram, discord);
+
+  // Position auto-closer (take-profit, stop-loss, max hold time)
+  const positionCloser = new PositionCloser(config, positions, aggregator, pnlTracker, telegram);
 
   // Opportunity handler: shared across all strategies
   const handleOpportunity = async (opp: Opportunity): Promise<void> => {
@@ -91,9 +108,11 @@ async function main(): Promise<void> {
       confidence: opp.confidence.toFixed(2),
     });
 
+    dailyReporter.incrementOpportunities();
+
     if (config.liveTrading) {
       const result = await executor.executeOpportunity(opp);
-      if (result && result.status === "filled") {
+      if (result && (result.status === "filled" || result.status === "partial")) {
         const msg = `Trade executed: ${opp.strategy}\n${opp.description}\nFill: $${result.fillPrice} x ${result.fillSize}`;
         await Promise.all([
           telegram.sendAlert("Trade Executed", msg),
@@ -135,6 +154,7 @@ async function main(): Promise<void> {
   log.info("Starting monitoring...");
   healthChecker.start();
   dailyReporter.start();
+  positionCloser.start();
 
   // Send startup notification
   const startupMsg = [
@@ -143,6 +163,8 @@ async function main(): Promise<void> {
     `Max Exposure: $${config.maxTotalExposure}`,
     `Min Spread: ${config.minSpreadThreshold}%`,
     `Kill Switch: ${config.killSwitch ? "ACTIVE" : "inactive"}`,
+    `Wallet Balance: $${walletMonitor.getBalance().toFixed(2)}`,
+    `Open Positions: ${positions.getOpenPositionCount()} ($${positions.getTotalExposure().toFixed(2)} exposure)`,
   ].join("\n");
 
   await Promise.all([
@@ -167,9 +189,11 @@ async function main(): Promise<void> {
     temporalArb.stop();
     correlatedContracts.stop();
 
-    // Stop monitoring
+    // Stop monitoring and position management
+    positionCloser.stop();
     healthChecker.stop();
     dailyReporter.stop();
+    walletMonitor.stop();
     clearInterval(heartbeatTimer);
 
     // Stop feeds and aggregator cleanup
