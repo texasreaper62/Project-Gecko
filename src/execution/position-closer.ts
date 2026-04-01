@@ -1,6 +1,7 @@
 import { createLogger } from "../core/logger.js";
-import type { AppConfig, Position } from "../core/types.js";
+import type { AppConfig, Position, TradeParams } from "../core/types.js";
 import type { PositionTracker } from "./position-tracker.js";
+import type { OrderExecutor } from "./order-executor.js";
 import type { FeedAggregator } from "../feeds/feed-aggregator.js";
 import type { PnlTracker } from "../monitoring/pnl-tracker.js";
 import type { TelegramNotifier } from "../monitoring/telegram.js";
@@ -9,30 +10,35 @@ const log = createLogger("position-closer");
 
 // Check positions every 5 seconds
 const CHECK_INTERVAL = 5_000;
-// Close positions 30 seconds before contract expiry
-const EXPIRY_BUFFER_MS = 30_000;
 // Take profit at 15% gain
 const TAKE_PROFIT_PERCENT = 15;
 // Stop loss at -10% loss
 const STOP_LOSS_PERCENT = -10;
+// Max hold time for short-term arb positions
+const MAX_HOLD_MS = 30 * 60 * 1000;
 
 export class PositionCloser {
   private readonly config: AppConfig;
   private readonly positions: PositionTracker;
+  private readonly executor: OrderExecutor;
   private readonly aggregator: FeedAggregator;
   private readonly pnlTracker: PnlTracker;
   private readonly telegram: TelegramNotifier;
   private timer: ReturnType<typeof setInterval> | null = null;
+  // Prevent closing the same position twice concurrently
+  private readonly closingTokens: Set<string> = new Set();
 
   constructor(
     config: AppConfig,
     positions: PositionTracker,
+    executor: OrderExecutor,
     aggregator: FeedAggregator,
     pnlTracker: PnlTracker,
     telegram: TelegramNotifier,
   ) {
     this.config = config;
     this.positions = positions;
+    this.executor = executor;
     this.aggregator = aggregator;
     this.pnlTracker = pnlTracker;
     this.telegram = telegram;
@@ -61,6 +67,9 @@ export class PositionCloser {
     if (openPositions.length === 0) return;
 
     for (const pos of openPositions) {
+      // Skip if already being closed
+      if (this.closingTokens.has(pos.tokenId)) continue;
+
       // Update current price from aggregator
       const currentPrice = this.aggregator.getTokenPrice(pos.tokenId);
       if (currentPrice !== null) {
@@ -75,24 +84,18 @@ export class PositionCloser {
   }
 
   private shouldClose(pos: Position): string | null {
-    // 1. Check if position is near expiry (contract about to settle)
-    // We don't have expiry info stored on position, so we skip this for now
-    // and rely on contract settlement
+    const pnlPct = this.pnlPercent(pos);
 
-    // 2. Take profit
-    const pnlPercent = this.pnlPercent(pos);
-    if (pnlPercent >= TAKE_PROFIT_PERCENT) {
-      return `Take profit: ${pnlPercent.toFixed(1)}% gain`;
+    if (pnlPct >= TAKE_PROFIT_PERCENT) {
+      return `Take profit: ${pnlPct.toFixed(1)}% gain`;
     }
 
-    // 3. Stop loss
-    if (pnlPercent <= STOP_LOSS_PERCENT) {
-      return `Stop loss: ${pnlPercent.toFixed(1)}% loss`;
+    if (pnlPct <= STOP_LOSS_PERCENT) {
+      return `Stop loss: ${pnlPct.toFixed(1)}% loss`;
     }
 
-    // 4. Position held too long (over 30 minutes for short-term arb)
     const holdTimeMs = Date.now() - pos.openTimestamp;
-    if (holdTimeMs > 30 * 60 * 1000) {
+    if (holdTimeMs > MAX_HOLD_MS) {
       return `Max hold time exceeded: ${(holdTimeMs / 60_000).toFixed(0)}min`;
     }
 
@@ -108,6 +111,8 @@ export class PositionCloser {
   }
 
   private async closePosition(pos: Position, reason: string): Promise<void> {
+    this.closingTokens.add(pos.tokenId);
+
     log.info("Auto-closing position", {
       tokenId: pos.tokenId,
       reason,
@@ -115,16 +120,48 @@ export class PositionCloser {
       currentPrice: pos.currentPrice,
     });
 
-    // For now, close at current price (in live trading, this would submit a sell order)
-    const exitPrice = pos.currentPrice;
-    const pnl = this.positions.closePosition(pos.tokenId, exitPrice, 0);
-    this.pnlTracker.recordTrade(pnl, 0);
+    try {
+      // Submit actual sell order if live trading is enabled
+      let exitPrice = pos.currentPrice;
+      let fees = 0;
 
-    const msg = `Position auto-closed: ${reason}\n` +
-      `Market: ${pos.market}\n` +
-      `Entry: $${pos.entryPrice.toFixed(4)} -> Exit: $${exitPrice.toFixed(4)}\n` +
-      `P&L: $${pnl.toFixed(4)}`;
+      if (this.config.liveTrading) {
+        const sellParams: TradeParams = {
+          tokenId: pos.tokenId,
+          side: "SELL",
+          price: pos.currentPrice,
+          size: pos.size,
+          orderType: "FOK",
+          conditionId: pos.conditionId,
+          negRisk: false,
+        };
 
-    await this.telegram.sendAlert("Position Closed", msg).catch(() => {});
+        const result = await this.executor.submitSellOrder(sellParams);
+        if (result && (result.status === "filled" || result.status === "partial")) {
+          exitPrice = result.fillPrice;
+          fees = result.fees;
+        } else {
+          // Sell order failed or was rejected; log but still close locally
+          // The tokens remain in the wallet but we remove tracking
+          log.warn("Sell order did not fill, closing position locally", {
+            tokenId: pos.tokenId,
+            result: result?.status ?? "null",
+          });
+        }
+      }
+
+      const pnl = this.positions.closePosition(pos.tokenId, exitPrice, fees);
+      this.pnlTracker.recordTrade(pnl, fees);
+      this.executor.recordTradeResult(pnl);
+
+      const msg = `Position auto-closed: ${reason}\n` +
+        `Market: ${pos.market}\n` +
+        `Entry: $${pos.entryPrice.toFixed(4)} -> Exit: $${exitPrice.toFixed(4)}\n` +
+        `P&L: $${pnl.toFixed(4)}`;
+
+      await this.telegram.sendAlert("Position Closed", msg).catch(() => {});
+    } finally {
+      this.closingTokens.delete(pos.tokenId);
+    }
   }
 }

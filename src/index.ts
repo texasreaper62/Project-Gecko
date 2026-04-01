@@ -97,7 +97,7 @@ async function main(): Promise<void> {
   const dailyReporter = new DailyReporter(config, pnlTracker, healthChecker, telegram, discord);
 
   // Position auto-closer (take-profit, stop-loss, max hold time)
-  const positionCloser = new PositionCloser(config, positions, aggregator, pnlTracker, telegram);
+  const positionCloser = new PositionCloser(config, positions, executor, aggregator, pnlTracker, telegram);
 
   // Opportunity handler: shared across all strategies
   const handleOpportunity = async (opp: Opportunity): Promise<void> => {
@@ -195,6 +195,15 @@ async function main(): Promise<void> {
     dailyReporter.stop();
     walletMonitor.stop();
     clearInterval(heartbeatTimer);
+
+    // Cancel all open orders on the exchange
+    if (config.liveTrading) {
+      await executor.cancelAllOrders().catch((err) => {
+        log.error("Failed to cancel orders on shutdown", {
+          error: err instanceof Error ? err.message : String(err),
+        });
+      });
+    }
 
     // Stop feeds and aggregator cleanup
     aggregator.stop();

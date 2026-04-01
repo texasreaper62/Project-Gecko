@@ -44,6 +44,14 @@ function optionalBool(name: string, fallback: boolean): boolean {
   return raw.trim().toLowerCase() === "true";
 }
 
+function boundedNumber(name: string, fallback: number, min: number, max: number): number {
+  const val = optionalNumber(name, fallback);
+  if (val < min || val > max) {
+    throw new Error(`${name} must be between ${min} and ${max}, got: ${val}`);
+  }
+  return val;
+}
+
 function validateLogLevel(val: string): LogLevel {
   const valid: LogLevel[] = ["debug", "info", "warn", "error"];
   if (!valid.includes(val as LogLevel)) {
@@ -93,12 +101,12 @@ export function loadConfig(): AppConfig {
     kalshiPrivateKeyPath: optional("KALSHI_PRIVATE_KEY_PATH", ""),
     kalshiApiUrl: optional("KALSHI_API_URL", "https://api.elections.kalshi.com/trade-api/v2"),
 
-    // Trading
-    minSpreadThreshold: optionalNumber("MIN_SPREAD_THRESHOLD", 5.0),
-    maxPositionSize: optionalNumber("MAX_POSITION_SIZE", 50),
-    maxTotalExposure: optionalNumber("MAX_TOTAL_EXPOSURE", 1000),
-    maxOpenPositions: optionalNumber("MAX_OPEN_POSITIONS", 5),
-    minLiquidity: optionalNumber("MIN_LIQUIDITY", 500),
+    // Trading (with bounds validation)
+    minSpreadThreshold: boundedNumber("MIN_SPREAD_THRESHOLD", 5.0, 0.1, 50),
+    maxPositionSize: boundedNumber("MAX_POSITION_SIZE", 50, 1, 10_000),
+    maxTotalExposure: boundedNumber("MAX_TOTAL_EXPOSURE", 1000, 10, 100_000),
+    maxOpenPositions: boundedNumber("MAX_OPEN_POSITIONS", 5, 1, 50),
+    minLiquidity: boundedNumber("MIN_LIQUIDITY", 500, 0, 100_000),
     killSwitch: optionalBool("KILL_SWITCH", false),
     liveTrading: optionalBool("LIVE_TRADING", false),
 
