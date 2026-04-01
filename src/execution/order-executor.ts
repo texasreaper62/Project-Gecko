@@ -267,6 +267,7 @@ export class OrderExecutor {
           result,
           opportunity.description,
           opportunity.strategy,
+          { ...opportunity.metadata, opportunityId: opportunity.id, expectedSpread: opportunity.expectedSpread },
         );
       }
 

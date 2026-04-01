@@ -1,10 +1,11 @@
 import { createLogger } from "../core/logger.js";
-import type { AppConfig, Position, TradeParams } from "../core/types.js";
+import type { AppConfig, Position, TradeParams, Opportunity } from "../core/types.js";
 import type { PositionTracker } from "./position-tracker.js";
 import type { OrderExecutor } from "./order-executor.js";
 import type { FeedAggregator } from "../feeds/feed-aggregator.js";
 import type { PnlTracker } from "../monitoring/pnl-tracker.js";
 import type { TelegramNotifier } from "../monitoring/telegram.js";
+import type { SelfTuner } from "../strategies/self-tuner.js";
 
 const log = createLogger("position-closer");
 
@@ -24,8 +25,8 @@ export class PositionCloser {
   private readonly aggregator: FeedAggregator;
   private readonly pnlTracker: PnlTracker;
   private readonly telegram: TelegramNotifier;
+  private readonly selfTuner: SelfTuner | null;
   private timer: ReturnType<typeof setInterval> | null = null;
-  // Prevent closing the same position twice concurrently
   private readonly closingTokens: Set<string> = new Set();
 
   constructor(
@@ -35,6 +36,7 @@ export class PositionCloser {
     aggregator: FeedAggregator,
     pnlTracker: PnlTracker,
     telegram: TelegramNotifier,
+    selfTuner?: SelfTuner,
   ) {
     this.config = config;
     this.positions = positions;
@@ -42,6 +44,7 @@ export class PositionCloser {
     this.aggregator = aggregator;
     this.pnlTracker = pnlTracker;
     this.telegram = telegram;
+    this.selfTuner = selfTuner ?? null;
   }
 
   start(): void {
@@ -153,6 +156,35 @@ export class PositionCloser {
       const pnl = this.positions.closePosition(pos.tokenId, exitPrice, fees);
       this.pnlTracker.recordTrade(pnl, fees);
       this.executor.recordTradeResult(pnl);
+
+      // Record outcome for self-tuning
+      if (this.selfTuner && pos.opportunityMetadata) {
+        const fakeOpp: Opportunity = {
+          id: (pos.opportunityMetadata.opportunityId as string) ?? "unknown",
+          strategy: pos.strategy,
+          timestamp: pos.openTimestamp,
+          description: pos.market,
+          expectedSpread: (pos.opportunityMetadata.expectedSpread as number) ?? 0,
+          confidence: 0,
+          params: {
+            tokenId: pos.tokenId,
+            side: pos.side,
+            price: pos.entryPrice,
+            size: pos.size,
+            orderType: "FOK",
+            conditionId: pos.conditionId,
+            negRisk: false,
+          },
+          metadata: pos.opportunityMetadata,
+        };
+        this.selfTuner.recordOutcome(
+          fakeOpp,
+          pos.entryPrice,
+          exitPrice,
+          pnl,
+          Date.now() - pos.openTimestamp,
+        );
+      }
 
       const msg = `Position auto-closed: ${reason}\n` +
         `Market: ${pos.market}\n` +

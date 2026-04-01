@@ -89,6 +89,8 @@ export interface Position {
   readonly size: number;
   readonly openTimestamp: number;
   readonly market: string;        // question/description
+  readonly strategy: StrategyType;
+  readonly opportunityMetadata: Record<string, unknown>;
   currentPrice: number;
   unrealizedPnl: number;
 }

@@ -30,6 +30,9 @@ import { WalletMonitor } from "./monitoring/wallet-monitor.js";
 // Position management
 import { PositionCloser } from "./execution/position-closer.js";
 
+// Self-improvement
+import { SelfTuner } from "./strategies/self-tuner.js";
+
 const log = createLogger("main");
 
 async function main(): Promise<void> {
@@ -89,15 +92,18 @@ async function main(): Promise<void> {
     });
   }
 
+  // Self-improvement engine
+  const selfTuner = new SelfTuner(config);
+
   // Initialize monitoring
   const telegram = new TelegramNotifier(config.telegramBotToken, config.telegramChatId);
   const discord = new DiscordNotifier(config.discordWebhookUrl);
   const pnlTracker = new PnlTracker(positions);
   const healthChecker = new HealthChecker(binance, coinbase, polyWs, positions, riskManager, walletMonitor);
-  const dailyReporter = new DailyReporter(config, pnlTracker, healthChecker, telegram, discord);
+  const dailyReporter = new DailyReporter(config, pnlTracker, healthChecker, telegram, discord, selfTuner);
 
   // Position auto-closer (take-profit, stop-loss, max hold time)
-  const positionCloser = new PositionCloser(config, positions, executor, aggregator, pnlTracker, telegram);
+  const positionCloser = new PositionCloser(config, positions, executor, aggregator, pnlTracker, telegram, selfTuner);
 
   // Opportunity handler: shared across all strategies
   const handleOpportunity = async (opp: Opportunity): Promise<void> => {
@@ -109,6 +115,15 @@ async function main(): Promise<void> {
     });
 
     dailyReporter.incrementOpportunities();
+
+    // Check if this strategy has been auto-disabled by the self-tuner
+    if (!selfTuner.isStrategyEnabled(opp.strategy)) {
+      log.info("Opportunity skipped: strategy auto-disabled by self-tuner", {
+        strategy: opp.strategy,
+        id: opp.id,
+      });
+      return;
+    }
 
     if (config.liveTrading) {
       const result = await executor.executeOpportunity(opp);
@@ -123,7 +138,7 @@ async function main(): Promise<void> {
   };
 
   // Initialize strategies
-  const temporalArb = new TemporalArbStrategy(config, aggregator, polyRest, polyWs);
+  const temporalArb = new TemporalArbStrategy(config, aggregator, polyRest, polyWs, selfTuner);
   temporalArb.setOpportunityHandler((opp) => {
     handleOpportunity(opp).catch((err) => {
       log.error("Error handling temporal-arb opportunity", {

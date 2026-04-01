@@ -3,6 +3,7 @@ import type { AppConfig, DailySummary } from "../core/types.js";
 import type { PnlTracker } from "./pnl-tracker.js";
 import type { HealthChecker } from "./health-check.js";
 import type { TelegramNotifier } from "./telegram.js";
+import type { SelfTuner } from "../strategies/self-tuner.js";
 import type { DiscordNotifier } from "./discord.js";
 import { appendJsonl } from "../utils/persistence.js";
 import { isoDate } from "../utils/time.js";
@@ -15,6 +16,7 @@ export class DailyReporter {
   private readonly health: HealthChecker;
   private readonly telegram: TelegramNotifier;
   private readonly discord: DiscordNotifier;
+  private readonly selfTuner: SelfTuner | null;
 
   private timer: ReturnType<typeof setInterval> | null = null;
   private lastReportDate = "";
@@ -26,12 +28,14 @@ export class DailyReporter {
     health: HealthChecker,
     telegram: TelegramNotifier,
     discord: DiscordNotifier,
+    selfTuner?: SelfTuner,
   ) {
     this.config = config;
     this.pnl = pnl;
     this.health = health;
     this.telegram = telegram;
     this.discord = discord;
+    this.selfTuner = selfTuner ?? null;
   }
 
   incrementOpportunities(): void {
@@ -88,6 +92,7 @@ export class DailyReporter {
       `Kill Switch: ${healthStatus.killSwitch ? "ACTIVE" : "inactive"}`,
       `Uptime: ${(healthStatus.uptime / 3_600_000).toFixed(1)} hours`,
       `Opportunities scanned: ${this.opportunityCount}`,
+      ...(this.selfTuner ? ["---", "Self-Tuner:", this.selfTuner.getSummary()] : []),
     ].join("\n");
 
     log.info("Sending daily report");

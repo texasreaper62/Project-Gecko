@@ -5,6 +5,7 @@ import type { PolymarketRestClient } from "../feeds/polymarket-rest.js";
 import type { PolymarketWsFeed } from "../feeds/polymarket-ws.js";
 import { generateOpportunityId } from "./strategy-types.js";
 import { priceMomentum, edgePercent } from "../utils/math.js";
+import type { SelfTuner } from "./self-tuner.js";
 
 const log = createLogger("temporal-arb");
 
@@ -26,11 +27,12 @@ export class TemporalArbStrategy {
   private readonly polyRest: PolymarketRestClient;
   private readonly polyWs: PolymarketWsFeed;
 
+  private readonly selfTuner: SelfTuner | null;
+
   private targetMarkets: PolymarketMarket[] = [];
   private scanTimer: ReturnType<typeof setInterval> | null = null;
   private refreshTimer: ReturnType<typeof setInterval> | null = null;
   private onOpportunity: ((opp: Opportunity) => void) | null = null;
-  // Track recently signaled markets to prevent duplicate opportunities
   private readonly recentOpportunities: Map<string, number> = new Map();
 
   constructor(
@@ -38,11 +40,13 @@ export class TemporalArbStrategy {
     aggregator: FeedAggregator,
     polyRest: PolymarketRestClient,
     polyWs: PolymarketWsFeed,
+    selfTuner?: SelfTuner,
   ) {
     this.config = config;
     this.aggregator = aggregator;
     this.polyRest = polyRest;
     this.polyWs = polyWs;
+    this.selfTuner = selfTuner ?? null;
   }
 
   setOpportunityHandler(handler: (opp: Opportunity) => void): void {
@@ -166,14 +170,20 @@ export class TemporalArbStrategy {
     // For BTC ~$60K: scale ~$60, so a $60 delta gives ~73% probability
     // For ETH ~$3K: scale ~$3, similar behavior relative to asset price
     const volatilityScale = currentSpot * 0.001;
-    const k = volatilityScale > 0 ? 1 / volatilityScale : 1;
+    const baseK = volatilityScale > 0 ? 1 / volatilityScale : 1;
+    // Apply self-tuner calibration multiplier
+    const kMultiplier = this.selfTuner?.getKMultiplier() ?? 1.0;
+    const k = baseK * kMultiplier;
     const trueProbability = 1 / (1 + Math.exp(-k * priceDelta));
 
     // Calculate edge
     const marketProbability = yesPrice;
     const edge = edgePercent(trueProbability, marketProbability);
 
-    if (Math.abs(edge) >= this.config.minSpreadThreshold) {
+    // Use adaptive spread threshold if self-tuner is active
+    const spreadThreshold = this.selfTuner?.getSpreadThreshold() ?? this.config.minSpreadThreshold;
+
+    if (Math.abs(edge) >= spreadThreshold) {
       const buyYes = edge > 0; // True probability > market probability = buy YES
       const targetToken = buyYes ? yesToken : noToken;
       const targetPrice = buyYes ? yesPrice : (1 - yesPrice);

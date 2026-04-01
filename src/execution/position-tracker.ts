@@ -48,6 +48,7 @@ export class PositionTracker {
     result: TradeResult,
     marketQuestion: string,
     strategy: StrategyType,
+    opportunityMetadata?: Record<string, unknown>,
   ): void {
     const pos: Position = {
       conditionId: params.conditionId,
@@ -57,6 +58,8 @@ export class PositionTracker {
       size: result.fillSize,
       openTimestamp: Date.now(),
       market: marketQuestion,
+      strategy,
+      opportunityMetadata: opportunityMetadata ?? {},
       currentPrice: result.fillPrice,
       unrealizedPnl: 0,
     };
@@ -127,7 +130,7 @@ export class PositionTracker {
       fillPrice: exitPrice,
       fees,
       pnl,
-      strategy: "temporal-arb", // TODO: track strategy per position
+      strategy: pos.strategy,
     };
 
     appendJsonl("data/trades.jsonl", closeRecord);
