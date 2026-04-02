@@ -1,5 +1,5 @@
 import { createLogger } from "../core/logger.js";
-import type { AppConfig, Opportunity, PolymarketMarket } from "../core/types.js";
+import type { AppConfig, Opportunity, PolymarketMarket, PolymarketToken } from "../core/types.js";
 import type { PolymarketRestClient } from "../feeds/polymarket-rest.js";
 import { generateOpportunityId } from "./strategy-types.js";
 import { sumProbabilities } from "../utils/math.js";
@@ -89,16 +89,16 @@ export class CorrelatedContractsStrategy {
           if (market.closed || !market.active) continue;
 
           const yesToken = market.tokens?.find(
-            (t) => t.outcome.toUpperCase() === "YES"
+            (t) => t.outcome === "YES"
           );
           if (!yesToken || yesToken.price <= 0) continue;
 
           outcomes.push({
-            conditionId: market.condition_id,
+            conditionId: market.conditionId,
             question: market.question,
             yesPrice: yesToken.price,
-            yesTokenId: yesToken.token_id,
-            negRisk: market.neg_risk,
+            yesTokenId: yesToken.tokenId,
+            negRisk: market.negRisk,
           });
         }
 

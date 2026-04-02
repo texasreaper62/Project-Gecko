@@ -257,8 +257,15 @@ export class TemporalArbStrategy {
       // Subscribe to WS feeds for target market tokens
       const tokenIds: string[] = [];
       for (const m of this.targetMarkets) {
+        if (m.tokens.length === 0) {
+          log.warn("Market has no tokens", { conditionId: m.conditionId, question: m.question.slice(0, 80) });
+        }
         for (const t of m.tokens) {
-          tokenIds.push(t.tokenId);
+          if (t.tokenId) {
+            tokenIds.push(t.tokenId);
+          } else {
+            log.warn("Token has empty tokenId", { conditionId: m.conditionId, outcome: t.outcome });
+          }
         }
       }
       if (tokenIds.length > 0) {
