@@ -93,7 +93,7 @@ export function loadConfig(): AppConfig {
     polygonWsUrl: optional("POLYGON_WS_URL", ""),
 
     // Feeds
-    binanceWsUrl: optional("BINANCE_WS_URL", "wss://stream.binance.com:9443/stream?streams=btcusdt@trade/ethusdt@trade"),
+    binanceWsUrl: optional("BINANCE_WS_URL", "wss://stream.binance.us:9443/stream?streams=btcusdt@trade/ethusdt@trade"),
     coinbaseWsUrl: optional("COINBASE_WS_URL", "wss://ws-feed.exchange.coinbase.com"),
 
     // Kalshi (optional for now)
