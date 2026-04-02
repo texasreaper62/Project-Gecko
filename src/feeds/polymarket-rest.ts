@@ -35,7 +35,12 @@ interface GammaMarket {
   end_date_iso: string;
   volume: string;
   liquidity: string;
-  tokens: GammaToken[];
+  // Gamma API may return tokens as array, JSON string, or not at all
+  tokens: GammaToken[] | string;
+  // Alternative fields the API might use
+  clob_token_ids?: string;
+  clobTokenIds?: string;
+  outcomePrices?: string;
   events: GammaEvent[];
 }
 
@@ -87,6 +92,12 @@ export class PolymarketRestClient {
     try {
       const resp = await fetchWithRetry(url);
       const raw = await resp.json() as GammaMarket[];
+      log.debug("Crypto markets raw sample", {
+        count: raw.length,
+        firstTokens: raw[0]?.tokens?.length ?? 0,
+        firstQuestion: raw[0]?.question?.slice(0, 80),
+        sampleKeys: raw[0] ? Object.keys(raw[0]).join(",") : "empty",
+      });
       return raw.map((m) => this.mapMarket(m));
     } catch {
       log.warn("Crypto tag filter failed, fetching all and filtering");
@@ -95,9 +106,15 @@ export class PolymarketRestClient {
     }
   }
 
-  async getNegRiskEvents(): Promise<GammaEventResponse[]> {
+  async getNegRiskEvents(): Promise<{ slug: string; title: string; markets: PolymarketMarket[] }[]> {
     const events = await this.getActiveEvents(100);
-    return events.filter((e) => e.markets?.some((m) => m.neg_risk));
+    return events
+      .filter((e) => e.markets?.some((m) => m.neg_risk))
+      .map((e) => ({
+        slug: e.slug,
+        title: e.title,
+        markets: (e.markets ?? []).map((m) => this.mapMarket(m)),
+      }));
   }
 
   async getOrderBook(tokenId: string): Promise<OrderBookSnapshot> {
@@ -156,13 +173,7 @@ export class PolymarketRestClient {
   }
 
   private mapMarket(m: GammaMarket): PolymarketMarket {
-    const tokens: PolymarketToken[] = (m.tokens ?? []).map((t) => ({
-      tokenId: t.token_id,
-      outcome: t.outcome.toUpperCase() === "YES" ? "YES" as const : "NO" as const,
-      price: t.price,
-      winner: t.winner,
-    }));
-
+    const tokens = this.parseTokens(m);
     const event = m.events?.[0];
 
     return {
@@ -180,6 +191,62 @@ export class PolymarketRestClient {
       eventSlug: event?.slug ?? "",
       eventTitle: event?.title ?? "",
     };
+  }
+
+  private parseTokens(m: GammaMarket): PolymarketToken[] {
+    // Case 1: tokens is already an array of objects
+    let rawTokens: GammaToken[] = [];
+
+    if (Array.isArray(m.tokens)) {
+      rawTokens = m.tokens;
+    } else if (typeof m.tokens === "string" && m.tokens.length > 2) {
+      // Case 2: tokens is a JSON string
+      try {
+        rawTokens = JSON.parse(m.tokens) as GammaToken[];
+      } catch {
+        log.debug("Failed to parse tokens JSON string", { conditionId: m.condition_id });
+      }
+    }
+
+    if (rawTokens.length > 0) {
+      return rawTokens.map((t) => ({
+        tokenId: t.token_id,
+        outcome: t.outcome.toUpperCase() === "YES" ? "YES" as const : "NO" as const,
+        price: t.price,
+        winner: t.winner,
+      }));
+    }
+
+    // Case 3: tokens not available, try clob_token_ids field
+    // Gamma API returns clob_token_ids as a JSON string: '["tokenId1","tokenId2"]'
+    // where [0] = YES, [1] = NO
+    const clobIds = m.clob_token_ids ?? m.clobTokenIds;
+    if (clobIds) {
+      try {
+        const ids: string[] = JSON.parse(clobIds);
+        // Parse outcome prices if available: '["0.55","0.45"]'
+        let prices: number[] = [0, 0];
+        if (m.outcomePrices) {
+          try {
+            const parsed: string[] = JSON.parse(m.outcomePrices);
+            prices = parsed.map((p) => parseFloat(p) || 0);
+          } catch { /* ignore */ }
+        }
+
+        const result: PolymarketToken[] = [];
+        if (ids[0]) {
+          result.push({ tokenId: ids[0], outcome: "YES", price: prices[0] ?? 0, winner: false });
+        }
+        if (ids[1]) {
+          result.push({ tokenId: ids[1], outcome: "NO", price: prices[1] ?? 0, winner: false });
+        }
+        return result;
+      } catch {
+        log.debug("Failed to parse clob_token_ids", { conditionId: m.condition_id });
+      }
+    }
+
+    return [];
   }
 
   private isCryptoMarket(m: PolymarketMarket): boolean {
