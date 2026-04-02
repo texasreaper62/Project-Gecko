@@ -24,12 +24,15 @@ interface WsBookMsg {
   readonly asks?: { price: string; size: string }[];
 }
 
+const POLYMARKET_PING_INTERVAL = 50_000; // 50 seconds, per Polymarket docs
+
 export class PolymarketWsFeed {
   private readonly ws: WsManager;
   private subscribedTokens: Set<string> = new Set();
   private onPriceUpdate: PriceUpdateCallback | null = null;
   private bestBids: Map<string, number> = new Map();
   private bestAsks: Map<string, number> = new Map();
+  private pingTimer: ReturnType<typeof setInterval> | null = null;
 
   constructor() {
     this.ws = new WsManager({
@@ -38,7 +41,12 @@ export class PolymarketWsFeed {
     });
 
     this.ws.setConnectedHandler(() => {
+      this.startApplicationPing();
       this.resubscribe();
+    });
+
+    this.ws.setDisconnectedHandler(() => {
+      this.stopApplicationPing();
     });
 
     this.ws.setMessageHandler((raw: unknown) => {
@@ -61,6 +69,7 @@ export class PolymarketWsFeed {
   }
 
   stop(): void {
+    this.stopApplicationPing();
     this.ws.close();
   }
 
@@ -89,14 +98,38 @@ export class PolymarketWsFeed {
     this.bestBids.delete(tokenId);
     this.bestAsks.delete(tokenId);
     if (this.ws.getStatus() === "connected") {
-      this.ws.send({ type: "unsubscribe", assets_ids: [tokenId] });
+      this.ws.send({
+        type: "market",
+        markets: [],
+        assets_ids: [tokenId],
+        initial_dump: false,
+      });
+    }
+  }
+
+  private startApplicationPing(): void {
+    this.stopApplicationPing();
+    this.pingTimer = setInterval(() => {
+      this.ws.sendRaw("PING");
+    }, POLYMARKET_PING_INTERVAL);
+  }
+
+  private stopApplicationPing(): void {
+    if (this.pingTimer) {
+      clearInterval(this.pingTimer);
+      this.pingTimer = null;
     }
   }
 
   private sendSubscribe(tokenIds: string[]): void {
     if (tokenIds.length === 0) return;
     log.info("Subscribing to tokens", { count: tokenIds.length });
-    this.ws.send({ assets_ids: tokenIds, type: "market" });
+    this.ws.send({
+      type: "market",
+      markets: [],
+      assets_ids: tokenIds,
+      initial_dump: true,
+    });
   }
 
   private resubscribe(): void {
