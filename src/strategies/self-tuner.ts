@@ -94,11 +94,10 @@ export class SelfTuner {
       ? opportunity.metadata.marketProbability : null;
 
     if (predicted === null || market === null) {
-      log.warn("Outcome missing probability metadata, skipping tuning", {
+      log.warn("Outcome missing probability metadata, recording without calibration data", {
         opportunityId: opportunity.id,
         strategy: opportunity.strategy,
       });
-      // Still record the trade for strategy stats, just skip k-tuning
     }
     const slippage = Math.abs(entryPrice - opportunity.params.price);
 
@@ -106,8 +105,8 @@ export class SelfTuner {
       ts: new Date().toISOString(),
       opportunityId: opportunity.id,
       strategy: opportunity.strategy,
-      predictedProbability: predicted ?? 0.5,
-      marketProbability: market ?? 0.5,
+      predictedProbability: predicted ?? -1, // -1 = unknown, excluded from k-tuning
+      marketProbability: market ?? -1,
       predictedEdge: opportunity.expectedSpread,
       entryPrice,
       exitPrice,
@@ -225,10 +224,10 @@ export class SelfTuner {
   }
 
   private tuneKParameter(recent: OutcomeRecord[]): void {
-    // Measure calibration: did high-confidence predictions actually win more often?
-    // Split into high-edge (>10%) and low-edge (<10%) buckets
-    const highEdge = recent.filter((o) => o.predictedEdge >= 10);
-    const lowEdge = recent.filter((o) => o.predictedEdge < 10 && o.predictedEdge >= 5);
+    // Only use records with valid probability metadata for calibration
+    const calibratable = recent.filter((o) => o.predictedProbability >= 0 && o.marketProbability >= 0);
+    const highEdge = calibratable.filter((o) => o.predictedEdge >= 10);
+    const lowEdge = calibratable.filter((o) => o.predictedEdge < 10 && o.predictedEdge >= 5);
 
     const highWinRate = highEdge.length > 0
       ? highEdge.filter((o) => o.won).length / highEdge.length

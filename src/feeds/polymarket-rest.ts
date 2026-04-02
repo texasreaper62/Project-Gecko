@@ -152,15 +152,8 @@ export class PolymarketRestClient {
     }
   }
 
-  // Quote large numeric values in JSON text to prevent precision loss
-  // Matches unquoted numbers with 16+ digits and wraps them in quotes
-  // Quote unquoted large integers in JSON text to prevent precision loss.
-  // Handles values after colons, inside arrays, and after commas.
-  // Skips numbers already inside quotes.
+  // Quote unquoted 16+ digit integers in JSON text to prevent JS Number precision loss.
   private quoteLargeNumbers(text: string): string {
-    // Match large numbers that are NOT already inside quotes
-    // Lookbehind: preceded by :, [, or , (with optional whitespace)
-    // Lookahead: followed by }, ], ,, or whitespace
     return text.replace(/([:,\[]\s*)(-?\d{16,})(\s*[,\]\}])/g, '$1"$2"$3');
   }
 
