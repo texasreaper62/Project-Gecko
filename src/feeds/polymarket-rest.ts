@@ -154,8 +154,14 @@ export class PolymarketRestClient {
 
   // Quote large numeric values in JSON text to prevent precision loss
   // Matches unquoted numbers with 16+ digits and wraps them in quotes
+  // Quote unquoted large integers in JSON text to prevent precision loss.
+  // Handles values after colons, inside arrays, and after commas.
+  // Skips numbers already inside quotes.
   private quoteLargeNumbers(text: string): string {
-    return text.replace(/:\s*(\d{16,})/g, ':"$1"');
+    // Match large numbers that are NOT already inside quotes
+    // Lookbehind: preceded by :, [, or , (with optional whitespace)
+    // Lookahead: followed by }, ], ,, or whitespace
+    return text.replace(/([:,\[]\s*)(-?\d{16,})(\s*[,\]\}])/g, '$1"$2"$3');
   }
 
   async getNegRiskEvents(): Promise<{ slug: string; title: string; markets: PolymarketMarket[] }[]> {
@@ -295,6 +301,11 @@ export class PolymarketRestClient {
       }));
     }
 
+    log.warn("No tokens found for market", {
+      conditionId: m.condition_id ?? m.conditionId,
+      hasClobTokenIds: !!(m.clob_token_ids ?? m.clobTokenIds),
+      hasTokens: !!m.tokens,
+    });
     return [];
   }
 

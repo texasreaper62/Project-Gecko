@@ -61,19 +61,19 @@ export class RiskManager {
       return this.deny(`Already have ${openCount} open positions (max ${this.config.maxOpenPositions})`);
     }
 
-    // 7. Size sanity check
+    // 7. NaN/Infinity guard (must come before range checks since NaN comparisons are unreliable)
+    if (!Number.isFinite(params.price) || !Number.isFinite(params.size)) {
+      return this.deny(`Non-finite trade params: price=${params.price}, size=${params.size}`);
+    }
+
+    // 8. Size sanity check
     if (params.size <= 0) {
       return this.deny(`Invalid size: ${params.size}`);
     }
 
-    // 8. Price sanity check
+    // 9. Price sanity check
     if (params.price <= 0 || params.price >= 1) {
       return this.deny(`Invalid price: ${params.price}`);
-    }
-
-    // 9. NaN/Infinity guard
-    if (!Number.isFinite(params.price) || !Number.isFinite(params.size)) {
-      return this.deny(`Non-finite trade params: price=${params.price}, size=${params.size}`);
     }
 
     log.info("Risk check passed", {

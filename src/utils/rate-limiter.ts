@@ -12,6 +12,8 @@ export class RateLimiter {
   private lastRefill: number;
 
   constructor(name: string, maxTokens: number, refillRate: number) {
+    if (refillRate <= 0) throw new Error(`RateLimiter ${name}: refillRate must be > 0`);
+    if (maxTokens <= 0) throw new Error(`RateLimiter ${name}: maxTokens must be > 0`);
     this.name = name;
     this.maxTokens = maxTokens;
     this.refillRate = refillRate;
