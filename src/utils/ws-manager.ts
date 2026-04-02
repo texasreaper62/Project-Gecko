@@ -88,12 +88,18 @@ export class WsManager {
 
     this.ws.on("message", (raw: WebSocket.RawData) => {
       this.lastMessageTime = Date.now();
+      const str = raw.toString();
+
+      // Skip known raw string responses (not JSON)
+      if (str === "PONG" || str === "PING") return;
+
       try {
-        const data: unknown = JSON.parse(raw.toString());
+        const data: unknown = JSON.parse(str);
         this.onMessage?.(data);
       } catch (err) {
         this.log.warn("Failed to parse message", {
           error: err instanceof Error ? err.message : String(err),
+          preview: str.slice(0, 100),
         });
       }
     });
