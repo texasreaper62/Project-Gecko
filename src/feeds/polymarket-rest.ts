@@ -92,11 +92,16 @@ export class PolymarketRestClient {
     try {
       const resp = await fetchWithRetry(url);
       const raw = await resp.json() as GammaMarket[];
-      log.debug("Crypto markets raw sample", {
+      const sample = raw[0] as unknown as Record<string, unknown> | undefined;
+      log.info("Crypto markets raw sample", {
         count: raw.length,
-        firstTokens: raw[0]?.tokens?.length ?? 0,
-        firstQuestion: raw[0]?.question?.slice(0, 80),
-        sampleKeys: raw[0] ? Object.keys(raw[0]).join(",") : "empty",
+        sampleKeys: sample ? Object.keys(sample).slice(0, 15).join(",") : "empty",
+        hasClobTokenIds: !!sample?.clob_token_ids,
+        clobTokenIdsSample: typeof sample?.clob_token_ids === "string"
+          ? sample.clob_token_ids.slice(0, 60)
+          : "none",
+        hasTokens: !!sample?.tokens,
+        tokensType: typeof sample?.tokens,
       });
       return raw.map((m) => this.mapMarket(m));
     } catch {
@@ -194,37 +199,14 @@ export class PolymarketRestClient {
   }
 
   private parseTokens(m: GammaMarket): PolymarketToken[] {
-    // Case 1: tokens is already an array of objects
-    let rawTokens: GammaToken[] = [];
-
-    if (Array.isArray(m.tokens)) {
-      rawTokens = m.tokens;
-    } else if (typeof m.tokens === "string" && m.tokens.length > 2) {
-      // Case 2: tokens is a JSON string
-      try {
-        rawTokens = JSON.parse(m.tokens) as GammaToken[];
-      } catch {
-        log.debug("Failed to parse tokens JSON string", { conditionId: m.condition_id });
-      }
-    }
-
-    if (rawTokens.length > 0) {
-      return rawTokens.map((t) => ({
-        tokenId: t.token_id,
-        outcome: t.outcome.toUpperCase() === "YES" ? "YES" as const : "NO" as const,
-        price: t.price,
-        winner: t.winner,
-      }));
-    }
-
-    // Case 3: tokens not available, try clob_token_ids field
-    // Gamma API returns clob_token_ids as a JSON string: '["tokenId1","tokenId2"]'
-    // where [0] = YES, [1] = NO
+    // PREFER clob_token_ids: these are JSON strings where token IDs stay as strings,
+    // avoiding JavaScript's Number precision loss on 76+ digit integers.
+    // The tokens array from JSON.parse often has truncated numeric token IDs.
+    // clob_token_ids is a JSON string: '["tokenId1","tokenId2"]' where [0]=YES, [1]=NO
     const clobIds = m.clob_token_ids ?? m.clobTokenIds;
     if (clobIds) {
       try {
         const ids: string[] = JSON.parse(clobIds);
-        // Parse outcome prices if available: '["0.55","0.45"]'
         let prices: number[] = [0, 0];
         if (m.outcomePrices) {
           try {
@@ -240,10 +222,30 @@ export class PolymarketRestClient {
         if (ids[1]) {
           result.push({ tokenId: ids[1], outcome: "NO", price: prices[1] ?? 0, winner: false });
         }
-        return result;
+        if (result.length > 0) return result;
       } catch {
         log.debug("Failed to parse clob_token_ids", { conditionId: m.condition_id });
       }
+    }
+
+    // Fallback: tokens array. WARNING: token_id values may be truncated by JSON.parse
+    // if the API returns them as unquoted numbers (76+ digit integers overflow JS Number).
+    let rawTokens: GammaToken[] = [];
+    if (Array.isArray(m.tokens)) {
+      rawTokens = m.tokens;
+    } else if (typeof m.tokens === "string" && m.tokens.length > 2) {
+      try {
+        rawTokens = JSON.parse(m.tokens) as GammaToken[];
+      } catch { /* ignore */ }
+    }
+
+    if (rawTokens.length > 0) {
+      return rawTokens.map((t) => ({
+        tokenId: String(t.token_id),
+        outcome: t.outcome?.toUpperCase() === "YES" ? "YES" as const : "NO" as const,
+        price: t.price ?? 0,
+        winner: t.winner ?? false,
+      }));
     }
 
     return [];
