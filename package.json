@@ -1,23 +1,27 @@
 {
-  "name": "project-gecko",
-  "version": "1.0.0",
-  "main": "index.js",
+  "name": "predictionarb",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "dist/index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
-  },
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
-  "description": "",
-  "devDependencies": {
-    "@types/node": "^25.5.0",
-    "ts-node": "^10.9.2",
-    "typescript": "^6.0.2"
+    "build": "tsc",
+    "dev": "node --import tsx src/index.ts",
+    "start": "node dist/index.js",
+    "generate-key": "node --import tsx src/generate-api-key.ts",
+    "test-connection": "node --import tsx src/test-connection.ts"
   },
   "dependencies": {
-    "@types/ws": "^8.18.1",
-    "dotenv": "^17.4.0",
-    "ethers": "^6.16.0",
-    "ws": "^8.20.0"
+    "@polymarket/clob-client": "latest",
+    "@polymarket/order-utils": "latest",
+    "dotenv": "^16",
+    "ethers": "^6",
+    "ws": "^8"
+  },
+  "devDependencies": {
+    "@types/node": "^20",
+    "@types/ws": "^8",
+    "tsx": "^4",
+    "typescript": "^5"
   }
 }

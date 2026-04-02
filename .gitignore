@@ -4,3 +4,4 @@ dist/
 keys/
 logs/
 data/
+*.log
