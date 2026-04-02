@@ -13,6 +13,8 @@ const FEED_DISCONNECT_LIMIT = 30_000;
 const CLEANUP_INTERVAL = 300_000;
 // Token entries older than 1 hour are stale
 const TOKEN_STALE_THRESHOLD = 3_600_000;
+// Price history/confirmed spot entries older than 24 hours are stale
+const HISTORY_STALE_THRESHOLD = 86_400_000;
 
 interface PriceEntry {
   price: number;
@@ -162,15 +164,14 @@ export class FeedAggregator {
     }
 
     // Also clean priceHistory and confirmedSpot for symbols not seen in 24 hours
-    const DAY_MS = 86_400_000;
     for (const [symbol, history] of this.priceHistory) {
-      if (history.length === 0 || now - history[history.length - 1].timestamp > DAY_MS) {
+      if (history.length === 0 || now - history[history.length - 1].timestamp > HISTORY_STALE_THRESHOLD) {
         this.priceHistory.delete(symbol);
         cleaned++;
       }
     }
     for (const [symbol, state] of this.confirmedSpot) {
-      if (now - state.lastUpdate > DAY_MS) {
+      if (now - state.lastUpdate > HISTORY_STALE_THRESHOLD) {
         this.confirmedSpot.delete(symbol);
         cleaned++;
       }

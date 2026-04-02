@@ -30,8 +30,8 @@ export class OrderExecutor {
   private readonly positions: PositionTracker;
   private readonly polyRest: PolymarketRestClient;
 
-  // Execution mutex: Promise-based lock ensures only one trade at a time
-  private executionLock: Promise<void> = Promise.resolve();
+  // Execution mutex: boolean flag is safe in Node.js single-threaded event loop
+  // (no await/yield between check and set, so no interleaving possible)
   private executing = false;
 
   // Circuit breaker state
@@ -134,15 +134,13 @@ export class OrderExecutor {
       ...opportunity,
     });
 
-    // Execution mutex: reject if another trade is in flight (non-blocking check)
+    // Execution mutex: reject if another trade is in flight
     if (this.executing) {
       log.info("Skipping opportunity, another trade in flight", {
         opportunityId: opportunity.id,
       });
       return null;
     }
-    // Acquire the lock (waits for any in-flight execution to complete)
-    await this.executionLock;
 
     // Circuit breaker check
     if (Date.now() < this.circuitBreakerUntil) {
@@ -198,16 +196,13 @@ export class OrderExecutor {
       return null;
     }
 
-    // Acquire execution lock with Promise-based mutex
+    // Set flag synchronously (no yield between check and set = no race in Node.js)
     this.executing = true;
-    let releaseLock: () => void;
-    this.executionLock = new Promise<void>((resolve) => { releaseLock = resolve; });
 
     try {
       return await this.submitOrder(opportunity);
     } finally {
       this.executing = false;
-      releaseLock!();
     }
   }
 
