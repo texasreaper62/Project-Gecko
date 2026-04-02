@@ -24,24 +24,30 @@ interface GammaEvent {
   title: string;
 }
 
+// Gamma API uses camelCase fields
 interface GammaMarket {
-  condition_id: string;
-  question_id: string;
+  // Gamma uses camelCase, events endpoint uses snake_case
+  condition_id?: string;
+  conditionId?: string;
+  question_id?: string;
+  questionId?: string;
   question: string;
   slug: string;
   active: boolean;
   closed: boolean;
-  neg_risk: boolean;
-  end_date_iso: string;
+  neg_risk?: boolean;
+  negRisk?: boolean;
+  end_date_iso?: string;
+  endDate?: string;
   volume: string;
   liquidity: string;
-  // Gamma API may return tokens as array, JSON string, or not at all
-  tokens: GammaToken[] | string;
-  // Alternative fields the API might use
+  // Token data (may or may not be present)
+  tokens?: GammaToken[] | string;
   clob_token_ids?: string;
   clobTokenIds?: string;
   outcomePrices?: string;
-  events: GammaEvent[];
+  outcomes?: string;
+  events?: GammaEvent[];
 }
 
 interface GammaEventResponse {
@@ -69,7 +75,8 @@ export class PolymarketRestClient {
     log.debug("Fetching active events", { url });
 
     const resp = await fetchWithRetry(url);
-    const data = await resp.json() as GammaEventResponse[];
+    const text = await resp.text();
+    const data = JSON.parse(this.quoteLargeNumbers(text)) as GammaEventResponse[];
     log.info("Fetched active events", { count: data.length });
     return data;
   }
@@ -80,7 +87,8 @@ export class PolymarketRestClient {
     log.debug("Fetching active markets", { url });
 
     const resp = await fetchWithRetry(url);
-    const raw = await resp.json() as GammaMarket[];
+    const text = await resp.text();
+    const raw = JSON.parse(this.quoteLargeNumbers(text)) as GammaMarket[];
     return raw.map((m) => this.mapMarket(m));
   }
 
@@ -91,24 +99,63 @@ export class PolymarketRestClient {
 
     try {
       const resp = await fetchWithRetry(url);
-      const raw = await resp.json() as GammaMarket[];
-      const sample = raw[0] as unknown as Record<string, unknown> | undefined;
-      log.info("Crypto markets raw sample", {
-        count: raw.length,
-        sampleKeys: sample ? Object.keys(sample).slice(0, 15).join(",") : "empty",
-        hasClobTokenIds: !!sample?.clob_token_ids,
-        clobTokenIdsSample: typeof sample?.clob_token_ids === "string"
-          ? sample.clob_token_ids.slice(0, 60)
-          : "none",
-        hasTokens: !!sample?.tokens,
-        tokensType: typeof sample?.tokens,
+      // Fetch as text first and quote large numbers to prevent JSON.parse truncation
+      const text = await resp.text();
+      const raw = JSON.parse(this.quoteLargeNumbers(text)) as GammaMarket[];
+
+      const mapped = raw.map((m) => this.mapMarket(m));
+
+      // For markets missing token IDs, fetch from CLOB API
+      const needsTokens = mapped.filter((m) => m.tokens.length === 0 && m.conditionId);
+      if (needsTokens.length > 0) {
+        log.info("Fetching token IDs from CLOB API", { count: needsTokens.length });
+        await this.enrichWithClobTokens(needsTokens);
+      }
+
+      return mapped;
+    } catch (err) {
+      log.warn("Crypto markets fetch failed, fetching all and filtering", {
+        error: err instanceof Error ? err.message : String(err),
       });
-      return raw.map((m) => this.mapMarket(m));
-    } catch {
-      log.warn("Crypto tag filter failed, fetching all and filtering");
       const all = await this.getActiveMarkets(200);
       return all.filter((m) => this.isCryptoMarket(m));
     }
+  }
+
+  // Fetch token IDs from CLOB API for markets that don't have them from Gamma
+  private async enrichWithClobTokens(markets: PolymarketMarket[]): Promise<void> {
+    for (const market of markets) {
+      try {
+        await this.bookPriceLimiter.acquire();
+        const url = `${this.clobUrl}/markets/${market.conditionId}`;
+        const resp = await fetchWithRetry(url);
+        const text = await resp.text();
+        const data = JSON.parse(this.quoteLargeNumbers(text)) as {
+          tokens?: { token_id: string; outcome: string; price: number }[];
+        };
+        if (data.tokens && data.tokens.length > 0) {
+          const tokens = data.tokens.map((t) => ({
+            tokenId: String(t.token_id),
+            outcome: t.outcome?.toUpperCase() === "YES" ? "YES" as const : "NO" as const,
+            price: t.price ?? 0,
+            winner: false,
+          }));
+          // Mutate the readonly array via cast since we're enriching
+          (market as unknown as { tokens: typeof tokens }).tokens = tokens;
+        }
+      } catch (err) {
+        log.debug("Failed to fetch CLOB market", {
+          conditionId: market.conditionId,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+  }
+
+  // Quote large numeric values in JSON text to prevent precision loss
+  // Matches unquoted numbers with 16+ digits and wraps them in quotes
+  private quoteLargeNumbers(text: string): string {
+    return text.replace(/:\s*(\d{16,})/g, ':"$1"');
   }
 
   async getNegRiskEvents(): Promise<{ slug: string; title: string; markets: PolymarketMarket[] }[]> {
@@ -182,17 +229,17 @@ export class PolymarketRestClient {
     const event = m.events?.[0];
 
     return {
-      conditionId: m.condition_id,
-      questionId: m.question_id,
-      question: m.question,
-      slug: m.slug,
+      conditionId: m.condition_id ?? m.conditionId ?? "",
+      questionId: m.question_id ?? m.questionId ?? "",
+      question: m.question ?? "",
+      slug: m.slug ?? "",
       tokens,
-      active: m.active,
-      closed: m.closed,
-      negRisk: m.neg_risk,
-      endDateIso: m.end_date_iso,
-      volume: parseFloat(m.volume ?? "0") || 0,
-      liquidity: parseFloat(m.liquidity ?? "0") || 0,
+      active: m.active ?? true,
+      closed: m.closed ?? false,
+      negRisk: m.neg_risk ?? m.negRisk ?? false,
+      endDateIso: m.end_date_iso ?? m.endDate ?? "",
+      volume: parseFloat(String(m.volume ?? "0")) || 0,
+      liquidity: parseFloat(String(m.liquidity ?? "0")) || 0,
       eventSlug: event?.slug ?? "",
       eventTitle: event?.title ?? "",
     };
