@@ -158,7 +158,7 @@ export class PositionTracker {
   }
 
   private persistOpenPositions(): void {
-    // Overwrite positions file with current open positions
+    // Atomic write: write to temp file then rename (prevents corruption on concurrent calls)
     try {
       const dir = path.dirname(POSITIONS_FILE);
       if (!fs.existsSync(dir)) {
@@ -167,7 +167,9 @@ export class PositionTracker {
       const lines = Array.from(this.positions.values())
         .map((p) => JSON.stringify(p))
         .join("\n");
-      fs.writeFileSync(POSITIONS_FILE, lines ? lines + "\n" : "", "utf-8");
+      const tmpFile = POSITIONS_FILE + ".tmp";
+      fs.writeFileSync(tmpFile, lines ? lines + "\n" : "", "utf-8");
+      fs.renameSync(tmpFile, POSITIONS_FILE);
     } catch (err) {
       log.error("Failed to persist open positions", {
         error: err instanceof Error ? err.message : String(err),

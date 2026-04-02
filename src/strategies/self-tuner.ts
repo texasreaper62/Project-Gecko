@@ -88,16 +88,26 @@ export class SelfTuner {
     pnl: number,
     holdTimeMs: number,
   ): void {
-    const predicted = (opportunity.metadata.trueProbability as number) ?? 0.5;
-    const market = (opportunity.metadata.marketProbability as number) ?? 0.5;
+    const predicted = typeof opportunity.metadata.trueProbability === "number"
+      ? opportunity.metadata.trueProbability : null;
+    const market = typeof opportunity.metadata.marketProbability === "number"
+      ? opportunity.metadata.marketProbability : null;
+
+    if (predicted === null || market === null) {
+      log.warn("Outcome missing probability metadata, skipping tuning", {
+        opportunityId: opportunity.id,
+        strategy: opportunity.strategy,
+      });
+      // Still record the trade for strategy stats, just skip k-tuning
+    }
     const slippage = Math.abs(entryPrice - opportunity.params.price);
 
     const record: OutcomeRecord = {
       ts: new Date().toISOString(),
       opportunityId: opportunity.id,
       strategy: opportunity.strategy,
-      predictedProbability: predicted,
-      marketProbability: market,
+      predictedProbability: predicted ?? 0.5,
+      marketProbability: market ?? 0.5,
       predictedEdge: opportunity.expectedSpread,
       entryPrice,
       exitPrice,
@@ -232,7 +242,8 @@ export class SelfTuner {
     // If high-edge trades win much more, model is underconfident => decrease k (steeper)
     const edgeDiff = highWinRate - lowWinRate;
 
-    if (highEdge.length >= 3 && lowEdge.length >= 3) {
+    // Require minimum 8 trades per bucket to reduce variance and prevent oscillation
+    if (highEdge.length >= 8 && lowEdge.length >= 8) {
       if (edgeDiff < 0.05) {
         // Model overconfident: high edge doesn't predict better outcomes
         this.state.kMultiplier = Math.min(

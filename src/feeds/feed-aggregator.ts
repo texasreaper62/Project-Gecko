@@ -161,8 +161,23 @@ export class FeedAggregator {
       }
     }
 
+    // Also clean priceHistory and confirmedSpot for symbols not seen in 24 hours
+    const DAY_MS = 86_400_000;
+    for (const [symbol, history] of this.priceHistory) {
+      if (history.length === 0 || now - history[history.length - 1].timestamp > DAY_MS) {
+        this.priceHistory.delete(symbol);
+        cleaned++;
+      }
+    }
+    for (const [symbol, state] of this.confirmedSpot) {
+      if (now - state.lastUpdate > DAY_MS) {
+        this.confirmedSpot.delete(symbol);
+        cleaned++;
+      }
+    }
+
     if (cleaned > 0) {
-      log.debug("Cleaned stale token prices", { removed: cleaned, remaining: this.tokenPrices.size });
+      log.debug("Cleaned stale entries", { removed: cleaned, tokenPrices: this.tokenPrices.size });
     }
   }
 }
