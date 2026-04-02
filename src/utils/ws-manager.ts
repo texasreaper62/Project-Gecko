@@ -134,6 +134,14 @@ export class WsManager {
     this.ws.send(JSON.stringify(data));
   }
 
+  sendRaw(data: string): void {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+      this.log.warn("Cannot send, WebSocket not open");
+      return;
+    }
+    this.ws.send(data);
+  }
+
   close(): void {
     this.intentionallyClosed = true;
     this.cleanup();
