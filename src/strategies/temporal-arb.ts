@@ -503,11 +503,10 @@ export class TemporalArbStrategy {
             eventTitle: `${asset.toUpperCase()} ${ws.label} Up/Down`,
           };
 
-          // Subscribe to WS for real-time prices (require 50+ digit token IDs)
+          // Collect token IDs for batch WS subscription (done after the loop)
           const tokenIds = tokens.map((t) => t.tokenId).filter((id) => id && id.length >= 50);
           if (tokenIds.length > 0) {
-            this.polyWs.subscribeToTokens(tokenIds);
-            log.info("Subscribed to WS tokens", { slug, count: tokenIds.length, sampleLen: tokenIds[0].length });
+            log.info("Got valid token IDs", { slug, count: tokenIds.length, sampleLen: tokenIds[0].length });
           } else {
             log.warn("Token IDs too short for WS subscription", {
               slug,
@@ -535,6 +534,22 @@ export class TemporalArbStrategy {
 
     this.activeWindows = newWindows;
     const withTokens = newWindows.filter((w) => w.upToken && w.downToken).length;
+
+    // Batch subscribe ALL new tokens in a single WS message
+    // (sending multiple subscribe messages on one connection causes INVALID OPERATION)
+    const allNewTokenIds: string[] = [];
+    for (const w of newWindows) {
+      if (w.upToken && w.upToken.tokenId.length >= 50 && !this.polyWs.isSubscribed(w.upToken.tokenId)) {
+        allNewTokenIds.push(w.upToken.tokenId);
+      }
+      if (w.downToken && w.downToken.tokenId.length >= 50 && !this.polyWs.isSubscribed(w.downToken.tokenId)) {
+        allNewTokenIds.push(w.downToken.tokenId);
+      }
+    }
+    if (allNewTokenIds.length > 0) {
+      this.polyWs.subscribeToTokens(allNewTokenIds);
+      log.info("Batch subscribed to WS tokens", { count: allNewTokenIds.length });
+    }
 
     log.info("Refreshed active windows", {
       total: newWindows.length,

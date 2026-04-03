@@ -84,6 +84,10 @@ export class PolymarketWsFeed {
     }
   }
 
+  isSubscribed(tokenId: string): boolean {
+    return this.subscribedTokens.has(tokenId);
+  }
+
   subscribeToTokens(tokenIds: string[]): void {
     // Only subscribe to tokens we haven't already subscribed to
     const newTokens = tokenIds.filter((id) => !this.subscribedTokens.has(id));
