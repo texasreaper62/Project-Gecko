@@ -89,7 +89,15 @@ export class PolymarketRestClient {
     const resp = await fetchWithRetry(url);
     const text = await resp.text();
     const raw = JSON.parse(this.quoteLargeNumbers(text)) as GammaMarket[];
-    return raw.map((m) => this.mapMarket(m));
+    const mapped = raw.map((m) => this.mapMarket(m));
+
+    // Enrich markets missing tokens from CLOB API
+    const needsTokens = mapped.filter((m) => m.tokens.length === 0 && m.conditionId);
+    if (needsTokens.length > 0) {
+      await this.enrichWithClobTokens(needsTokens);
+    }
+
+    return mapped;
   }
 
   async getCryptoMarkets(): Promise<PolymarketMarket[]> {
@@ -122,29 +130,48 @@ export class PolymarketRestClient {
     }
   }
 
-  // Fetch token IDs from CLOB API for markets that don't have them from Gamma
+  // Fetch token IDs from CLOB API for markets that don't have them from Gamma.
+  // The CLOB API returns full-precision string token IDs.
   private async enrichWithClobTokens(markets: PolymarketMarket[]): Promise<void> {
     for (const market of markets) {
       try {
         await this.bookPriceLimiter.acquire();
+        // Try the condition_id query parameter format first
         const url = `${this.clobUrl}/markets/${market.conditionId}`;
-        const resp = await fetchWithRetry(url);
-        const text = await resp.text();
+        let resp: Response;
+        let text: string;
+        try {
+          resp = await fetchWithRetry(url);
+          text = await resp.text();
+        } catch {
+          // Fallback: try query parameter format
+          const url2 = `${this.clobUrl}/markets?condition_id=${market.conditionId}`;
+          resp = await fetchWithRetry(url2);
+          text = await resp.text();
+        }
         const data = JSON.parse(this.quoteLargeNumbers(text)) as {
           tokens?: { token_id: string; outcome: string; price: number }[];
-        };
-        if (data.tokens && data.tokens.length > 0) {
-          const tokens = data.tokens.map((t) => ({
+          // If the response is an array (from ?condition_id= query)
+        } | Array<{ tokens?: { token_id: string; outcome: string; price: number }[] }>;
+
+        // Handle both single object and array response
+        const marketData = Array.isArray(data) ? data[0] : data;
+        if (marketData?.tokens && marketData.tokens.length > 0) {
+          const tokens = marketData.tokens.map((t) => ({
             tokenId: String(t.token_id),
             outcome: t.outcome?.toUpperCase() === "YES" ? "YES" as const : "NO" as const,
             price: t.price ?? 0,
             winner: false,
           }));
-          // Mutate the readonly array via cast since we're enriching
           (market as unknown as { tokens: typeof tokens }).tokens = tokens;
+          log.info("Enriched market with CLOB tokens", {
+            conditionId: market.conditionId,
+            tokenSample: tokens[0]?.tokenId?.slice(0, 40),
+            tokenLength: tokens[0]?.tokenId?.length,
+          });
         }
       } catch (err) {
-        log.debug("Failed to fetch CLOB market", {
+        log.warn("Failed to fetch CLOB market tokens", {
           conditionId: market.conditionId,
           error: err instanceof Error ? err.message : String(err),
         });

@@ -130,15 +130,13 @@ async function main(): Promise<void> {
       return;
     }
 
-    if (config.liveTrading) {
-      const result = await executor.executeOpportunity(opp);
-      if (result && (result.status === "filled" || result.status === "partial")) {
-        const msg = `Trade executed: ${opp.strategy}\n${opp.description}\nFill: $${result.fillPrice} x ${result.fillSize}`;
-        await Promise.all([
-          telegram.sendAlert("Trade Executed", msg),
-          discord.sendEmbed("Trade Executed", msg, 0x00ff00),
-        ]);
-      }
+    // Execute immediately, no waiting on notifications
+    const result = await executor.executeOpportunity(opp);
+    if (result && (result.status === "filled" || result.status === "partial")) {
+      // Fire-and-forget: notify AFTER execution, don't block the trading loop
+      const msg = `Trade: ${opp.strategy}\n${opp.description}\nFill: $${result.fillPrice} x ${result.fillSize}`;
+      telegram.sendAlert("Trade", msg).catch(() => {});
+      discord.sendEmbed("Trade", msg, 0x00ff00).catch(() => {});
     }
   };
 
