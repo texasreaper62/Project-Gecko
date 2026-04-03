@@ -168,6 +168,8 @@ export class TemporalArbStrategy {
     const pollableWindows = this.activeWindows.filter((w) => {
       if (!w.upToken || !w.market) return false;
       if (w.asset !== "btc" && w.asset !== "eth") return false;
+      // Skip expired windows
+      if (w.closeTimestamp * 1000 < Date.now()) return false;
       // Skip if WS is providing fresh prices
       const wsPrice = this.aggregator.getTokenPrice(w.upToken.tokenId);
       if (wsPrice !== null) return false;
