@@ -24,8 +24,6 @@ const ENTRY_WINDOW_END_SECONDS = 5;    // Stop entering after T-5s (need time fo
 const MIN_CONFIDENCE = 0.20;
 // Cooldown per conditionId to prevent duplicate signals
 const OPPORTUNITY_COOLDOWN_MS = 10_000;
-// Warn if a token's REST-polled price hasn't changed in this many ms
-const PRICE_STALENESS_WARN_MS = 30_000;
 // Maximum spread threshold the self-tuner is allowed to set
 const MAX_TUNER_THRESHOLD = 10.0;
 // Reset threshold when tuner exceeds max
@@ -75,8 +73,6 @@ export class TemporalArbStrategy {
   private refreshTimer: ReturnType<typeof setInterval> | null = null;
   private onOpportunity: ((opp: Opportunity) => void) | null = null;
   private readonly recentOpportunities: Map<string, number> = new Map();
-  // Tracks {price, firstSeenAt} per tokenId to detect stale REST prices
-  private readonly lastSeenPrices: Map<string, { price: number; firstSeenAt: number }> = new Map();
 
   constructor(
     config: AppConfig,
@@ -171,8 +167,8 @@ export class TemporalArbStrategy {
     const pollableWindows = this.activeWindows.filter((w) => {
       if (!w.upToken || !w.market) return false;
       if (w.asset !== "btc" && w.asset !== "eth") return false;
-      // Skip expired windows
-      if (w.closeTimestamp * 1000 < Date.now()) return false;
+      // Skip expired windows (with 10s buffer for settlement)
+      if (w.closeTimestamp * 1000 + 10_000 < Date.now()) return false;
       // Skip if WS is providing fresh prices
       const wsPrice = this.aggregator.getTokenPrice(w.upToken.tokenId);
       if (wsPrice !== null) return false;
@@ -212,9 +208,28 @@ export class TemporalArbStrategy {
     if (!spotState || spotState.confirmedPrice === null) return null;
     const currentSpot = spotState.confirmedPrice;
 
-    // Record the opening spot price when we first see this window
+    // Record the opening spot price - try to find it from price history
+    // at the window open time, or use the earliest available price
     if (window.openSpotPrice === null) {
-      window.openSpotPrice = currentSpot;
+      const history = this.aggregator.getSpotPriceHistory(symbol);
+      const windowOpenMs = window.openTimestamp * 1000;
+      // Find the price closest to window open time
+      let bestPrice = currentSpot;
+      let bestTimeDiff = Infinity;
+      for (const h of history) {
+        const diff = Math.abs(h.timestamp - windowOpenMs);
+        if (diff < bestTimeDiff) {
+          bestTimeDiff = diff;
+          bestPrice = h.price;
+        }
+      }
+      window.openSpotPrice = bestPrice;
+      log.debug("Set window open price", {
+        slug: window.slug,
+        openPrice: bestPrice.toFixed(2),
+        timeDiffMs: bestTimeDiff,
+        usedCurrent: bestTimeDiff > 60_000,
+      });
     }
 
     // CRITICAL: Only trade in the last 15-5 seconds before window close
@@ -549,42 +564,4 @@ export class TemporalArbStrategy {
     });
   }
 
-  // Check if a token's price has been unchanged for too long, indicating stale REST data
-  private checkPriceStaleness(tokenId: string, currentPrice: number, slug: string): void {
-    const entry = this.lastSeenPrices.get(tokenId);
-    const now = Date.now();
-
-    if (!entry || entry.price !== currentPrice) {
-      // Price changed (or first observation) -- reset tracking
-      this.lastSeenPrices.set(tokenId, { price: currentPrice, firstSeenAt: now });
-      return;
-    }
-
-    // Price is the same as last time we checked
-    const staleDuration = now - entry.firstSeenAt;
-    if (staleDuration > PRICE_STALENESS_WARN_MS) {
-      log.warn("Token price appears stale (unchanged for 30s+)", {
-        slug,
-        tokenId: tokenId.slice(0, 20) + "...",
-        price: currentPrice,
-        staleForMs: staleDuration,
-      });
-      // Reset so we don't spam the warning every scan cycle
-      this.lastSeenPrices.set(tokenId, { price: currentPrice, firstSeenAt: now });
-    }
-  }
-
-  private estimateVolatility(
-    history: readonly { price: number; timestamp: number }[],
-    currentSpot: number,
-  ): number {
-    if (history.length < 5) return currentSpot * 0.001;
-    const changes: number[] = [];
-    for (let i = 1; i < history.length; i++) {
-      changes.push(Math.abs(history[i].price - history[i - 1].price));
-    }
-    const mean = changes.reduce((s, c) => s + c, 0) / changes.length;
-    const variance = changes.reduce((s, c) => s + (c - mean) ** 2, 0) / changes.length;
-    return Math.max(Math.sqrt(variance), currentSpot * 0.0001);
-  }
 }
