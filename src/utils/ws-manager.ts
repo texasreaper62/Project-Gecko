@@ -91,7 +91,7 @@ export class WsManager {
       const str = raw.toString();
 
       // Skip known raw string responses (not JSON)
-      if (str === "PONG" || str === "PING") return;
+      if (str === "PONG" || str === "PING" || str === "INVALID OPERATION") return;
 
       try {
         const data: unknown = JSON.parse(str);
