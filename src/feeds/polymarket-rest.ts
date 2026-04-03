@@ -6,7 +6,7 @@ import {
   createGammaMarketsLimiter,
   type RateLimiter,
 } from "../utils/rate-limiter.js";
-import type { PolymarketMarket, PolymarketToken, OrderBookSnapshot, OrderBookLevel } from "../core/types.js";
+import type { PolymarketMarket, PolymarketToken, OrderBookSnapshot, OrderBookLevel, ExecutableDepth } from "../core/types.js";
 
 const log = createLogger("polymarket-rest");
 
@@ -224,6 +224,63 @@ export class PolymarketRestClient {
     for (const a of asks) depth += a.price * a.size;
 
     return { tokenId, bids, asks, bestBid, bestAsk, midpoint, spread, depth, timestamp: Date.now() };
+  }
+
+  async getExecutableDepth(
+    tokenId: string,
+    side: "BUY" | "SELL",
+    maxSlippagePct: number,
+  ): Promise<ExecutableDepth> {
+    const book = await this.getOrderBook(tokenId);
+
+    if (book.midpoint <= 0) {
+      return { maxSize: 0, levels: 0, worstPrice: 0, midpoint: 0, slippagePct: 0 };
+    }
+
+    // BUY walks the asks (ascending price), SELL walks the bids (descending price)
+    const levels = side === "BUY" ? book.asks : book.bids;
+    const midpoint = book.midpoint;
+    const slippageLimit = midpoint * (maxSlippagePct / 100);
+    const priceFloor = side === "BUY" ? midpoint + slippageLimit : midpoint - slippageLimit;
+
+    let totalUsdc = 0;
+    let levelsConsumed = 0;
+    let worstPrice = 0;
+
+    for (const level of levels) {
+      // Check if this level is within our slippage tolerance
+      if (side === "BUY" && level.price > priceFloor) break;
+      if (side === "SELL" && level.price < priceFloor) break;
+
+      // size is in contracts, price is per contract, so USDC cost = price * size
+      const levelUsdc = level.price * level.size;
+      totalUsdc += levelUsdc;
+      levelsConsumed++;
+      worstPrice = level.price;
+    }
+
+    const actualSlippage = worstPrice > 0
+      ? Math.abs(worstPrice - midpoint) / midpoint * 100
+      : 0;
+
+    log.debug("Executable depth calculated", {
+      tokenId,
+      side,
+      maxSlippagePct,
+      midpoint,
+      maxSize: totalUsdc,
+      levels: levelsConsumed,
+      worstPrice,
+      actualSlippage,
+    });
+
+    return {
+      maxSize: totalUsdc,
+      levels: levelsConsumed,
+      worstPrice,
+      midpoint,
+      slippagePct: actualSlippage,
+    };
   }
 
   async getMidpoint(tokenId: string): Promise<number> {

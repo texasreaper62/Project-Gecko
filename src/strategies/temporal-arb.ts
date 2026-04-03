@@ -21,6 +21,16 @@ const MIN_PRICE_POINTS = 5;
 // Cooldown per conditionId to prevent duplicate opportunities
 const OPPORTUNITY_COOLDOWN_MS = 10_000;
 
+// Duration tier boundaries (ms)
+const SHORT_DURATION_MAX_MS = 20 * 60 * 1000;   // 20 minutes
+const MEDIUM_DURATION_MAX_MS = 4 * 60 * 60 * 1000; // 4 hours
+
+// Medium-duration tier requires higher spread and uses smaller positions
+const MEDIUM_SPREAD_MULTIPLIER = 1.5;
+const MEDIUM_POSITION_MULTIPLIER = 0.5;
+
+type DurationTier = "short" | "medium";
+
 export class TemporalArbStrategy {
   private readonly config: AppConfig;
   private readonly aggregator: FeedAggregator;
@@ -177,8 +187,11 @@ export class TemporalArbStrategy {
     const marketProbability = yesPrice;
     const edge = edgePercent(trueProbability, marketProbability);
 
-    // Use adaptive spread threshold if self-tuner is active
-    const spreadThreshold = this.selfTuner?.getSpreadThreshold() ?? this.config.minSpreadThreshold;
+    // Use adaptive spread threshold if self-tuner is active, then apply tier multiplier
+    const baseSpreadThreshold = this.selfTuner?.getSpreadThreshold() ?? this.config.minSpreadThreshold;
+    const tier = this.getDurationTier(timeToExpiry);
+    const spreadMultiplier = tier === "medium" ? MEDIUM_SPREAD_MULTIPLIER : 1;
+    const spreadThreshold = baseSpreadThreshold * spreadMultiplier;
 
     if (Math.abs(edge) >= spreadThreshold) {
       const buyYes = edge > 0; // True probability > market probability = buy YES
@@ -187,7 +200,8 @@ export class TemporalArbStrategy {
 
       // Confidence-weighted sizing: scale position by edge magnitude
       const confidence = Math.min(Math.abs(edge) / 20, 1);
-      const positionSize = this.config.maxPositionSize * Math.max(confidence, 0.2);
+      const positionMultiplier = tier === "medium" ? MEDIUM_POSITION_MULTIPLIER : 1;
+      const positionSize = this.config.maxPositionSize * Math.max(confidence, 0.2) * positionMultiplier;
 
       const opp: Opportunity = {
         id: generateOpportunityId("temporal-arb"),
@@ -219,12 +233,15 @@ export class TemporalArbStrategy {
           marketProbability,
           timeToExpiryMs: timeToExpiry,
           buyYes,
+          durationTier: tier,
         },
       };
 
       log.info("Opportunity detected", {
         id: opp.id,
         edge: edge.toFixed(2),
+        tier,
+        spreadThreshold: spreadThreshold.toFixed(1),
         market: market.question,
       });
 
@@ -241,13 +258,13 @@ export class TemporalArbStrategy {
     try {
       const markets = await this.polyRest.getCryptoMarkets();
 
-      // Filter for short-duration crypto contracts
+      // Filter for short and medium-duration crypto contracts
       this.targetMarkets = markets.filter((m) => {
         if (m.closed || !m.active) return false;
         const expiry = new Date(m.endDateIso).getTime();
         const timeToExpiry = expiry - Date.now();
-        // Only 5-minute and 15-minute contracts (up to ~20 min out)
-        if (timeToExpiry <= 0 || timeToExpiry > 20 * 60 * 1000) return false;
+        // Include contracts from 5min up to 4 hours out
+        if (timeToExpiry <= 0 || timeToExpiry > MEDIUM_DURATION_MAX_MS) return false;
         return this.extractSymbol(m.question) !== null;
       });
 
@@ -277,9 +294,17 @@ export class TemporalArbStrategy {
         }
       }
 
+      const shortCount = this.targetMarkets.filter((m) => {
+        const tte = new Date(m.endDateIso).getTime() - Date.now();
+        return tte <= SHORT_DURATION_MAX_MS;
+      }).length;
+      const mediumCount = this.targetMarkets.length - shortCount;
+
       log.info("Refreshed target markets", {
         total: markets.length,
         targets: this.targetMarkets.length,
+        shortDuration: shortCount,
+        mediumDuration: mediumCount,
         tokens: tokenIds.length,
       });
     } catch (err) {
@@ -311,6 +336,11 @@ export class TemporalArbStrategy {
 
     // Use stddev as volatility scale, with a floor of 0.01% of spot
     return Math.max(stddev, currentSpot * 0.0001);
+  }
+
+  private getDurationTier(timeToExpiryMs: number): DurationTier {
+    if (timeToExpiryMs <= SHORT_DURATION_MAX_MS) return "short";
+    return "medium";
   }
 
   private extractSymbol(question: string): string | null {
