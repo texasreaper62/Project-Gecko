@@ -123,7 +123,6 @@ export class PolymarketWsFeed {
 
   private sendSubscribe(tokenIds: string[]): void {
     if (tokenIds.length === 0) return;
-    // Only subscribe to valid-looking token IDs (long numeric strings)
     const valid = tokenIds.filter((id) => id && id.length > 10);
     if (valid.length === 0) {
       log.warn("No valid token IDs to subscribe", { raw: tokenIds.slice(0, 3) });
@@ -131,7 +130,8 @@ export class PolymarketWsFeed {
     }
     log.info("Subscribing to tokens", {
       count: valid.length,
-      sample: valid[0]?.slice(0, 30),
+      firstIdFull: valid[0],
+      firstIdLen: valid[0]?.length,
     });
     this.ws.send({
       type: "market",
