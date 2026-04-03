@@ -56,6 +56,14 @@ export interface OrderBookSnapshot {
   readonly timestamp: number;
 }
 
+export interface ExecutableDepth {
+  readonly maxSize: number;      // Max USDC fillable within slippage
+  readonly levels: number;       // Number of book levels consumed
+  readonly worstPrice: number;   // Worst price level touched
+  readonly midpoint: number;     // Midpoint at time of calculation
+  readonly slippagePct: number;  // Actual slippage at maxSize
+}
+
 // -- Trading --
 
 export type TradeSide = "BUY" | "SELL";
@@ -228,6 +236,14 @@ export interface DailySummary {
   readonly maxDrawdown: number;
   readonly opportunities: number;
   readonly strategies: Record<StrategyType, StrategyState>;
+}
+
+export interface FillStats {
+  fokAttempts: number;
+  fokFills: number;
+  gtcAttempts: number;
+  gtcFills: number;
+  gtcCancelled: number;
 }
 
 export interface HealthStatus {
