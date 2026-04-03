@@ -176,6 +176,12 @@ export class SelfTuner {
     return this.state.spreadThreshold;
   }
 
+  // Force-reset the spread threshold (used when the tuner drifts too high)
+  resetSpreadThreshold(value: number): void {
+    this.state.spreadThreshold = value;
+    this.saveState();
+  }
+
   // Check if a strategy is currently enabled
   isStrategyEnabled(strategy: StrategyType): boolean {
     const stats = this.state.strategies[strategy];

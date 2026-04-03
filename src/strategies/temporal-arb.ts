@@ -13,8 +13,8 @@ const log = createLogger("temporal-arb");
 
 const GAMMA_BASE = "https://gamma-api.polymarket.com";
 
-// Scan every 3 seconds (balanced between speed and REST rate limits)
-const SCAN_INTERVAL = 3_000;
+// Scan every 2 seconds (we only poll BTC/ETH windows now, cutting requests in half)
+const SCAN_INTERVAL = 2_000;
 // Refresh active market windows every 30 seconds
 const MARKET_REFRESH_INTERVAL = 30_000;
 // Minimum seconds until contract expiry to consider trading
@@ -23,6 +23,12 @@ const MIN_EXPIRY_SECONDS = 30;
 const MIN_PRICE_POINTS = 5;
 // Cooldown per conditionId to prevent duplicate signals
 const OPPORTUNITY_COOLDOWN_MS = 10_000;
+// Warn if a token's REST-polled price hasn't changed in this many ms
+const PRICE_STALENESS_WARN_MS = 30_000;
+// Maximum spread threshold the self-tuner is allowed to set
+const MAX_TUNER_THRESHOLD = 10.0;
+// Reset threshold when tuner exceeds max
+const TUNER_RESET_THRESHOLD = 5.0;
 
 // Assets and window sizes to track
 const TRACKED_ASSETS = ["btc", "eth", "sol", "xrp"] as const;
@@ -66,6 +72,8 @@ export class TemporalArbStrategy {
   private refreshTimer: ReturnType<typeof setInterval> | null = null;
   private onOpportunity: ((opp: Opportunity) => void) | null = null;
   private readonly recentOpportunities: Map<string, number> = new Map();
+  // Tracks {price, firstSeenAt} per tokenId to detect stale REST prices
+  private readonly lastSeenPrices: Map<string, { price: number; firstSeenAt: number }> = new Map();
 
   constructor(
     config: AppConfig,
@@ -89,6 +97,20 @@ export class TemporalArbStrategy {
 
   async start(): Promise<void> {
     log.info("Starting temporal arbitrage strategy (Up/Down markets)");
+
+    // Cap the self-tuner's spread threshold to prevent it from making the bot stop trading
+    if (this.selfTuner) {
+      const tunerThreshold = this.selfTuner.getSpreadThreshold();
+      if (tunerThreshold > MAX_TUNER_THRESHOLD) {
+        log.warn("Self-tuner spread threshold too high, resetting", {
+          currentThreshold: tunerThreshold,
+          resetTo: TUNER_RESET_THRESHOLD,
+          maxAllowed: MAX_TUNER_THRESHOLD,
+        });
+        this.selfTuner.resetSpreadThreshold(TUNER_RESET_THRESHOLD);
+      }
+    }
+
     await this.refreshWindows();
 
     this.scanTimer = setInterval(() => {
@@ -138,25 +160,35 @@ export class TemporalArbStrategy {
     return opportunities;
   }
 
-  // Poll fresh prices from CLOB REST API for active windows
-  // This runs every scan cycle (~500ms) to get real-time prices when WS isn't working
+  // Poll fresh prices from CLOB REST API for BTC/ETH windows only.
+  // We skip SOL/XRP since we have no spot data for them (evaluateWindow filters them out).
+  // Requests are batched with Promise.allSettled to avoid sequential waterfall delays.
   private async refreshPricesViaRest(): Promise<void> {
-    for (const window of this.activeWindows) {
-      if (!window.upToken || !window.market) continue;
+    // Only poll windows for assets we actually evaluate
+    const pollableWindows = this.activeWindows.filter((w) => {
+      if (!w.upToken || !w.market) return false;
+      if (w.asset !== "btc" && w.asset !== "eth") return false;
+      // Skip if WS is providing fresh prices
+      const wsPrice = this.aggregator.getTokenPrice(w.upToken.tokenId);
+      if (wsPrice !== null) return false;
+      return true;
+    });
 
-      // Only poll if the WS price is stale (not updated in last 3 seconds)
-      const wsPrice = this.aggregator.getTokenPrice(window.upToken.tokenId);
-      if (wsPrice !== null) continue; // WS is working for this token, skip REST
+    if (pollableWindows.length === 0) return;
 
-      try {
-        const midpoint = await this.polyRest.getMidpoint(window.upToken.tokenId);
-        if (Number.isFinite(midpoint) && midpoint > 0 && midpoint < 1) {
-          // Update the token prices directly
-          (window.upToken as { price: number }).price = midpoint;
-          (window.downToken as { price: number }).price = 1 - midpoint;
-        }
-      } catch {
-        // Rate limited or token not found - skip silently
+    const results = await Promise.allSettled(
+      pollableWindows.map((w) => this.polyRest.getMidpoint(w.upToken!.tokenId)),
+    );
+
+    for (let i = 0; i < pollableWindows.length; i++) {
+      const result = results[i];
+      const window = pollableWindows[i];
+      if (result.status !== "fulfilled") continue;
+
+      const midpoint = result.value;
+      if (Number.isFinite(midpoint) && midpoint > 0 && midpoint < 1) {
+        (window.upToken as { price: number }).price = midpoint;
+        (window.downToken as { price: number }).price = 1 - midpoint;
       }
     }
   }
@@ -221,6 +253,9 @@ export class TemporalArbStrategy {
     const downPrice = this.aggregator.getTokenPrice(downToken.tokenId) ?? downToken.price;
 
     if (upPrice <= 0 || upPrice >= 1 || downPrice <= 0 || downPrice >= 1) return null;
+
+    // Track price staleness: warn if the price hasn't changed in 30+ seconds
+    this.checkPriceStaleness(upToken.tokenId, upPrice, window.slug);
 
     // Calculate realized volatility for confidence scaling
     const volatilityScale = this.estimateVolatility(recentHistory, currentSpot);
@@ -495,6 +530,31 @@ export class TemporalArbStrategy {
       assets: TRACKED_ASSETS.join(","),
       windowSizes: WINDOW_SIZES.map((w) => w.label).join(","),
     });
+  }
+
+  // Check if a token's price has been unchanged for too long, indicating stale REST data
+  private checkPriceStaleness(tokenId: string, currentPrice: number, slug: string): void {
+    const entry = this.lastSeenPrices.get(tokenId);
+    const now = Date.now();
+
+    if (!entry || entry.price !== currentPrice) {
+      // Price changed (or first observation) -- reset tracking
+      this.lastSeenPrices.set(tokenId, { price: currentPrice, firstSeenAt: now });
+      return;
+    }
+
+    // Price is the same as last time we checked
+    const staleDuration = now - entry.firstSeenAt;
+    if (staleDuration > PRICE_STALENESS_WARN_MS) {
+      log.warn("Token price appears stale (unchanged for 30s+)", {
+        slug,
+        tokenId: tokenId.slice(0, 20) + "...",
+        price: currentPrice,
+        staleForMs: staleDuration,
+      });
+      // Reset so we don't spam the warning every scan cycle
+      this.lastSeenPrices.set(tokenId, { price: currentPrice, firstSeenAt: now });
+    }
   }
 
   private estimateVolatility(
