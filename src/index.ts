@@ -32,6 +32,7 @@ import { PositionCloser } from "./execution/position-closer.js";
 
 // Self-improvement
 import { SelfTuner } from "./strategies/self-tuner.js";
+import { ShadowTracker } from "./strategies/shadow-tracker.js";
 
 const log = createLogger("main");
 
@@ -94,13 +95,14 @@ async function main(): Promise<void> {
 
   // Self-improvement engine
   const selfTuner = new SelfTuner(config);
+  const shadowTracker = new ShadowTracker(polyRest, selfTuner);
 
   // Initialize monitoring
   const telegram = new TelegramNotifier(config.telegramBotToken, config.telegramChatId);
   const discord = new DiscordNotifier(config.discordWebhookUrl);
   const pnlTracker = new PnlTracker(positions);
   const healthChecker = new HealthChecker(binance, coinbase, polyWs, positions, riskManager, walletMonitor);
-  const dailyReporter = new DailyReporter(config, pnlTracker, healthChecker, telegram, discord, selfTuner);
+  const dailyReporter = new DailyReporter(config, pnlTracker, healthChecker, telegram, discord, selfTuner, shadowTracker);
 
   // Position auto-closer (take-profit, stop-loss, max hold time)
   const positionCloser = new PositionCloser(config, positions, executor, aggregator, pnlTracker, telegram, selfTuner);
@@ -115,6 +117,9 @@ async function main(): Promise<void> {
     });
 
     dailyReporter.incrementOpportunities();
+
+    // Track every opportunity for shadow learning (even if not traded)
+    shadowTracker.trackOpportunity(opp);
 
     // Check if this strategy has been auto-disabled by the self-tuner
     if (!selfTuner.isStrategyEnabled(opp.strategy)) {
@@ -170,6 +175,7 @@ async function main(): Promise<void> {
   healthChecker.start();
   dailyReporter.start();
   positionCloser.start();
+  shadowTracker.start();
 
   // Send startup notification
   const startupMsg = [
@@ -204,7 +210,8 @@ async function main(): Promise<void> {
     temporalArb.stop();
     correlatedContracts.stop();
 
-    // Stop monitoring and position management
+    // Stop monitoring, position management, shadow tracker
+    shadowTracker.stop();
     positionCloser.stop();
     healthChecker.stop();
     dailyReporter.stop();

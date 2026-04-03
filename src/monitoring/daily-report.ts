@@ -4,6 +4,7 @@ import type { PnlTracker } from "./pnl-tracker.js";
 import type { HealthChecker } from "./health-check.js";
 import type { TelegramNotifier } from "./telegram.js";
 import type { SelfTuner } from "../strategies/self-tuner.js";
+import type { ShadowTracker } from "../strategies/shadow-tracker.js";
 import type { DiscordNotifier } from "./discord.js";
 import { appendJsonl } from "../utils/persistence.js";
 import { isoDate } from "../utils/time.js";
@@ -17,6 +18,7 @@ export class DailyReporter {
   private readonly telegram: TelegramNotifier;
   private readonly discord: DiscordNotifier;
   private readonly selfTuner: SelfTuner | null;
+  private readonly shadowTracker: ShadowTracker | null;
 
   private timer: ReturnType<typeof setInterval> | null = null;
   private lastReportDate = "";
@@ -29,6 +31,7 @@ export class DailyReporter {
     telegram: TelegramNotifier,
     discord: DiscordNotifier,
     selfTuner?: SelfTuner,
+    shadowTracker?: ShadowTracker,
   ) {
     this.config = config;
     this.pnl = pnl;
@@ -36,6 +39,7 @@ export class DailyReporter {
     this.telegram = telegram;
     this.discord = discord;
     this.selfTuner = selfTuner ?? null;
+    this.shadowTracker = shadowTracker ?? null;
   }
 
   incrementOpportunities(): void {
@@ -92,6 +96,7 @@ export class DailyReporter {
       `Kill Switch: ${healthStatus.killSwitch ? "ACTIVE" : "inactive"}`,
       `Uptime: ${(healthStatus.uptime / 3_600_000).toFixed(1)} hours`,
       `Opportunities scanned: ${this.opportunityCount}`,
+      ...(this.shadowTracker ? ["---", this.shadowTracker.getSummary()] : []),
       ...(this.selfTuner ? ["---", "Self-Tuner:", this.selfTuner.getSummary()] : []),
     ].join("\n");
 
