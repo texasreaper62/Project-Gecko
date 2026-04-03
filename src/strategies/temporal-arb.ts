@@ -6,6 +6,7 @@ import type { PolymarketWsFeed } from "../feeds/polymarket-ws.js";
 import { generateOpportunityId } from "./strategy-types.js";
 import { priceMomentum, edgePercent } from "../utils/math.js";
 import type { SelfTuner } from "./self-tuner.js";
+import type { EmpiricalModel } from "./empirical-model.js";
 
 const log = createLogger("temporal-arb");
 
@@ -38,6 +39,7 @@ export class TemporalArbStrategy {
   private readonly polyWs: PolymarketWsFeed;
 
   private readonly selfTuner: SelfTuner | null;
+  private readonly empiricalModel: EmpiricalModel | null;
 
   private targetMarkets: PolymarketMarket[] = [];
   private scanTimer: ReturnType<typeof setInterval> | null = null;
@@ -51,12 +53,14 @@ export class TemporalArbStrategy {
     polyRest: PolymarketRestClient,
     polyWs: PolymarketWsFeed,
     selfTuner?: SelfTuner,
+    empiricalModel?: EmpiricalModel,
   ) {
     this.config = config;
     this.aggregator = aggregator;
     this.polyRest = polyRest;
     this.polyWs = polyWs;
     this.selfTuner = selfTuner ?? null;
+    this.empiricalModel = empiricalModel ?? null;
   }
 
   setOpportunityHandler(handler: (opp: Opportunity) => void): void {
@@ -181,7 +185,15 @@ export class TemporalArbStrategy {
     const baseK = volatilityScale > 0 ? 1 / volatilityScale : 1;
     const kMultiplier = this.selfTuner?.getKMultiplier() ?? 1.0;
     const k = baseK * kMultiplier;
-    const trueProbability = 1 / (1 + Math.exp(-k * priceDelta));
+    const sigmoidProbability = 1 / (1 + Math.exp(-k * priceDelta));
+
+    // Blend with empirical model if available
+    const distancePercent = Math.abs(currentSpot - strike) / currentSpot * 100;
+    const timeToExpiryMin = timeToExpiry / 60_000;
+    const empiricalProb = this.empiricalModel?.getEmpiricalProbability(distancePercent, timeToExpiryMin) ?? null;
+    const trueProbability = empiricalProb !== null
+      ? 0.7 * empiricalProb + 0.3 * sigmoidProbability
+      : sigmoidProbability;
 
     // Calculate edge
     const marketProbability = yesPrice;
