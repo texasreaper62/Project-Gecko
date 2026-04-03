@@ -4,7 +4,6 @@ import type { FeedAggregator } from "../feeds/feed-aggregator.js";
 import type { PolymarketRestClient } from "../feeds/polymarket-rest.js";
 import type { PolymarketWsFeed } from "../feeds/polymarket-ws.js";
 import { generateOpportunityId } from "./strategy-types.js";
-import { priceMomentum } from "../utils/math.js";
 import type { SelfTuner } from "./self-tuner.js";
 import type { EmpiricalModel } from "./empirical-model.js";
 import { fetchWithRetry } from "../utils/retry.js";
@@ -13,21 +12,26 @@ const log = createLogger("temporal-arb");
 
 const GAMMA_BASE = "https://gamma-api.polymarket.com";
 
-// Scan every 1 second for precise late-window entry timing
-const SCAN_INTERVAL = 1_000;
-// Refresh active market windows every 30 seconds
+// Core timing: scan every 200ms for maximum speed on lag detection
+const SCAN_INTERVAL = 200;
+// Refresh market windows every 30 seconds
 const MARKET_REFRESH_INTERVAL = 30_000;
-// Only enter trades in the final seconds of a window when outcome is nearly certain
-const ENTRY_WINDOW_START_SECONDS = 15; // Start considering entry at T-15s
-const ENTRY_WINDOW_END_SECONDS = 5;    // Stop entering after T-5s (need time for order to fill)
-// Minimum confidence to trade (0-1 scale based on composite signal score)
-const MIN_CONFIDENCE = 0.20;
-// Cooldown per conditionId to prevent duplicate signals
-const OPPORTUNITY_COOLDOWN_MS = 10_000;
-// Maximum spread threshold the self-tuner is allowed to set
-const MAX_TUNER_THRESHOLD = 10.0;
-// Reset threshold when tuner exceeds max
-const TUNER_RESET_THRESHOLD = 5.0;
+
+// LATENCY ARB: minimum price move on Binance/Coinbase to trigger a trade
+// The 0x8dxd bot used 3-5% implied probability edge
+// A 0.15% spot move in 30 seconds on BTC implies direction with high confidence
+const MIN_SPOT_MOVE_PERCENT = 0.15;
+// Lookback window for detecting spot price moves (ms)
+const SPOT_MOVE_LOOKBACK_MS = 30_000;
+// Minimum edge (percentage points) between our estimate and market price to trade
+const MIN_EDGE_PERCENT = 3;
+// Cooldown per slug to prevent rapid re-entry on same window
+const OPPORTUNITY_COOLDOWN_MS = 5_000;
+
+// Kelly Criterion: fraction of bankroll to risk (Quarter Kelly for safety)
+const KELLY_FRACTION = 0.25;
+// Maximum single position as fraction of total capital
+const MAX_POSITION_FRACTION = 0.08;
 
 // Assets and window sizes to track
 const TRACKED_ASSETS = ["btc", "eth", "sol", "xrp"] as const;
@@ -38,7 +42,6 @@ const WINDOW_SIZES = [
 
 type TrackedAsset = typeof TRACKED_ASSETS[number];
 
-// Map asset slug names to spot price symbols
 const ASSET_TO_SYMBOL: Record<TrackedAsset, string> = {
   btc: "BTC",
   eth: "ETH",
@@ -51,12 +54,11 @@ interface ActiveWindow {
   readonly windowLabel: string;
   readonly windowSeconds: number;
   readonly slug: string;
-  readonly openTimestamp: number; // Unix seconds when window opened
-  readonly closeTimestamp: number; // Unix seconds when window closes
+  readonly openTimestamp: number;
+  readonly closeTimestamp: number;
   market: PolymarketMarket | null;
   upToken: PolymarketToken | null;
   downToken: PolymarketToken | null;
-  // Spot price when the window opened (for window delta calculation)
   openSpotPrice: number | null;
 }
 
@@ -95,23 +97,10 @@ export class TemporalArbStrategy {
   }
 
   async start(): Promise<void> {
-    log.info("Starting temporal arbitrage strategy (Up/Down markets)");
-
-    // Cap the self-tuner's spread threshold to prevent it from making the bot stop trading
-    if (this.selfTuner) {
-      const tunerThreshold = this.selfTuner.getSpreadThreshold();
-      if (tunerThreshold > MAX_TUNER_THRESHOLD) {
-        log.warn("Self-tuner spread threshold too high, resetting", {
-          currentThreshold: tunerThreshold,
-          resetTo: TUNER_RESET_THRESHOLD,
-          maxAllowed: MAX_TUNER_THRESHOLD,
-        });
-        this.selfTuner.resetSpreadThreshold(TUNER_RESET_THRESHOLD);
-      }
-    }
-
+    log.info("Starting latency arbitrage strategy");
     await this.refreshWindows();
 
+    // Scan at 200ms for maximum speed - latency arb needs to be fast
     this.scanTimer = setInterval(() => {
       this.scan().catch((err) => {
         log.error("Scan error", { error: err instanceof Error ? err.message : String(err) });
@@ -128,16 +117,13 @@ export class TemporalArbStrategy {
   stop(): void {
     if (this.scanTimer) { clearInterval(this.scanTimer); this.scanTimer = null; }
     if (this.refreshTimer) { clearInterval(this.refreshTimer); this.refreshTimer = null; }
-    log.info("Stopped temporal arbitrage strategy");
+    log.info("Stopped latency arbitrage strategy");
   }
 
   async scan(): Promise<Opportunity[]> {
     const opportunities: Opportunity[] = [];
 
     if (!this.aggregator.areFeedsHealthy()) return opportunities;
-
-    // Refresh prices via REST for all active windows (fallback for when WS doesn't work)
-    await this.refreshPricesViaRest();
 
     for (const window of this.activeWindows) {
       if (!window.upToken || !window.downToken) continue;
@@ -159,174 +145,147 @@ export class TemporalArbStrategy {
     return opportunities;
   }
 
-  // Poll fresh prices from CLOB REST API for BTC/ETH windows only.
-  // We skip SOL/XRP since we have no spot data for them (evaluateWindow filters them out).
-  // Requests are batched with Promise.allSettled to avoid sequential waterfall delays.
-  private async refreshPricesViaRest(): Promise<void> {
-    // Only poll windows for assets we actually evaluate
-    const pollableWindows = this.activeWindows.filter((w) => {
-      if (!w.upToken || !w.market) return false;
-      if (w.asset !== "btc" && w.asset !== "eth") return false;
-      // Skip expired windows (with 10s buffer for settlement)
-      if (w.closeTimestamp * 1000 + 10_000 < Date.now()) return false;
-      // Skip if WS is providing fresh prices
-      const wsPrice = this.aggregator.getTokenPrice(w.upToken.tokenId);
-      if (wsPrice !== null) return false;
-      return true;
-    });
-
-    if (pollableWindows.length === 0) return;
-
-    const results = await Promise.allSettled(
-      pollableWindows.map((w) => this.polyRest.getMidpoint(w.upToken!.tokenId)),
-    );
-
-    for (let i = 0; i < pollableWindows.length; i++) {
-      const result = results[i];
-      const window = pollableWindows[i];
-      if (result.status !== "fulfilled") continue;
-
-      const midpoint = result.value;
-      if (Number.isFinite(midpoint) && midpoint > 0 && midpoint < 1) {
-        (window.upToken as { price: number }).price = midpoint;
-        (window.downToken as { price: number }).price = 1 - midpoint;
-      }
-    }
-  }
-
+  /**
+   * CORE LATENCY ARBITRAGE LOGIC
+   *
+   * The mechanism:
+   * 1. Detect a significant price move on Binance/Coinbase (confirmed by both feeds)
+   * 2. Check if Polymarket's token prices still reflect the OLD probability
+   * 3. If there's a >3% edge between real probability and market price, BUY immediately
+   * 4. Polymarket will reprice within 2-3 seconds, closing the gap
+   *
+   * We don't predict anything. We react to confirmed price moves faster than the market.
+   */
   private evaluateWindow(window: ActiveWindow): Opportunity | null {
-    // Dedup cooldown
+    // Cooldown check
     const lastSignal = this.recentOpportunities.get(window.slug);
     if (lastSignal && Date.now() - lastSignal < OPPORTUNITY_COOLDOWN_MS) return null;
 
     const symbol = ASSET_TO_SYMBOL[window.asset];
-    if (!symbol) return null;
-    if (symbol !== "BTC" && symbol !== "ETH") return null;
+    if (!symbol || (symbol !== "BTC" && symbol !== "ETH")) return null;
 
-    // Get confirmed spot price (requires both Binance and Coinbase to agree)
+    // Must have time left in the window (at least 30 seconds)
+    const timeToExpiry = window.closeTimestamp * 1000 - Date.now();
+    if (timeToExpiry < 30_000) return null;
+
+    // Get CONFIRMED spot price (both Binance and Coinbase must agree)
     const spotState = this.aggregator.getConfirmedSpotPrice(symbol);
     if (!spotState || spotState.confirmedPrice === null) return null;
     const currentSpot = spotState.confirmedPrice;
 
-    // Record the opening spot price - try to find it from price history
-    // at the window open time, or use the earliest available price
+    // Record opening price for this window
     if (window.openSpotPrice === null) {
       const history = this.aggregator.getSpotPriceHistory(symbol);
       const windowOpenMs = window.openTimestamp * 1000;
-      // Find the price closest to window open time
       let bestPrice = currentSpot;
-      let bestTimeDiff = Infinity;
+      let bestDiff = Infinity;
       for (const h of history) {
         const diff = Math.abs(h.timestamp - windowOpenMs);
-        if (diff < bestTimeDiff) {
-          bestTimeDiff = diff;
-          bestPrice = h.price;
-        }
+        if (diff < bestDiff) { bestDiff = diff; bestPrice = h.price; }
       }
       window.openSpotPrice = bestPrice;
-      log.debug("Set window open price", {
-        slug: window.slug,
-        openPrice: bestPrice.toFixed(2),
-        timeDiffMs: bestTimeDiff,
-        usedCurrent: bestTimeDiff > 60_000,
-      });
     }
 
-    // CRITICAL: Only trade in the last 15-5 seconds before window close
-    // This is when the outcome is nearly certain but tokens haven't fully repriced
-    const timeToExpiry = window.closeTimestamp * 1000 - Date.now();
-    const secondsToClose = timeToExpiry / 1000;
+    // STEP 1: Detect a significant spot price move
+    // Look at price change over the last 30 seconds
+    const history = this.aggregator.getSpotPriceHistory(symbol);
+    const now = Date.now();
+    const recentPrices = history.filter((h) => now - h.timestamp < SPOT_MOVE_LOOKBACK_MS);
+    if (recentPrices.length < 3) return null;
 
-    if (secondsToClose > ENTRY_WINDOW_START_SECONDS) return null; // Too early
-    if (secondsToClose < ENTRY_WINDOW_END_SECONDS) return null;    // Too late
+    // Find the biggest move in the lookback window
+    const oldestRecent = recentPrices[0].price;
+    const spotMovePercent = ((currentSpot - oldestRecent) / oldestRecent) * 100;
+    const absSpotMove = Math.abs(spotMovePercent);
 
-    // WINDOW DELTA: The #1 signal (weight 5-7x in Archetapp model)
-    // Is the current spot price above or below the window's opening price?
+    // Need a meaningful move to have a signal
+    if (absSpotMove < MIN_SPOT_MOVE_PERCENT) return null;
+
+    // STEP 2: Determine the "true" probability based on the spot move
+    // Window delta: is spot above or below the opening price?
     const windowDelta = currentSpot - window.openSpotPrice;
-    const deltaPercent = (windowDelta / window.openSpotPrice) * 100;
     const isUp = windowDelta > 0;
 
-    // Need some minimum movement to have conviction
-    if (Math.abs(deltaPercent) < 0.005) return null; // Less than 0.005% move = no signal
+    // Convert spot move magnitude to implied probability
+    // Bigger moves = higher confidence in direction
+    // A 0.5% move in 30s on BTC is very strong signal
+    let impliedProbUp: number;
+    if (absSpotMove > 0.5) {
+      impliedProbUp = isUp ? 0.90 : 0.10;
+    } else if (absSpotMove > 0.3) {
+      impliedProbUp = isUp ? 0.82 : 0.18;
+    } else if (absSpotMove > 0.15) {
+      impliedProbUp = isUp ? 0.72 : 0.28;
+    } else {
+      return null; // Move too small
+    }
 
-    // MOMENTUM CONFIRMATION: Short-term momentum should agree with delta
-    const history = this.aggregator.getSpotPriceHistory(symbol);
-    const recentHistory = history.filter((h) => Date.now() - h.timestamp < 10_000);
-    const recentMomentum = recentHistory.length >= 3 ? priceMomentum(recentHistory) : 0;
-    const momentumAgrees = (isUp && recentMomentum >= 0) || (!isUp && recentMomentum <= 0);
-
-    // COMPOSITE CONFIDENCE SCORE (0-1)
-    // Window delta strength is the primary factor
-    let confidence = 0;
-
-    // Delta strength: bigger moves = higher confidence
-    const absDelta = Math.abs(deltaPercent);
-    if (absDelta > 0.1) confidence += 0.4;       // Strong move (>0.1%)
-    else if (absDelta > 0.05) confidence += 0.25; // Moderate move
-    else if (absDelta > 0.01) confidence += 0.15; // Small move
-    else confidence += 0.05;                       // Tiny move
-
-    // Momentum agreement bonus
-    if (momentumAgrees) confidence += 0.2;
-
-    // Time bonus: closer to expiry = more certain
-    if (secondsToClose < 10) confidence += 0.2;
-    else if (secondsToClose < 12) confidence += 0.1;
-
-    // Dual-feed confirmation bonus (both Binance and Coinbase agree)
-    if (spotState.binance && spotState.coinbase) confidence += 0.1;
-
-    confidence = Math.min(confidence, 1.0);
-
-    if (confidence < MIN_CONFIDENCE) return null;
-
-    // Get token prices
+    // STEP 3: Compare to Polymarket's current token prices
     const upToken = window.upToken!;
     const downToken = window.downToken!;
-    const upPrice = this.aggregator.getTokenPrice(upToken.tokenId) ?? upToken.price;
-    const downPrice = this.aggregator.getTokenPrice(downToken.tokenId) ?? downToken.price;
+    const marketUpPrice = this.aggregator.getTokenPrice(upToken.tokenId) ?? upToken.price;
+    const marketDownPrice = this.aggregator.getTokenPrice(downToken.tokenId) ?? downToken.price;
 
-    if (upPrice <= 0 || upPrice >= 1 || downPrice <= 0 || downPrice >= 1) return null;
+    if (marketUpPrice <= 0 || marketUpPrice >= 1) return null;
 
-    // EDGE CALCULATION: Window delta tells us the likely outcome.
-    // Our edge is the difference between our high-confidence prediction and the market price.
-    // If we think "Up" with 85% confidence but market prices Up at 50%, we have 35% edge.
-    const buyUp = isUp;
-    const targetToken = buyUp ? upToken : downToken;
-    const targetPrice = buyUp ? upPrice : downPrice;
+    // STEP 4: Calculate edge
+    // Edge = difference between our implied probability and market price
+    const upEdge = (impliedProbUp - marketUpPrice) * 100;
+    const downEdge = ((1 - impliedProbUp) - marketDownPrice) * 100;
 
-    // At T-10s with a clear delta, our confidence in the outcome is high
-    // The edge is: (1 - targetPrice) because if we're right, token pays $1
-    // We buy at targetPrice and it resolves to $1 = profit of (1 - targetPrice)
-    const potentialPayout = 1 - targetPrice;
-    const edge = potentialPayout * confidence * 100; // Edge as percentage
+    // Pick the side with the larger edge
+    let edge: number;
+    let buyUp: boolean;
+    let targetToken: PolymarketToken;
+    let targetPrice: number;
 
-    // Don't trade if market has already priced the outcome correctly
-    // If Up token is already at 0.90+, the market knows and there's no lag to exploit
-    if (targetPrice > 0.85) return null;
+    if (upEdge > downEdge) {
+      edge = upEdge;
+      buyUp = true;
+      targetToken = upToken;
+      targetPrice = marketUpPrice;
+    } else {
+      edge = downEdge;
+      buyUp = false;
+      targetToken = downToken;
+      targetPrice = marketDownPrice;
+    }
 
-    // Need meaningful edge to overcome any residual risk
-    if (edge < 5) return null;
+    // Need minimum edge to overcome fees and slippage
+    if (edge < MIN_EDGE_PERCENT) return null;
 
-    // Position sizing: higher confidence = larger position
-    const positionSize = this.config.maxPositionSize * Math.max(confidence, 0.2);
+    // STEP 5: Position sizing with Quarter Kelly
+    // Kelly: f* = (p * b - q) / b where p=win prob, q=lose prob, b=payout odds
+    const winProb = buyUp ? impliedProbUp : (1 - impliedProbUp);
+    const payoutOdds = (1 - targetPrice) / targetPrice; // How much we win per dollar risked
+    const kellyFraction = (winProb * payoutOdds - (1 - winProb)) / payoutOdds;
+    const quarterKelly = Math.max(0, kellyFraction * KELLY_FRACTION);
+
+    // Cap at MAX_POSITION_FRACTION of total capital
+    const positionFraction = Math.min(quarterKelly, MAX_POSITION_FRACTION);
+    const positionSize = Math.min(
+      this.config.maxPositionSize * positionFraction / MAX_POSITION_FRACTION,
+      this.config.maxPositionSize,
+    );
+
+    if (positionSize < 1) return null; // Below minimum
 
     const opp: Opportunity = {
       id: generateOpportunityId("temporal-arb"),
       strategy: "temporal-arb",
       timestamp: Date.now(),
-      description: `${symbol} ${window.windowLabel} ${buyUp ? "UP" : "DOWN"} T-${secondsToClose.toFixed(0)}s: ` +
-        `delta=${deltaPercent > 0 ? "+" : ""}${deltaPercent.toFixed(4)}%, ` +
-        `open=$${window.openSpotPrice!.toFixed(2)}, now=$${currentSpot.toFixed(2)}, ` +
-        `token=${(targetPrice * 100).toFixed(1)}c, edge=${edge.toFixed(1)}%`,
+      description: `${symbol} ${window.windowLabel} LATENCY ARB ${buyUp ? "UP" : "DOWN"}: ` +
+        `spot moved ${spotMovePercent > 0 ? "+" : ""}${spotMovePercent.toFixed(3)}% in ${SPOT_MOVE_LOOKBACK_MS / 1000}s, ` +
+        `implied=${(impliedProbUp * 100).toFixed(0)}%Up, market=${(marketUpPrice * 100).toFixed(1)}%Up, ` +
+        `edge=${edge.toFixed(1)}%, kelly=${(quarterKelly * 100).toFixed(1)}%`,
       expectedSpread: edge,
-      confidence,
+      confidence: winProb,
       params: {
         tokenId: targetToken.tokenId,
         side: "BUY",
         price: targetPrice,
         size: positionSize,
-        // GTC limit order = maker = ZERO FEES (taker fees are 3.15% on these markets)
+        // GTC limit order = maker = ZERO FEES
         orderType: "GTC",
         conditionId: window.market?.conditionId ?? "",
         negRisk: false,
@@ -336,24 +295,27 @@ export class TemporalArbStrategy {
         windowLabel: window.windowLabel,
         spotPrice: currentSpot,
         openSpotPrice: window.openSpotPrice,
-        windowDelta: deltaPercent,
-        recentMomentum,
-        momentumAgrees,
-        trueProbability: confidence,
-        marketProbability: upPrice,
+        spotMovePercent,
+        impliedProbUp,
+        marketUpPrice,
+        edge,
+        kellyFraction: quarterKelly,
         timeToExpiryMs: timeToExpiry,
-        secondsToClose,
         buyUp,
+        trueProbability: winProb,
+        marketProbability: marketUpPrice,
       },
     };
 
-    log.info("Opportunity detected", {
+    log.info("LATENCY ARB opportunity", {
       id: opp.id,
-      edge: edge.toFixed(2),
       direction: buyUp ? "UP" : "DOWN",
+      spotMove: `${spotMovePercent.toFixed(3)}%`,
+      edge: `${edge.toFixed(1)}%`,
+      kelly: `${(quarterKelly * 100).toFixed(1)}%`,
+      size: `$${positionSize.toFixed(2)}`,
       window: window.windowLabel,
       asset: symbol,
-      slug: window.slug,
     });
 
     this.recentOpportunities.set(window.slug, Date.now());
@@ -365,7 +327,7 @@ export class TemporalArbStrategy {
     const now = Math.floor(Date.now() / 1000);
     const newWindows: ActiveWindow[] = [];
 
-    // Collect token IDs from expired windows for unsubscription
+    // Unsubscribe expired window tokens
     const expiredTokenIds: string[] = [];
     for (const w of this.activeWindows) {
       if (w.closeTimestamp <= now) {
@@ -379,23 +341,20 @@ export class TemporalArbStrategy {
 
     for (const asset of TRACKED_ASSETS) {
       for (const ws of WINDOW_SIZES) {
-        // Current window: the one that's currently open
         const windowOpen = Math.floor(now / ws.seconds) * ws.seconds;
         const windowClose = windowOpen + ws.seconds;
 
-        // Only target if there's enough time left
-        if (windowClose - now < ENTRY_WINDOW_END_SECONDS) continue;
+        if (windowClose - now < 5) continue; // Skip nearly expired
 
         const slug = `${asset}-updown-${ws.label}-${windowOpen}`;
 
-        // Check if we already have this window
+        // Reuse existing window if we have it
         const existing = this.activeWindows.find((w) => w.slug === slug);
         if (existing) {
           newWindows.push(existing);
           continue;
         }
 
-        // Fetch market data for this slug
         const window: ActiveWindow = {
           asset,
           windowLabel: ws.label,
@@ -410,32 +369,18 @@ export class TemporalArbStrategy {
         };
 
         try {
-          // Step 1: Get conditionId and basic data from Gamma API
+          // Get conditionId from Gamma
           const url = `${GAMMA_BASE}/events?slug=${slug}`;
           const resp = await fetchWithRetry(url);
           const text = await resp.text();
-          const events = JSON.parse(text.replace(/([:,\[]\s*)(-?\d{16,})(\s*[,\]\}])/g, '$1"$2"$3')) as {
-            markets?: {
-              conditionId?: string;
-              condition_id?: string;
-              question?: string;
-              tokens?: { token_id: string; outcome: string; price: number }[];
-              clobTokenIds?: string;
-              clob_token_ids?: string;
-              outcomePrices?: string;
-            }[];
-          }[];
+          const events = JSON.parse(text.replace(/([:,\[]\s*)(-?\d{16,})(\s*[,\]\}])/g, '$1"$2"$3'));
+          const mkt = events[0]?.markets?.[0];
 
-          const event = events[0];
-          const mkt = event?.markets?.[0];
-          if (!mkt) {
-            newWindows.push(window);
-            continue;
-          }
+          if (!mkt) { newWindows.push(window); continue; }
 
           const conditionId = mkt.conditionId ?? mkt.condition_id ?? "";
 
-          // Step 2: Get proper token IDs from CLOB API (returns strings, no truncation)
+          // Get proper token IDs from CLOB API
           let tokens: PolymarketToken[] = [];
           if (conditionId) {
             try {
@@ -453,25 +398,13 @@ export class TemporalArbStrategy {
                   price: typeof t.price === "number" ? t.price : parseFloat(String(t.price)) || 0,
                   winner: false,
                 }));
-                log.info("Got CLOB token IDs", {
-                  slug,
-                  conditionId,
-                  tokenCount: tokens.length,
-                  upTokenLen: tokens.find((t) => t.outcome === "YES")?.tokenId.length,
-                  sample: tokens[0]?.tokenId.slice(0, 40),
-                });
               }
-            } catch (clobErr) {
-              log.debug("CLOB market fetch failed, falling back to Gamma data", {
-                slug,
-                error: clobErr instanceof Error ? clobErr.message : String(clobErr),
-              });
-            }
+            } catch { /* CLOB fetch failed, skip */ }
           }
 
-          // Fallback: use Gamma data if CLOB didn't work
-          if (tokens.length === 0) {
-            if (mkt.clobTokenIds || mkt.clob_token_ids) {
+          // Fallback to Gamma data
+          if (tokens.length === 0 && (mkt.clobTokenIds || mkt.clob_token_ids)) {
+            try {
               const ids: string[] = JSON.parse(mkt.clobTokenIds ?? mkt.clob_token_ids ?? "[]");
               let prices = [0.5, 0.5];
               if (mkt.outcomePrices) {
@@ -479,17 +412,9 @@ export class TemporalArbStrategy {
               }
               if (ids[0]) tokens.push({ tokenId: ids[0], outcome: "YES", price: prices[0], winner: false });
               if (ids[1]) tokens.push({ tokenId: ids[1], outcome: "NO", price: prices[1], winner: false });
-            } else if (mkt.tokens && mkt.tokens.length > 0) {
-              tokens = mkt.tokens.map((t) => ({
-                tokenId: String(t.token_id),
-                outcome: t.outcome?.toLowerCase() === "up" ? "YES" as const : "NO" as const,
-                price: t.price ?? 0,
-                winner: false,
-              }));
-            }
+            } catch { /* parse failed */ }
           }
 
-          // Map Up=YES, Down=NO
           window.upToken = tokens.find((t) => t.outcome === "YES") ?? null;
           window.downToken = tokens.find((t) => t.outcome === "NO") ?? null;
           window.market = {
@@ -507,19 +432,8 @@ export class TemporalArbStrategy {
             eventSlug: slug,
             eventTitle: `${asset.toUpperCase()} ${ws.label} Up/Down`,
           };
-
-          // Collect token IDs for batch WS subscription (done after the loop)
-          const tokenIds = tokens.map((t) => t.tokenId).filter((id) => id && id.length >= 50);
-          if (tokenIds.length > 0) {
-            log.info("Got valid token IDs", { slug, count: tokenIds.length, sampleLen: tokenIds[0].length });
-          } else {
-            log.warn("Token IDs too short for WS subscription", {
-              slug,
-              lengths: tokens.map((t) => t.tokenId.length),
-            });
-          }
         } catch (err) {
-          log.debug("Failed to fetch window market", {
+          log.debug("Failed to fetch window", {
             slug,
             error: err instanceof Error ? err.message : String(err),
           });
@@ -540,8 +454,7 @@ export class TemporalArbStrategy {
     this.activeWindows = newWindows;
     const withTokens = newWindows.filter((w) => w.upToken && w.downToken).length;
 
-    // Batch subscribe ALL new tokens in a single WS message
-    // (sending multiple subscribe messages on one connection causes INVALID OPERATION)
+    // Batch subscribe all new tokens
     const allNewTokenIds: string[] = [];
     for (const w of newWindows) {
       if (w.upToken && w.upToken.tokenId.length >= 50 && !this.polyWs.isSubscribed(w.upToken.tokenId)) {
@@ -563,5 +476,4 @@ export class TemporalArbStrategy {
       windowSizes: WINDOW_SIZES.map((w) => w.label).join(","),
     });
   }
-
 }
