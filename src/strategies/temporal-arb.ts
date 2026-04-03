@@ -13,14 +13,15 @@ const log = createLogger("temporal-arb");
 
 const GAMMA_BASE = "https://gamma-api.polymarket.com";
 
-// Scan every 2 seconds (we only poll BTC/ETH windows now, cutting requests in half)
-const SCAN_INTERVAL = 2_000;
+// Scan every 1 second for precise late-window entry timing
+const SCAN_INTERVAL = 1_000;
 // Refresh active market windows every 30 seconds
 const MARKET_REFRESH_INTERVAL = 30_000;
-// Minimum seconds until contract expiry to consider trading
-const MIN_EXPIRY_SECONDS = 30;
-// Minimum price history data points for momentum
-const MIN_PRICE_POINTS = 5;
+// Only enter trades in the final seconds of a window when outcome is nearly certain
+const ENTRY_WINDOW_START_SECONDS = 15; // Start considering entry at T-15s
+const ENTRY_WINDOW_END_SECONDS = 5;    // Stop entering after T-5s (need time for order to fill)
+// Minimum confidence to trade (0-1 scale based on composite signal score)
+const MIN_CONFIDENCE = 0.20;
 // Cooldown per conditionId to prevent duplicate signals
 const OPPORTUNITY_COOLDOWN_MS = 10_000;
 // Warn if a token's REST-polled price hasn't changed in this many ms
@@ -57,6 +58,8 @@ interface ActiveWindow {
   market: PolymarketMarket | null;
   upToken: PolymarketToken | null;
   downToken: PolymarketToken | null;
+  // Spot price when the window opened (for window delta calculation)
+  openSpotPrice: number | null;
 }
 
 export class TemporalArbStrategy {
@@ -202,51 +205,65 @@ export class TemporalArbStrategy {
 
     const symbol = ASSET_TO_SYMBOL[window.asset];
     if (!symbol) return null;
-
-    // We only have spot data for BTC and ETH from our feeds
     if (symbol !== "BTC" && symbol !== "ETH") return null;
 
-    // Get confirmed spot price
+    // Get confirmed spot price (requires both Binance and Coinbase to agree)
     const spotState = this.aggregator.getConfirmedSpotPrice(symbol);
     if (!spotState || spotState.confirmedPrice === null) return null;
-
-    // Get price history for momentum
-    const history = this.aggregator.getSpotPriceHistory(symbol);
-    if (history.length < MIN_PRICE_POINTS) return null;
-    const first = history[0];
-    const last = history[history.length - 1];
-    if (last.timestamp - first.timestamp < 100) return null;
-
-    // Check time to expiry
-    const timeToExpiry = window.closeTimestamp * 1000 - Date.now();
-    if (timeToExpiry < MIN_EXPIRY_SECONDS * 1000) return null;
-
     const currentSpot = spotState.confirmedPrice;
 
-    // Use SHORT-TERM momentum (last 10 seconds) for 5m windows
-    // Long-term momentum is noise for short prediction windows
+    // Record the opening spot price when we first see this window
+    if (window.openSpotPrice === null) {
+      window.openSpotPrice = currentSpot;
+    }
+
+    // CRITICAL: Only trade in the last 15-5 seconds before window close
+    // This is when the outcome is nearly certain but tokens haven't fully repriced
+    const timeToExpiry = window.closeTimestamp * 1000 - Date.now();
+    const secondsToClose = timeToExpiry / 1000;
+
+    if (secondsToClose > ENTRY_WINDOW_START_SECONDS) return null; // Too early
+    if (secondsToClose < ENTRY_WINDOW_END_SECONDS) return null;    // Too late
+
+    // WINDOW DELTA: The #1 signal (weight 5-7x in Archetapp model)
+    // Is the current spot price above or below the window's opening price?
+    const windowDelta = currentSpot - window.openSpotPrice;
+    const deltaPercent = (windowDelta / window.openSpotPrice) * 100;
+    const isUp = windowDelta > 0;
+
+    // Need some minimum movement to have conviction
+    if (Math.abs(deltaPercent) < 0.005) return null; // Less than 0.005% move = no signal
+
+    // MOMENTUM CONFIRMATION: Short-term momentum should agree with delta
+    const history = this.aggregator.getSpotPriceHistory(symbol);
     const recentHistory = history.filter((h) => Date.now() - h.timestamp < 10_000);
-    if (recentHistory.length < 3) return null; // Need at least 3 recent ticks
+    const recentMomentum = recentHistory.length >= 3 ? priceMomentum(recentHistory) : 0;
+    const momentumAgrees = (isUp && recentMomentum >= 0) || (!isUp && recentMomentum <= 0);
 
-    const recentMomentum = priceMomentum(recentHistory);
+    // COMPOSITE CONFIDENCE SCORE (0-1)
+    // Window delta strength is the primary factor
+    let confidence = 0;
 
-    // Also compute medium-term momentum (last 30 seconds) for confirmation
-    const mediumHistory = history.filter((h) => Date.now() - h.timestamp < 30_000);
-    const mediumMomentum = mediumHistory.length >= 3 ? priceMomentum(mediumHistory) : 0;
+    // Delta strength: bigger moves = higher confidence
+    const absDelta = Math.abs(deltaPercent);
+    if (absDelta > 0.1) confidence += 0.4;       // Strong move (>0.1%)
+    else if (absDelta > 0.05) confidence += 0.25; // Moderate move
+    else if (absDelta > 0.01) confidence += 0.15; // Small move
+    else confidence += 0.05;                       // Tiny move
 
-    // Require both short and medium momentum to agree on direction
-    // This filters out random noise and only acts on sustained moves
-    const bothAgree = (recentMomentum > 0 && mediumMomentum > 0) ||
-                      (recentMomentum < 0 && mediumMomentum < 0);
-    if (!bothAgree) return null;
+    // Momentum agreement bonus
+    if (momentumAgrees) confidence += 0.2;
 
-    // Use the weaker of the two as the effective momentum (conservative)
-    const effectiveMomentum = Math.abs(recentMomentum) < Math.abs(mediumMomentum)
-      ? recentMomentum : mediumMomentum;
+    // Time bonus: closer to expiry = more certain
+    if (secondsToClose < 10) confidence += 0.2;
+    else if (secondsToClose < 12) confidence += 0.1;
 
-    // Project price at window close
-    const projectedPrice = currentSpot + effectiveMomentum * timeToExpiry;
-    const projectedUp = projectedPrice > currentSpot;
+    // Dual-feed confirmation bonus (both Binance and Coinbase agree)
+    if (spotState.binance && spotState.coinbase) confidence += 0.1;
+
+    confidence = Math.min(confidence, 1.0);
+
+    if (confidence < MIN_CONFIDENCE) return null;
 
     // Get token prices
     const upToken = window.upToken!;
@@ -256,68 +273,37 @@ export class TemporalArbStrategy {
 
     if (upPrice <= 0 || upPrice >= 1 || downPrice <= 0 || downPrice >= 1) return null;
 
-    // Track price staleness: warn if the price hasn't changed in 30+ seconds
-    this.checkPriceStaleness(upToken.tokenId, upPrice, window.slug);
-
-    // Calculate realized volatility for confidence scaling
-    const volatilityScale = this.estimateVolatility(recentHistory, currentSpot);
-    const momentumStrength = Math.abs(effectiveMomentum * timeToExpiry) / volatilityScale;
-
-    // Sigmoid to convert momentum strength to directional probability
-    const kMultiplier = this.selfTuner?.getKMultiplier() ?? 1.0;
-    const k = 2.0 * kMultiplier; // Scale factor for momentum strength
-    const sigmoidProb = 1 / (1 + Math.exp(-k * momentumStrength));
-
-    // True probability of "Up" outcome
-    const trueUpProbability = projectedUp ? sigmoidProb : (1 - sigmoidProb);
-
-    // Blend with empirical model if available
-    const distancePct = Math.abs(projectedPrice - currentSpot) / currentSpot * 100;
-    const timeToExpiryMin = timeToExpiry / 60_000;
-    const empiricalProb = this.empiricalModel?.getEmpiricalProbability(distancePct, timeToExpiryMin) ?? null;
-    const finalUpProb = empiricalProb !== null
-      ? (projectedUp ? 0.7 * empiricalProb + 0.3 * trueUpProbability : 1 - (0.7 * empiricalProb + 0.3 * (1 - trueUpProbability)))
-      : trueUpProbability;
-
-    // Market's implied probability of Up
-    const marketUpProb = upPrice;
-
-    // Calculate edge
-    const upEdge = (finalUpProb - marketUpProb) * 100;
-    const downEdge = ((1 - finalUpProb) - downPrice) * 100;
-
-    const spreadThreshold = this.selfTuner?.getSpreadThreshold() ?? this.config.minSpreadThreshold;
-
-    // Choose the side with the larger edge
-    let edge: number;
-    let buyUp: boolean;
-    if (upEdge > downEdge) {
-      edge = upEdge;
-      buyUp = true;
-    } else {
-      edge = downEdge;
-      buyUp = false;
-    }
-
-    if (edge < spreadThreshold) return null;
-
-    // Extra filter: don't trade if momentum strength is too weak
-    // This prevents trading on barely-moving markets where momentum is just noise
-    if (momentumStrength < 0.5) return null;
-
+    // EDGE CALCULATION: Window delta tells us the likely outcome.
+    // Our edge is the difference between our high-confidence prediction and the market price.
+    // If we think "Up" with 85% confidence but market prices Up at 50%, we have 35% edge.
+    const buyUp = isUp;
     const targetToken = buyUp ? upToken : downToken;
     const targetPrice = buyUp ? upPrice : downPrice;
-    const confidence = Math.min(edge / 20, 1);
+
+    // At T-10s with a clear delta, our confidence in the outcome is high
+    // The edge is: (1 - targetPrice) because if we're right, token pays $1
+    // We buy at targetPrice and it resolves to $1 = profit of (1 - targetPrice)
+    const potentialPayout = 1 - targetPrice;
+    const edge = potentialPayout * confidence * 100; // Edge as percentage
+
+    // Don't trade if market has already priced the outcome correctly
+    // If Up token is already at 0.90+, the market knows and there's no lag to exploit
+    if (targetPrice > 0.85) return null;
+
+    // Need meaningful edge to overcome any residual risk
+    if (edge < 5) return null;
+
+    // Position sizing: higher confidence = larger position
     const positionSize = this.config.maxPositionSize * Math.max(confidence, 0.2);
 
     const opp: Opportunity = {
       id: generateOpportunityId("temporal-arb"),
       strategy: "temporal-arb",
       timestamp: Date.now(),
-      description: `${symbol} ${window.windowLabel} ${buyUp ? "UP" : "DOWN"}: ` +
-        `spot=$${currentSpot.toFixed(2)}, momentum=${projectedUp ? "+" : "-"}${Math.abs(effectiveMomentum * 60000).toFixed(2)}/min, ` +
-        `market=${(marketUpProb * 100).toFixed(1)}%Up, est=${(finalUpProb * 100).toFixed(1)}%Up, ` +
-        `edge=${edge.toFixed(1)}%`,
+      description: `${symbol} ${window.windowLabel} ${buyUp ? "UP" : "DOWN"} T-${secondsToClose.toFixed(0)}s: ` +
+        `delta=${deltaPercent > 0 ? "+" : ""}${deltaPercent.toFixed(4)}%, ` +
+        `open=$${window.openSpotPrice!.toFixed(2)}, now=$${currentSpot.toFixed(2)}, ` +
+        `token=${(targetPrice * 100).toFixed(1)}c, edge=${edge.toFixed(1)}%`,
       expectedSpread: edge,
       confidence,
       params: {
@@ -325,7 +311,8 @@ export class TemporalArbStrategy {
         side: "BUY",
         price: targetPrice,
         size: positionSize,
-        orderType: "FOK",
+        // GTC limit order = maker = ZERO FEES (taker fees are 3.15% on these markets)
+        orderType: "GTC",
         conditionId: window.market?.conditionId ?? "",
         negRisk: false,
       },
@@ -333,15 +320,15 @@ export class TemporalArbStrategy {
         symbol,
         windowLabel: window.windowLabel,
         spotPrice: currentSpot,
-        projectedPrice,
+        openSpotPrice: window.openSpotPrice,
+        windowDelta: deltaPercent,
         recentMomentum,
-        mediumMomentum,
-        effectiveMomentum,
-        trueProbability: finalUpProb,
-        marketProbability: marketUpProb,
+        momentumAgrees,
+        trueProbability: confidence,
+        marketProbability: upPrice,
         timeToExpiryMs: timeToExpiry,
+        secondsToClose,
         buyUp,
-        momentumStrength,
       },
     };
 
@@ -382,7 +369,7 @@ export class TemporalArbStrategy {
         const windowClose = windowOpen + ws.seconds;
 
         // Only target if there's enough time left
-        if (windowClose - now < MIN_EXPIRY_SECONDS) continue;
+        if (windowClose - now < ENTRY_WINDOW_END_SECONDS) continue;
 
         const slug = `${asset}-updown-${ws.label}-${windowOpen}`;
 
@@ -404,6 +391,7 @@ export class TemporalArbStrategy {
           market: null,
           upToken: null,
           downToken: null,
+          openSpotPrice: null,
         };
 
         try {
