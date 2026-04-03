@@ -33,6 +33,7 @@ import { PositionCloser } from "./execution/position-closer.js";
 // Self-improvement
 import { SelfTuner } from "./strategies/self-tuner.js";
 import { ShadowTracker } from "./strategies/shadow-tracker.js";
+import { EmpiricalModel } from "./strategies/empirical-model.js";
 
 const log = createLogger("main");
 
@@ -95,7 +96,8 @@ async function main(): Promise<void> {
 
   // Self-improvement engine
   const selfTuner = new SelfTuner(config);
-  const shadowTracker = new ShadowTracker(polyRest, selfTuner);
+  const empiricalModel = new EmpiricalModel();
+  const shadowTracker = new ShadowTracker(polyRest, selfTuner, empiricalModel);
 
   // Initialize monitoring
   const telegram = new TelegramNotifier(config.telegramBotToken, config.telegramChatId);
@@ -141,7 +143,7 @@ async function main(): Promise<void> {
   };
 
   // Initialize strategies
-  const temporalArb = new TemporalArbStrategy(config, aggregator, polyRest, polyWs, selfTuner);
+  const temporalArb = new TemporalArbStrategy(config, aggregator, polyRest, polyWs, selfTuner, empiricalModel);
   temporalArb.setOpportunityHandler((opp) => {
     handleOpportunity(opp).catch((err) => {
       log.error("Error handling temporal-arb opportunity", {

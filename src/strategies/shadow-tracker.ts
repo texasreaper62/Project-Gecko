@@ -2,6 +2,7 @@ import { createLogger } from "../core/logger.js";
 import type { Opportunity, StrategyType } from "../core/types.js";
 import type { PolymarketRestClient } from "../feeds/polymarket-rest.js";
 import type { SelfTuner } from "./self-tuner.js";
+import type { EmpiricalModel } from "./empirical-model.js";
 import { appendJsonl, readJsonl } from "../utils/persistence.js";
 
 const log = createLogger("shadow-tracker");
@@ -54,9 +55,12 @@ export class ShadowTracker {
   private totalWouldHaveWon = 0;
   private totalTheoreticalPnl = 0;
 
-  constructor(polyRest: PolymarketRestClient, selfTuner: SelfTuner) {
+  private readonly empiricalModel: EmpiricalModel | null;
+
+  constructor(polyRest: PolymarketRestClient, selfTuner: SelfTuner, empiricalModel?: EmpiricalModel) {
     this.polyRest = polyRest;
     this.selfTuner = selfTuner;
+    this.empiricalModel = empiricalModel ?? null;
     this.loadStats();
   }
 
@@ -181,7 +185,7 @@ export class ShadowTracker {
         if (wouldHaveWon) this.totalWouldHaveWon++;
         this.totalTheoreticalPnl += theoreticalPnl;
 
-        // Feed into self-tuner as a synthetic outcome for calibration
+        // Feed into self-tuner and empirical model
         this.selfTuner.recordShadowOutcome(
           pending.strategy,
           pending.predictedProbability,
@@ -189,6 +193,13 @@ export class ShadowTracker {
           pending.predictedEdge,
           wouldHaveWon,
         );
+
+        // Feed empirical model with distance/time/outcome data
+        if (this.empiricalModel && pending.spotPriceAtSignal > 0) {
+          const distPct = Math.abs(pending.spotPriceAtSignal - pending.priceAtSignal) / pending.spotPriceAtSignal * 100;
+          const tteMins = (pending.expiryEstimate - pending.timestamp) / 60_000;
+          this.empiricalModel.recordOutcome(distPct, tteMins, wouldHaveWon);
+        }
 
         log.info("Shadow outcome resolved", {
           id: pending.id,
