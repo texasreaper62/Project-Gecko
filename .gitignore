@@ -5,3 +5,4 @@ keys/
 logs/
 data/
 *.log
+.claude/
