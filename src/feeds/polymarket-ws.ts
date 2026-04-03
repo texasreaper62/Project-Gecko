@@ -163,12 +163,19 @@ export class PolymarketWsFeed {
     });
   }
 
+  // Clear all tracked subscriptions (called before fresh batch subscribe)
+  clearSubscriptions(): void {
+    this.subscribedTokens.clear();
+    this.bestBids.clear();
+    this.bestAsks.clear();
+  }
+
   private resubscribe(): void {
-    const tokens = Array.from(this.subscribedTokens);
-    if (tokens.length > 0) {
-      log.info("Resubscribing after reconnect", { count: tokens.length });
-      this.sendSubscribe(tokens);
-    }
+    // On reconnect, DON'T resubscribe stale tokens
+    // The temporal-arb strategy will re-subscribe current tokens on its next refresh cycle
+    // Just clear and let the strategy re-subscribe fresh tokens
+    log.info("WS reconnected, clearing stale subscriptions", { oldCount: this.subscribedTokens.size });
+    this.clearSubscriptions();
   }
 
   private handleMessage(raw: unknown): void {
