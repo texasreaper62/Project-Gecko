@@ -13,8 +13,8 @@ const log = createLogger("temporal-arb");
 
 const GAMMA_BASE = "https://gamma-api.polymarket.com";
 
-// Scan every 500ms (these markets move fast)
-const SCAN_INTERVAL = 500;
+// Scan every 3 seconds (balanced between speed and REST rate limits)
+const SCAN_INTERVAL = 3_000;
 // Refresh active market windows every 30 seconds
 const MARKET_REFRESH_INTERVAL = 30_000;
 // Minimum seconds until contract expiry to consider trading
@@ -115,6 +115,9 @@ export class TemporalArbStrategy {
 
     if (!this.aggregator.areFeedsHealthy()) return opportunities;
 
+    // Refresh prices via REST for all active windows (fallback for when WS doesn't work)
+    await this.refreshPricesViaRest();
+
     for (const window of this.activeWindows) {
       if (!window.upToken || !window.downToken) continue;
 
@@ -133,6 +136,29 @@ export class TemporalArbStrategy {
     }
 
     return opportunities;
+  }
+
+  // Poll fresh prices from CLOB REST API for active windows
+  // This runs every scan cycle (~500ms) to get real-time prices when WS isn't working
+  private async refreshPricesViaRest(): Promise<void> {
+    for (const window of this.activeWindows) {
+      if (!window.upToken || !window.market) continue;
+
+      // Only poll if the WS price is stale (not updated in last 3 seconds)
+      const wsPrice = this.aggregator.getTokenPrice(window.upToken.tokenId);
+      if (wsPrice !== null) continue; // WS is working for this token, skip REST
+
+      try {
+        const midpoint = await this.polyRest.getMidpoint(window.upToken.tokenId);
+        if (Number.isFinite(midpoint) && midpoint > 0 && midpoint < 1) {
+          // Update the token prices directly
+          (window.upToken as { price: number }).price = midpoint;
+          (window.downToken as { price: number }).price = 1 - midpoint;
+        }
+      } catch {
+        // Rate limited or token not found - skip silently
+      }
+    }
   }
 
   private evaluateWindow(window: ActiveWindow): Opportunity | null {
@@ -161,12 +187,31 @@ export class TemporalArbStrategy {
     const timeToExpiry = window.closeTimestamp * 1000 - Date.now();
     if (timeToExpiry < MIN_EXPIRY_SECONDS * 1000) return null;
 
-    // Calculate momentum
-    const momentum = priceMomentum(history);
     const currentSpot = spotState.confirmedPrice;
 
+    // Use SHORT-TERM momentum (last 10 seconds) for 5m windows
+    // Long-term momentum is noise for short prediction windows
+    const recentHistory = history.filter((h) => Date.now() - h.timestamp < 10_000);
+    if (recentHistory.length < 3) return null; // Need at least 3 recent ticks
+
+    const recentMomentum = priceMomentum(recentHistory);
+
+    // Also compute medium-term momentum (last 30 seconds) for confirmation
+    const mediumHistory = history.filter((h) => Date.now() - h.timestamp < 30_000);
+    const mediumMomentum = mediumHistory.length >= 3 ? priceMomentum(mediumHistory) : 0;
+
+    // Require both short and medium momentum to agree on direction
+    // This filters out random noise and only acts on sustained moves
+    const bothAgree = (recentMomentum > 0 && mediumMomentum > 0) ||
+                      (recentMomentum < 0 && mediumMomentum < 0);
+    if (!bothAgree) return null;
+
+    // Use the weaker of the two as the effective momentum (conservative)
+    const effectiveMomentum = Math.abs(recentMomentum) < Math.abs(mediumMomentum)
+      ? recentMomentum : mediumMomentum;
+
     // Project price at window close
-    const projectedPrice = currentSpot + momentum * timeToExpiry;
+    const projectedPrice = currentSpot + effectiveMomentum * timeToExpiry;
     const projectedUp = projectedPrice > currentSpot;
 
     // Get token prices
@@ -178,8 +223,8 @@ export class TemporalArbStrategy {
     if (upPrice <= 0 || upPrice >= 1 || downPrice <= 0 || downPrice >= 1) return null;
 
     // Calculate realized volatility for confidence scaling
-    const volatilityScale = this.estimateVolatility(history, currentSpot);
-    const momentumStrength = Math.abs(momentum * timeToExpiry) / volatilityScale;
+    const volatilityScale = this.estimateVolatility(recentHistory, currentSpot);
+    const momentumStrength = Math.abs(effectiveMomentum * timeToExpiry) / volatilityScale;
 
     // Sigmoid to convert momentum strength to directional probability
     const kMultiplier = this.selfTuner?.getKMultiplier() ?? 1.0;
@@ -219,6 +264,10 @@ export class TemporalArbStrategy {
 
     if (edge < spreadThreshold) return null;
 
+    // Extra filter: don't trade if momentum strength is too weak
+    // This prevents trading on barely-moving markets where momentum is just noise
+    if (momentumStrength < 0.5) return null;
+
     const targetToken = buyUp ? upToken : downToken;
     const targetPrice = buyUp ? upPrice : downPrice;
     const confidence = Math.min(edge / 20, 1);
@@ -229,7 +278,7 @@ export class TemporalArbStrategy {
       strategy: "temporal-arb",
       timestamp: Date.now(),
       description: `${symbol} ${window.windowLabel} ${buyUp ? "UP" : "DOWN"}: ` +
-        `spot=$${currentSpot.toFixed(2)}, momentum=${projectedUp ? "+" : "-"}${Math.abs(momentum * 60000).toFixed(2)}/min, ` +
+        `spot=$${currentSpot.toFixed(2)}, momentum=${projectedUp ? "+" : "-"}${Math.abs(effectiveMomentum * 60000).toFixed(2)}/min, ` +
         `market=${(marketUpProb * 100).toFixed(1)}%Up, est=${(finalUpProb * 100).toFixed(1)}%Up, ` +
         `edge=${edge.toFixed(1)}%`,
       expectedSpread: edge,
@@ -248,7 +297,9 @@ export class TemporalArbStrategy {
         windowLabel: window.windowLabel,
         spotPrice: currentSpot,
         projectedPrice,
-        momentum,
+        recentMomentum,
+        mediumMomentum,
+        effectiveMomentum,
         trueProbability: finalUpProb,
         marketProbability: marketUpProb,
         timeToExpiryMs: timeToExpiry,
