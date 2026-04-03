@@ -1,47 +1,67 @@
 import { createLogger } from "../core/logger.js";
-import type { AppConfig, Opportunity, PolymarketMarket } from "../core/types.js";
+import type { AppConfig, Opportunity, PolymarketMarket, PolymarketToken } from "../core/types.js";
 import type { FeedAggregator } from "../feeds/feed-aggregator.js";
 import type { PolymarketRestClient } from "../feeds/polymarket-rest.js";
 import type { PolymarketWsFeed } from "../feeds/polymarket-ws.js";
 import { generateOpportunityId } from "./strategy-types.js";
-import { priceMomentum, edgePercent } from "../utils/math.js";
+import { priceMomentum } from "../utils/math.js";
 import type { SelfTuner } from "./self-tuner.js";
 import type { EmpiricalModel } from "./empirical-model.js";
+import { fetchWithRetry } from "../utils/retry.js";
 
 const log = createLogger("temporal-arb");
 
-// How often to scan for opportunities (ms)
-const SCAN_INTERVAL = 100;
-// How often to refresh target markets from Gamma (ms)
-const MARKET_REFRESH_INTERVAL = 60_000;
-// Minimum seconds until contract expiry to consider trading
-const MIN_EXPIRY_SECONDS = 120;
-// Number of recent price points needed for momentum
-const MIN_PRICE_POINTS = 5;
+const GAMMA_BASE = "https://gamma-api.polymarket.com";
 
-// Cooldown per conditionId to prevent duplicate opportunities
+// Scan every 500ms (these markets move fast)
+const SCAN_INTERVAL = 500;
+// Refresh active market windows every 30 seconds
+const MARKET_REFRESH_INTERVAL = 30_000;
+// Minimum seconds until contract expiry to consider trading
+const MIN_EXPIRY_SECONDS = 30;
+// Minimum price history data points for momentum
+const MIN_PRICE_POINTS = 5;
+// Cooldown per conditionId to prevent duplicate signals
 const OPPORTUNITY_COOLDOWN_MS = 10_000;
 
-// Duration tier boundaries (ms)
-const SHORT_DURATION_MAX_MS = 20 * 60 * 1000;   // 20 minutes
-const MEDIUM_DURATION_MAX_MS = 4 * 60 * 60 * 1000; // 4 hours
+// Assets and window sizes to track
+const TRACKED_ASSETS = ["btc", "eth", "sol", "xrp"] as const;
+const WINDOW_SIZES = [
+  { label: "5m", seconds: 300 },
+  { label: "15m", seconds: 900 },
+] as const;
 
-// Medium-duration tier requires higher spread and uses smaller positions
-const MEDIUM_SPREAD_MULTIPLIER = 1.5;
-const MEDIUM_POSITION_MULTIPLIER = 0.5;
+type TrackedAsset = typeof TRACKED_ASSETS[number];
 
-type DurationTier = "short" | "medium";
+// Map asset slug names to spot price symbols
+const ASSET_TO_SYMBOL: Record<TrackedAsset, string> = {
+  btc: "BTC",
+  eth: "ETH",
+  sol: "SOL",
+  xrp: "XRP",
+};
+
+interface ActiveWindow {
+  readonly asset: TrackedAsset;
+  readonly windowLabel: string;
+  readonly windowSeconds: number;
+  readonly slug: string;
+  readonly openTimestamp: number; // Unix seconds when window opened
+  readonly closeTimestamp: number; // Unix seconds when window closes
+  market: PolymarketMarket | null;
+  upToken: PolymarketToken | null;
+  downToken: PolymarketToken | null;
+}
 
 export class TemporalArbStrategy {
   private readonly config: AppConfig;
   private readonly aggregator: FeedAggregator;
   private readonly polyRest: PolymarketRestClient;
   private readonly polyWs: PolymarketWsFeed;
-
   private readonly selfTuner: SelfTuner | null;
   private readonly empiricalModel: EmpiricalModel | null;
 
-  private targetMarkets: PolymarketMarket[] = [];
+  private activeWindows: ActiveWindow[] = [];
   private scanTimer: ReturnType<typeof setInterval> | null = null;
   private refreshTimer: ReturnType<typeof setInterval> | null = null;
   private onOpportunity: ((opp: Opportunity) => void) | null = null;
@@ -68,8 +88,8 @@ export class TemporalArbStrategy {
   }
 
   async start(): Promise<void> {
-    log.info("Starting temporal arbitrage strategy");
-    await this.refreshMarkets();
+    log.info("Starting temporal arbitrage strategy (Up/Down markets)");
+    await this.refreshWindows();
 
     this.scanTimer = setInterval(() => {
       this.scan().catch((err) => {
@@ -78,42 +98,35 @@ export class TemporalArbStrategy {
     }, SCAN_INTERVAL);
 
     this.refreshTimer = setInterval(() => {
-      this.refreshMarkets().catch((err) => {
-        log.error("Market refresh error", { error: err instanceof Error ? err.message : String(err) });
+      this.refreshWindows().catch((err) => {
+        log.error("Window refresh error", { error: err instanceof Error ? err.message : String(err) });
       });
     }, MARKET_REFRESH_INTERVAL);
   }
 
   stop(): void {
-    if (this.scanTimer) {
-      clearInterval(this.scanTimer);
-      this.scanTimer = null;
-    }
-    if (this.refreshTimer) {
-      clearInterval(this.refreshTimer);
-      this.refreshTimer = null;
-    }
+    if (this.scanTimer) { clearInterval(this.scanTimer); this.scanTimer = null; }
+    if (this.refreshTimer) { clearInterval(this.refreshTimer); this.refreshTimer = null; }
     log.info("Stopped temporal arbitrage strategy");
   }
 
   async scan(): Promise<Opportunity[]> {
     const opportunities: Opportunity[] = [];
 
-    // Only trade when both feeds confirm prices
-    if (!this.aggregator.areFeedsHealthy()) {
-      return opportunities;
-    }
+    if (!this.aggregator.areFeedsHealthy()) return opportunities;
 
-    for (const market of this.targetMarkets) {
+    for (const window of this.activeWindows) {
+      if (!window.upToken || !window.downToken) continue;
+
       try {
-        const opps = this.evaluateMarket(market);
-        for (const opp of opps) {
+        const opp = this.evaluateWindow(window);
+        if (opp) {
           opportunities.push(opp);
           this.onOpportunity?.(opp);
         }
       } catch (err) {
-        log.error("Error evaluating market", {
-          market: market.conditionId,
+        log.error("Error evaluating window", {
+          slug: window.slug,
           error: err instanceof Error ? err.message : String(err),
         });
       }
@@ -122,267 +135,282 @@ export class TemporalArbStrategy {
     return opportunities;
   }
 
-  private evaluateMarket(market: PolymarketMarket): Opportunity[] {
-    const opportunities: Opportunity[] = [];
+  private evaluateWindow(window: ActiveWindow): Opportunity | null {
+    // Dedup cooldown
+    const lastSignal = this.recentOpportunities.get(window.slug);
+    if (lastSignal && Date.now() - lastSignal < OPPORTUNITY_COOLDOWN_MS) return null;
 
-    // Dedup: skip if we recently signaled this market
-    const lastSignal = this.recentOpportunities.get(market.conditionId);
-    if (lastSignal && Date.now() - lastSignal < OPPORTUNITY_COOLDOWN_MS) {
-      return opportunities;
-    }
+    const symbol = ASSET_TO_SYMBOL[window.asset];
+    if (!symbol) return null;
 
-    // Determine which crypto asset this market tracks
-    const symbol = this.extractSymbol(market.question);
-    if (!symbol) return opportunities;
+    // We only have spot data for BTC and ETH from our feeds
+    if (symbol !== "BTC" && symbol !== "ETH") return null;
 
-    // Get confirmed spot price (requires both feeds to agree)
+    // Get confirmed spot price
     const spotState = this.aggregator.getConfirmedSpotPrice(symbol);
-    if (!spotState || spotState.confirmedPrice === null) return opportunities;
+    if (!spotState || spotState.confirmedPrice === null) return null;
 
     // Get price history for momentum
     const history = this.aggregator.getSpotPriceHistory(symbol);
-    if (history.length < MIN_PRICE_POINTS) return opportunities;
-
-    // Require at least 100ms of price data to avoid zero-dt momentum
+    if (history.length < MIN_PRICE_POINTS) return null;
     const first = history[0];
     const last = history[history.length - 1];
-    if (last.timestamp - first.timestamp < 100) return opportunities;
+    if (last.timestamp - first.timestamp < 100) return null;
 
-    // Calculate price momentum (per ms)
+    // Check time to expiry
+    const timeToExpiry = window.closeTimestamp * 1000 - Date.now();
+    if (timeToExpiry < MIN_EXPIRY_SECONDS * 1000) return null;
+
+    // Calculate momentum
     const momentum = priceMomentum(history);
-
-    // Extract strike price and direction from market question
-    const strikeInfo = this.extractStrike(market.question);
-    if (strikeInfo === null) return opportunities;
-    const { strike, isAbove: isAboveContract } = strikeInfo;
-
-    // Check expiry
-    const expiryMs = new Date(market.endDateIso).getTime();
-    const timeToExpiry = expiryMs - Date.now();
-    if (timeToExpiry < MIN_EXPIRY_SECONDS * 1000) return opportunities;
-
-    // Get the YES and NO tokens
-    const yesToken = market.tokens.find((t) => t.outcome === "YES");
-    const noToken = market.tokens.find((t) => t.outcome === "NO");
-    if (!yesToken || !noToken) return opportunities;
-
-    // Get current market prices from WS feed or fallback to token data
-    const yesPrice = this.aggregator.getTokenPrice(yesToken.tokenId) ?? yesToken.price;
-    if (yesPrice <= 0 || yesPrice >= 1) return opportunities;
-
-    // Estimate true probability using spot price, momentum, and time to expiry
     const currentSpot = spotState.confirmedPrice;
+
+    // Project price at window close
     const projectedPrice = currentSpot + momentum * timeToExpiry;
+    const projectedUp = projectedPrice > currentSpot;
 
-    // Price delta: positive means the contract outcome is more likely
-    const priceDelta = isAboveContract
-      ? projectedPrice - strike
-      : strike - projectedPrice;
+    // Get token prices
+    const upToken = window.upToken!;
+    const downToken = window.downToken!;
+    const upPrice = this.aggregator.getTokenPrice(upToken.tokenId) ?? upToken.price;
+    const downPrice = this.aggregator.getTokenPrice(downToken.tokenId) ?? downToken.price;
 
-    // Calculate realized volatility from recent price history
-    // Standard deviation of returns gives better k calibration than a fixed percentage
+    if (upPrice <= 0 || upPrice >= 1 || downPrice <= 0 || downPrice >= 1) return null;
+
+    // Calculate realized volatility for confidence scaling
     const volatilityScale = this.estimateVolatility(history, currentSpot);
-    const baseK = volatilityScale > 0 ? 1 / volatilityScale : 1;
+    const momentumStrength = Math.abs(momentum * timeToExpiry) / volatilityScale;
+
+    // Sigmoid to convert momentum strength to directional probability
     const kMultiplier = this.selfTuner?.getKMultiplier() ?? 1.0;
-    const k = baseK * kMultiplier;
-    const sigmoidProbability = 1 / (1 + Math.exp(-k * priceDelta));
+    const k = 2.0 * kMultiplier; // Scale factor for momentum strength
+    const sigmoidProb = 1 / (1 + Math.exp(-k * momentumStrength));
+
+    // True probability of "Up" outcome
+    const trueUpProbability = projectedUp ? sigmoidProb : (1 - sigmoidProb);
 
     // Blend with empirical model if available
-    const distancePercent = Math.abs(currentSpot - strike) / currentSpot * 100;
+    const distancePct = Math.abs(projectedPrice - currentSpot) / currentSpot * 100;
     const timeToExpiryMin = timeToExpiry / 60_000;
-    const empiricalProb = this.empiricalModel?.getEmpiricalProbability(distancePercent, timeToExpiryMin) ?? null;
-    const trueProbability = empiricalProb !== null
-      ? 0.7 * empiricalProb + 0.3 * sigmoidProbability
-      : sigmoidProbability;
+    const empiricalProb = this.empiricalModel?.getEmpiricalProbability(distancePct, timeToExpiryMin) ?? null;
+    const finalUpProb = empiricalProb !== null
+      ? (projectedUp ? 0.7 * empiricalProb + 0.3 * trueUpProbability : 1 - (0.7 * empiricalProb + 0.3 * (1 - trueUpProbability)))
+      : trueUpProbability;
+
+    // Market's implied probability of Up
+    const marketUpProb = upPrice;
 
     // Calculate edge
-    const marketProbability = yesPrice;
-    const edge = edgePercent(trueProbability, marketProbability);
+    const upEdge = (finalUpProb - marketUpProb) * 100;
+    const downEdge = ((1 - finalUpProb) - downPrice) * 100;
 
-    // Use adaptive spread threshold if self-tuner is active, then apply tier multiplier
-    const baseSpreadThreshold = this.selfTuner?.getSpreadThreshold() ?? this.config.minSpreadThreshold;
-    const tier = this.getDurationTier(timeToExpiry);
-    const spreadMultiplier = tier === "medium" ? MEDIUM_SPREAD_MULTIPLIER : 1;
-    const spreadThreshold = baseSpreadThreshold * spreadMultiplier;
+    const spreadThreshold = this.selfTuner?.getSpreadThreshold() ?? this.config.minSpreadThreshold;
 
-    if (Math.abs(edge) >= spreadThreshold) {
-      const buyYes = edge > 0; // True probability > market probability = buy YES
-      const targetToken = buyYes ? yesToken : noToken;
-      const targetPrice = buyYes ? yesPrice : (1 - yesPrice);
-
-      // Confidence-weighted sizing: scale position by edge magnitude
-      const confidence = Math.min(Math.abs(edge) / 20, 1);
-      const positionMultiplier = tier === "medium" ? MEDIUM_POSITION_MULTIPLIER : 1;
-      const positionSize = this.config.maxPositionSize * Math.max(confidence, 0.2) * positionMultiplier;
-
-      const opp: Opportunity = {
-        id: generateOpportunityId("temporal-arb"),
-        strategy: "temporal-arb",
-        timestamp: Date.now(),
-        description: `${symbol} ${isAboveContract ? "above" : "below"} $${strike}: ` +
-          `spot=$${currentSpot.toFixed(2)}, projected=$${projectedPrice.toFixed(2)}, ` +
-          `market=${(marketProbability * 100).toFixed(1)}%, est=${(trueProbability * 100).toFixed(1)}%, ` +
-          `edge=${edge.toFixed(1)}%`,
-        expectedSpread: Math.abs(edge),
-        confidence,
-        params: {
-          tokenId: targetToken.tokenId,
-          side: "BUY",
-          price: targetPrice,
-          size: positionSize,
-          orderType: "FOK",
-          conditionId: market.conditionId,
-          negRisk: market.negRisk,
-        },
-        metadata: {
-          symbol,
-          strike,
-          isAboveContract,
-          spotPrice: currentSpot,
-          projectedPrice,
-          momentum,
-          trueProbability,
-          marketProbability,
-          timeToExpiryMs: timeToExpiry,
-          buyYes,
-          durationTier: tier,
-        },
-      };
-
-      log.info("Opportunity detected", {
-        id: opp.id,
-        edge: edge.toFixed(2),
-        tier,
-        spreadThreshold: spreadThreshold.toFixed(1),
-        market: market.question,
-      });
-
-      // Mark this market as recently signaled
-      this.recentOpportunities.set(market.conditionId, Date.now());
-
-      opportunities.push(opp);
+    // Choose the side with the larger edge
+    let edge: number;
+    let buyUp: boolean;
+    if (upEdge > downEdge) {
+      edge = upEdge;
+      buyUp = true;
+    } else {
+      edge = downEdge;
+      buyUp = false;
     }
 
-    return opportunities;
+    if (edge < spreadThreshold) return null;
+
+    const targetToken = buyUp ? upToken : downToken;
+    const targetPrice = buyUp ? upPrice : downPrice;
+    const confidence = Math.min(edge / 20, 1);
+    const positionSize = this.config.maxPositionSize * Math.max(confidence, 0.2);
+
+    const opp: Opportunity = {
+      id: generateOpportunityId("temporal-arb"),
+      strategy: "temporal-arb",
+      timestamp: Date.now(),
+      description: `${symbol} ${window.windowLabel} ${buyUp ? "UP" : "DOWN"}: ` +
+        `spot=$${currentSpot.toFixed(2)}, momentum=${projectedUp ? "+" : "-"}${Math.abs(momentum * 60000).toFixed(2)}/min, ` +
+        `market=${(marketUpProb * 100).toFixed(1)}%Up, est=${(finalUpProb * 100).toFixed(1)}%Up, ` +
+        `edge=${edge.toFixed(1)}%`,
+      expectedSpread: edge,
+      confidence,
+      params: {
+        tokenId: targetToken.tokenId,
+        side: "BUY",
+        price: targetPrice,
+        size: positionSize,
+        orderType: "FOK",
+        conditionId: window.market?.conditionId ?? "",
+        negRisk: false,
+      },
+      metadata: {
+        symbol,
+        windowLabel: window.windowLabel,
+        spotPrice: currentSpot,
+        projectedPrice,
+        momentum,
+        trueProbability: finalUpProb,
+        marketProbability: marketUpProb,
+        timeToExpiryMs: timeToExpiry,
+        buyUp,
+        momentumStrength,
+      },
+    };
+
+    log.info("Opportunity detected", {
+      id: opp.id,
+      edge: edge.toFixed(2),
+      direction: buyUp ? "UP" : "DOWN",
+      window: window.windowLabel,
+      asset: symbol,
+      slug: window.slug,
+    });
+
+    this.recentOpportunities.set(window.slug, Date.now());
+    return opp;
   }
 
-  private async refreshMarkets(): Promise<void> {
-    try {
-      const markets = await this.polyRest.getCryptoMarkets();
+  // Build deterministic slugs for currently active windows and fetch their market data
+  private async refreshWindows(): Promise<void> {
+    const now = Math.floor(Date.now() / 1000);
+    const newWindows: ActiveWindow[] = [];
 
-      // Filter for short and medium-duration crypto contracts
-      this.targetMarkets = markets.filter((m) => {
-        if (m.closed || !m.active) return false;
-        const expiry = new Date(m.endDateIso).getTime();
-        const timeToExpiry = expiry - Date.now();
-        // Include contracts from 5min up to 4 hours out
-        if (timeToExpiry <= 0 || timeToExpiry > MEDIUM_DURATION_MAX_MS) return false;
-        return this.extractSymbol(m.question) !== null;
-      });
+    for (const asset of TRACKED_ASSETS) {
+      for (const ws of WINDOW_SIZES) {
+        // Current window: the one that's currently open
+        const windowOpen = Math.floor(now / ws.seconds) * ws.seconds;
+        const windowClose = windowOpen + ws.seconds;
 
-      // Subscribe to WS feeds for target market tokens
-      const tokenIds: string[] = [];
-      for (const m of this.targetMarkets) {
-        if (m.tokens.length === 0) {
-          log.warn("Market has no tokens", { conditionId: m.conditionId, question: m.question.slice(0, 80) });
+        // Only target if there's enough time left
+        if (windowClose - now < MIN_EXPIRY_SECONDS) continue;
+
+        const slug = `${asset}-updown-${ws.label}-${windowOpen}`;
+
+        // Check if we already have this window
+        const existing = this.activeWindows.find((w) => w.slug === slug);
+        if (existing) {
+          newWindows.push(existing);
+          continue;
         }
-        for (const t of m.tokens) {
-          if (t.tokenId) {
-            tokenIds.push(t.tokenId);
-          } else {
-            log.warn("Token has empty tokenId", { conditionId: m.conditionId, outcome: t.outcome });
+
+        // Fetch market data for this slug
+        const window: ActiveWindow = {
+          asset,
+          windowLabel: ws.label,
+          windowSeconds: ws.seconds,
+          slug,
+          openTimestamp: windowOpen,
+          closeTimestamp: windowClose,
+          market: null,
+          upToken: null,
+          downToken: null,
+        };
+
+        try {
+          const url = `${GAMMA_BASE}/events?slug=${slug}`;
+          const resp = await fetchWithRetry(url);
+          const text = await resp.text();
+          // Quote large numbers to prevent token ID truncation
+          const events = JSON.parse(text.replace(/([:,\[]\s*)(-?\d{16,})(\s*[,\]\}])/g, '$1"$2"$3')) as {
+            markets?: {
+              conditionId?: string;
+              condition_id?: string;
+              question?: string;
+              tokens?: { token_id: string; outcome: string; price: number }[];
+              clobTokenIds?: string;
+              clob_token_ids?: string;
+              outcomePrices?: string;
+            }[];
+          }[];
+
+          const event = events[0];
+          const mkt = event?.markets?.[0];
+          if (mkt) {
+            // Get tokens - try tokens array first, then clobTokenIds
+            let tokens: PolymarketToken[] = [];
+            if (mkt.tokens && mkt.tokens.length > 0) {
+              tokens = mkt.tokens.map((t) => ({
+                tokenId: String(t.token_id),
+                outcome: t.outcome?.toLowerCase() === "up" ? "YES" as const : "NO" as const,
+                price: t.price ?? 0,
+                winner: false,
+              }));
+            } else if (mkt.clobTokenIds || mkt.clob_token_ids) {
+              const ids: string[] = JSON.parse(mkt.clobTokenIds ?? mkt.clob_token_ids ?? "[]");
+              let prices = [0.5, 0.5];
+              if (mkt.outcomePrices) {
+                try { prices = JSON.parse(mkt.outcomePrices).map((p: string) => parseFloat(p) || 0.5); } catch { /* */ }
+              }
+              if (ids[0]) tokens.push({ tokenId: ids[0], outcome: "YES", price: prices[0], winner: false });
+              if (ids[1]) tokens.push({ tokenId: ids[1], outcome: "NO", price: prices[1], winner: false });
+            }
+
+            // Map Up=YES, Down=NO
+            window.upToken = tokens.find((t) => t.outcome === "YES") ?? null;
+            window.downToken = tokens.find((t) => t.outcome === "NO") ?? null;
+            window.market = {
+              conditionId: mkt.conditionId ?? mkt.condition_id ?? "",
+              questionId: "",
+              question: mkt.question ?? `${asset} Up/Down ${ws.label}`,
+              slug,
+              tokens,
+              active: true,
+              closed: false,
+              negRisk: false,
+              endDateIso: new Date(windowClose * 1000).toISOString(),
+              volume: 0,
+              liquidity: 0,
+              eventSlug: slug,
+              eventTitle: `${asset.toUpperCase()} ${ws.label} Up/Down`,
+            };
+
+            // Subscribe to WS for real-time prices
+            const tokenIds = tokens.map((t) => t.tokenId).filter((id) => id && id.length > 10);
+            if (tokenIds.length > 0) {
+              this.polyWs.subscribeToTokens(tokenIds);
+            }
           }
+        } catch (err) {
+          log.debug("Failed to fetch window market", {
+            slug,
+            error: err instanceof Error ? err.message : String(err),
+          });
         }
-      }
-      if (tokenIds.length > 0) {
-        this.polyWs.subscribeToTokens(tokenIds);
-      }
 
-      // Cleanup expired cooldown entries to prevent memory leak
-      const now = Date.now();
-      for (const [key, ts] of this.recentOpportunities) {
-        if (now - ts > OPPORTUNITY_COOLDOWN_MS * 2) {
-          this.recentOpportunities.delete(key);
-        }
+        newWindows.push(window);
       }
-
-      const shortCount = this.targetMarkets.filter((m) => {
-        const tte = new Date(m.endDateIso).getTime() - Date.now();
-        return tte <= SHORT_DURATION_MAX_MS;
-      }).length;
-      const mediumCount = this.targetMarkets.length - shortCount;
-
-      log.info("Refreshed target markets", {
-        total: markets.length,
-        targets: this.targetMarkets.length,
-        shortDuration: shortCount,
-        mediumDuration: mediumCount,
-        tokens: tokenIds.length,
-      });
-    } catch (err) {
-      log.error("Failed to refresh markets", {
-        error: err instanceof Error ? err.message : String(err),
-      });
     }
+
+    // Cleanup cooldown map
+    const now2 = Date.now();
+    for (const [key, ts] of this.recentOpportunities) {
+      if (now2 - ts > OPPORTUNITY_COOLDOWN_MS * 2) {
+        this.recentOpportunities.delete(key);
+      }
+    }
+
+    this.activeWindows = newWindows;
+    const withTokens = newWindows.filter((w) => w.upToken && w.downToken).length;
+
+    log.info("Refreshed active windows", {
+      total: newWindows.length,
+      withTokens,
+      assets: TRACKED_ASSETS.join(","),
+      windowSizes: WINDOW_SIZES.map((w) => w.label).join(","),
+    });
   }
 
-  // Estimate price volatility from recent history as standard deviation of price changes.
-  // Returns a dollar amount representing typical price movement.
-  // Falls back to 0.1% of spot if insufficient data.
   private estimateVolatility(
     history: readonly { price: number; timestamp: number }[],
     currentSpot: number,
   ): number {
     if (history.length < 5) return currentSpot * 0.001;
-
-    // Calculate absolute price changes between consecutive points
     const changes: number[] = [];
     for (let i = 1; i < history.length; i++) {
       changes.push(Math.abs(history[i].price - history[i - 1].price));
     }
-
-    // Standard deviation of changes
     const mean = changes.reduce((s, c) => s + c, 0) / changes.length;
     const variance = changes.reduce((s, c) => s + (c - mean) ** 2, 0) / changes.length;
-    const stddev = Math.sqrt(variance);
-
-    // Use stddev as volatility scale, with a floor of 0.01% of spot
-    return Math.max(stddev, currentSpot * 0.0001);
-  }
-
-  private getDurationTier(timeToExpiryMs: number): DurationTier {
-    if (timeToExpiryMs <= SHORT_DURATION_MAX_MS) return "short";
-    return "medium";
-  }
-
-  private extractSymbol(question: string): string | null {
-    const q = question.toLowerCase();
-    if (q.includes("btc") || q.includes("bitcoin")) return "BTC";
-    if (q.includes("eth") || q.includes("ethereum")) return "ETH";
-    return null;
-  }
-
-  private extractStrike(question: string): { strike: number; isAbove: boolean } | null {
-    // Try to match "above $X" or "below $X" patterns first for directional context
-    const aboveMatch = question.match(/above\s*\$([0-9,]+(?:\.[0-9]+)?)/i);
-    const belowMatch = question.match(/below\s*\$([0-9,]+(?:\.[0-9]+)?)/i);
-
-    if (aboveMatch) {
-      const num = parseFloat(aboveMatch[1].replace(/,/g, ""));
-      return Number.isFinite(num) ? { strike: num, isAbove: true } : null;
-    }
-
-    if (belowMatch) {
-      const num = parseFloat(belowMatch[1].replace(/,/g, ""));
-      return Number.isFinite(num) ? { strike: num, isAbove: false } : null;
-    }
-
-    // Fallback: first dollar amount, assume "above" if question contains "above"
-    const fallback = question.match(/\$([0-9,]+(?:\.[0-9]+)?)/);
-    if (!fallback) return null;
-    const num = parseFloat(fallback[1].replace(/,/g, ""));
-    if (!Number.isFinite(num)) return null;
-    const isAbove = question.toLowerCase().includes("above");
-    return { strike: num, isAbove };
+    return Math.max(Math.sqrt(variance), currentSpot * 0.0001);
   }
 }
