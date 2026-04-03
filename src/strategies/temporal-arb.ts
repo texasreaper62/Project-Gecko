@@ -307,10 +307,10 @@ export class TemporalArbStrategy {
         };
 
         try {
+          // Step 1: Get conditionId and basic data from Gamma API
           const url = `${GAMMA_BASE}/events?slug=${slug}`;
           const resp = await fetchWithRetry(url);
           const text = await resp.text();
-          // Quote large numbers to prevent token ID truncation
           const events = JSON.parse(text.replace(/([:,\[]\s*)(-?\d{16,})(\s*[,\]\}])/g, '$1"$2"$3')) as {
             markets?: {
               conditionId?: string;
@@ -325,17 +325,50 @@ export class TemporalArbStrategy {
 
           const event = events[0];
           const mkt = event?.markets?.[0];
-          if (mkt) {
-            // Get tokens - try tokens array first, then clobTokenIds
-            let tokens: PolymarketToken[] = [];
-            if (mkt.tokens && mkt.tokens.length > 0) {
-              tokens = mkt.tokens.map((t) => ({
-                tokenId: String(t.token_id),
-                outcome: t.outcome?.toLowerCase() === "up" ? "YES" as const : "NO" as const,
-                price: t.price ?? 0,
-                winner: false,
-              }));
-            } else if (mkt.clobTokenIds || mkt.clob_token_ids) {
+          if (!mkt) {
+            newWindows.push(window);
+            continue;
+          }
+
+          const conditionId = mkt.conditionId ?? mkt.condition_id ?? "";
+
+          // Step 2: Get proper token IDs from CLOB API (returns strings, no truncation)
+          let tokens: PolymarketToken[] = [];
+          if (conditionId) {
+            try {
+              const clobUrl = `${this.config.polymarketClobUrl}/markets/${conditionId}`;
+              const clobResp = await fetchWithRetry(clobUrl);
+              const clobText = await clobResp.text();
+              const clobData = JSON.parse(clobText) as {
+                tokens?: { token_id: string; outcome: string; price: number }[];
+              };
+
+              if (clobData.tokens && clobData.tokens.length > 0) {
+                tokens = clobData.tokens.map((t) => ({
+                  tokenId: String(t.token_id),
+                  outcome: t.outcome?.toLowerCase() === "up" ? "YES" as const : "NO" as const,
+                  price: typeof t.price === "number" ? t.price : parseFloat(String(t.price)) || 0,
+                  winner: false,
+                }));
+                log.info("Got CLOB token IDs", {
+                  slug,
+                  conditionId,
+                  tokenCount: tokens.length,
+                  upTokenLen: tokens.find((t) => t.outcome === "YES")?.tokenId.length,
+                  sample: tokens[0]?.tokenId.slice(0, 40),
+                });
+              }
+            } catch (clobErr) {
+              log.debug("CLOB market fetch failed, falling back to Gamma data", {
+                slug,
+                error: clobErr instanceof Error ? clobErr.message : String(clobErr),
+              });
+            }
+          }
+
+          // Fallback: use Gamma data if CLOB didn't work
+          if (tokens.length === 0) {
+            if (mkt.clobTokenIds || mkt.clob_token_ids) {
               const ids: string[] = JSON.parse(mkt.clobTokenIds ?? mkt.clob_token_ids ?? "[]");
               let prices = [0.5, 0.5];
               if (mkt.outcomePrices) {
@@ -343,32 +376,45 @@ export class TemporalArbStrategy {
               }
               if (ids[0]) tokens.push({ tokenId: ids[0], outcome: "YES", price: prices[0], winner: false });
               if (ids[1]) tokens.push({ tokenId: ids[1], outcome: "NO", price: prices[1], winner: false });
+            } else if (mkt.tokens && mkt.tokens.length > 0) {
+              tokens = mkt.tokens.map((t) => ({
+                tokenId: String(t.token_id),
+                outcome: t.outcome?.toLowerCase() === "up" ? "YES" as const : "NO" as const,
+                price: t.price ?? 0,
+                winner: false,
+              }));
             }
+          }
 
-            // Map Up=YES, Down=NO
-            window.upToken = tokens.find((t) => t.outcome === "YES") ?? null;
-            window.downToken = tokens.find((t) => t.outcome === "NO") ?? null;
-            window.market = {
-              conditionId: mkt.conditionId ?? mkt.condition_id ?? "",
-              questionId: "",
-              question: mkt.question ?? `${asset} Up/Down ${ws.label}`,
+          // Map Up=YES, Down=NO
+          window.upToken = tokens.find((t) => t.outcome === "YES") ?? null;
+          window.downToken = tokens.find((t) => t.outcome === "NO") ?? null;
+          window.market = {
+            conditionId,
+            questionId: "",
+            question: mkt.question ?? `${asset} Up/Down ${ws.label}`,
+            slug,
+            tokens,
+            active: true,
+            closed: false,
+            negRisk: false,
+            endDateIso: new Date(windowClose * 1000).toISOString(),
+            volume: 0,
+            liquidity: 0,
+            eventSlug: slug,
+            eventTitle: `${asset.toUpperCase()} ${ws.label} Up/Down`,
+          };
+
+          // Subscribe to WS for real-time prices (require 50+ digit token IDs)
+          const tokenIds = tokens.map((t) => t.tokenId).filter((id) => id && id.length >= 50);
+          if (tokenIds.length > 0) {
+            this.polyWs.subscribeToTokens(tokenIds);
+            log.info("Subscribed to WS tokens", { slug, count: tokenIds.length, sampleLen: tokenIds[0].length });
+          } else {
+            log.warn("Token IDs too short for WS subscription", {
               slug,
-              tokens,
-              active: true,
-              closed: false,
-              negRisk: false,
-              endDateIso: new Date(windowClose * 1000).toISOString(),
-              volume: 0,
-              liquidity: 0,
-              eventSlug: slug,
-              eventTitle: `${asset.toUpperCase()} ${ws.label} Up/Down`,
-            };
-
-            // Subscribe to WS for real-time prices
-            const tokenIds = tokens.map((t) => t.tokenId).filter((id) => id && id.length > 10);
-            if (tokenIds.length > 0) {
-              this.polyWs.subscribeToTokens(tokenIds);
-            }
+              lengths: tokens.map((t) => t.tokenId.length),
+            });
           }
         } catch (err) {
           log.debug("Failed to fetch window market", {
