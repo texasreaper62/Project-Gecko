@@ -85,12 +85,30 @@ export class PolymarketWsFeed {
   }
 
   subscribeToTokens(tokenIds: string[]): void {
-    for (const id of tokenIds) {
+    // Only subscribe to tokens we haven't already subscribed to
+    const newTokens = tokenIds.filter((id) => !this.subscribedTokens.has(id));
+    if (newTokens.length === 0) return;
+
+    for (const id of newTokens) {
       this.subscribedTokens.add(id);
     }
     if (this.ws.getStatus() === "connected") {
-      this.sendSubscribe(tokenIds);
+      this.sendSubscribe(newTokens);
     }
+  }
+
+  // Unsubscribe from tokens no longer needed (e.g., expired windows)
+  unsubscribeFromTokens(tokenIds: string[]): void {
+    const toRemove = tokenIds.filter((id) => this.subscribedTokens.has(id));
+    if (toRemove.length === 0) return;
+
+    for (const id of toRemove) {
+      this.subscribedTokens.delete(id);
+      this.bestBids.delete(id);
+      this.bestAsks.delete(id);
+    }
+    // No need to send unsubscribe message - expired tokens will stop sending data
+    log.debug("Unsubscribed from expired tokens", { count: toRemove.length });
   }
 
   unsubscribeFromToken(tokenId: string): void {

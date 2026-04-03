@@ -361,6 +361,18 @@ export class TemporalArbStrategy {
     const now = Math.floor(Date.now() / 1000);
     const newWindows: ActiveWindow[] = [];
 
+    // Collect token IDs from expired windows for unsubscription
+    const expiredTokenIds: string[] = [];
+    for (const w of this.activeWindows) {
+      if (w.closeTimestamp <= now) {
+        if (w.upToken) expiredTokenIds.push(w.upToken.tokenId);
+        if (w.downToken) expiredTokenIds.push(w.downToken.tokenId);
+      }
+    }
+    if (expiredTokenIds.length > 0) {
+      this.polyWs.unsubscribeFromTokens(expiredTokenIds);
+    }
+
     for (const asset of TRACKED_ASSETS) {
       for (const ws of WINDOW_SIZES) {
         // Current window: the one that's currently open
