@@ -130,6 +130,42 @@ export class SelfTuner {
     }
   }
 
+  // Record a shadow outcome (from opportunity tracking, no real trade)
+  // Used for model calibration without risking money
+  recordShadowOutcome(
+    strategy: StrategyType,
+    predictedProbability: number,
+    marketProbability: number,
+    predictedEdge: number,
+    wouldHaveWon: boolean,
+  ): void {
+    // Create a synthetic outcome record for calibration only
+    const record: OutcomeRecord = {
+      ts: new Date().toISOString(),
+      opportunityId: `shadow-${Date.now()}`,
+      strategy,
+      predictedProbability,
+      marketProbability,
+      predictedEdge,
+      entryPrice: marketProbability,
+      exitPrice: wouldHaveWon ? 1.0 : 0.0,
+      pnl: wouldHaveWon ? (1.0 - marketProbability) * 50 : -marketProbability * 50,
+      holdTimeMs: 0,
+      slippage: 0,
+      won: wouldHaveWon,
+    };
+
+    this.outcomes.push(record);
+    this.state.totalOutcomes++;
+
+    // Shadow outcomes count for tuning but NOT for strategy enable/disable
+    // (don't disable a strategy based on hypothetical outcomes)
+
+    if (this.state.totalOutcomes >= MIN_TRADES_FOR_TUNING) {
+      this.tune();
+    }
+  }
+
   // Get the current k multiplier (applied to the base k in temporal-arb)
   getKMultiplier(): number {
     return this.state.kMultiplier;

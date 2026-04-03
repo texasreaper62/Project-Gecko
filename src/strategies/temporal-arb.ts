@@ -165,13 +165,10 @@ export class TemporalArbStrategy {
       ? projectedPrice - strike
       : strike - projectedPrice;
 
-    // Logistic function to convert price delta to probability
-    // volatilityScale: larger for higher-priced assets, makes curve appropriately flat
-    // For BTC ~$60K: scale ~$60, so a $60 delta gives ~73% probability
-    // For ETH ~$3K: scale ~$3, similar behavior relative to asset price
-    const volatilityScale = currentSpot * 0.001;
+    // Calculate realized volatility from recent price history
+    // Standard deviation of returns gives better k calibration than a fixed percentage
+    const volatilityScale = this.estimateVolatility(history, currentSpot);
     const baseK = volatilityScale > 0 ? 1 / volatilityScale : 1;
-    // Apply self-tuner calibration multiplier
     const kMultiplier = this.selfTuner?.getKMultiplier() ?? 1.0;
     const k = baseK * kMultiplier;
     const trueProbability = 1 / (1 + Math.exp(-k * priceDelta));
@@ -290,6 +287,30 @@ export class TemporalArbStrategy {
         error: err instanceof Error ? err.message : String(err),
       });
     }
+  }
+
+  // Estimate price volatility from recent history as standard deviation of price changes.
+  // Returns a dollar amount representing typical price movement.
+  // Falls back to 0.1% of spot if insufficient data.
+  private estimateVolatility(
+    history: readonly { price: number; timestamp: number }[],
+    currentSpot: number,
+  ): number {
+    if (history.length < 5) return currentSpot * 0.001;
+
+    // Calculate absolute price changes between consecutive points
+    const changes: number[] = [];
+    for (let i = 1; i < history.length; i++) {
+      changes.push(Math.abs(history[i].price - history[i - 1].price));
+    }
+
+    // Standard deviation of changes
+    const mean = changes.reduce((s, c) => s + c, 0) / changes.length;
+    const variance = changes.reduce((s, c) => s + (c - mean) ** 2, 0) / changes.length;
+    const stddev = Math.sqrt(variance);
+
+    // Use stddev as volatility scale, with a floor of 0.01% of spot
+    return Math.max(stddev, currentSpot * 0.0001);
   }
 
   private extractSymbol(question: string): string | null {
