@@ -1,278 +1,239 @@
-import { loadConfig } from "./core/config.js";
-import { createLogger, setLogLevel } from "./core/logger.js";
-import type { AppConfig, Opportunity } from "./core/types.js";
+/**
+ * Project Gecko v2 -- Multi-Strategy Trading Agent
+ *
+ * Architecture: Constrained Autonomy (D0-inspired)
+ *
+ * SCOUT --finds--> ANALYST --proposes--> SENTINEL --adjudicates--> EXECUTOR
+ *                                                                     |
+ *                          RECORDER <--records-- all steps -----------+
+ *                              |
+ *                          feedback loop (outcomes -> context -> better decisions)
+ *
+ * The model reasons freely. The system executes within hard boundaries.
+ */
 
-// Feeds
-import { BinanceFeed } from "./feeds/binance-ws.js";
-import { CoinbaseFeed } from "./feeds/coinbase-ws.js";
-import { PolymarketRestClient } from "./feeds/polymarket-rest.js";
-import { PolymarketWsFeed } from "./feeds/polymarket-ws.js";
-import { FeedAggregator } from "./feeds/feed-aggregator.js";
+import { createLogger, setLogLevel } from './core/logger.js';
+import { scanEdgar, loadCikTickerMap } from './agents/scout/edgar-monitor.js';
+import { scanThresholdList } from './agents/scout/reg-sho-monitor.js';
+import { analyzeOpportunity } from './agents/analyst/analyst.js';
+import { adjudicate } from './agents/sentinel/constraint-engine.js';
+import { setPeakEquity } from './agents/sentinel/constraint-engine.js';
+import {
+  recordOpportunity,
+  recordAction,
+  recordVerdict,
+  generateDailySummary,
+} from './agents/recorder/trade-recorder.js';
+import type { AccountState, Opportunity, GeckoConfig } from './core/types.js';
+import { createFact } from './core/types.js';
 
-// Strategies
-import { TemporalArbStrategy } from "./strategies/temporal-arb.js";
-import { CorrelatedContractsStrategy } from "./strategies/correlated-contracts.js";
+const log = createLogger('gecko');
 
-// Execution
-import { OrderBuilder } from "./execution/order-builder.js";
-import { OrderExecutor } from "./execution/order-executor.js";
-import { RiskManager } from "./execution/risk-manager.js";
-import { PositionTracker } from "./execution/position-tracker.js";
+// ============================================================
+// CONFIGURATION
+// ============================================================
 
-// Monitoring
-import { TelegramNotifier } from "./monitoring/telegram.js";
-import { DiscordNotifier } from "./monitoring/discord.js";
-import { PnlTracker } from "./monitoring/pnl-tracker.js";
-import { HealthChecker } from "./monitoring/health-check.js";
-import { DailyReporter } from "./monitoring/daily-report.js";
-import { WalletMonitor } from "./monitoring/wallet-monitor.js";
+function loadConfig(): GeckoConfig {
+  return {
+    startingCapital: Number(process.env.STARTING_CAPITAL ?? '5000'),
+    brokerId: (process.env.BROKER_ID ?? 'paper') as 'ibkr' | 'alpaca' | 'paper',
+    claudeApiKey: process.env.CLAUDE_API_KEY ?? '',
+    telegramBotToken: process.env.TELEGRAM_BOT_TOKEN ?? '',
+    telegramChatId: process.env.TELEGRAM_CHAT_ID ?? '',
+    liveTrading: process.env.LIVE_TRADING === 'true',
+    maxPositionPercent: Number(process.env.MAX_POSITION_PERCENT ?? '0.12'),
+    maxDeployedPercent: Number(process.env.MAX_DEPLOYED_PERCENT ?? '0.60'),
+    dailyLossLimitPercent: Number(process.env.DAILY_LOSS_LIMIT_PERCENT ?? '0.03'),
+    enableNetNet: process.env.ENABLE_NET_NET !== 'false',
+    enableSpinoff: process.env.ENABLE_SPINOFF !== 'false',
+    enablePead: process.env.ENABLE_PEAD === 'true',
+    enableRegSho: process.env.ENABLE_REG_SHO !== 'false',
+    logLevel: (process.env.LOG_LEVEL ?? 'info') as 'debug' | 'info' | 'warn' | 'error',
+  };
+}
 
-// Position management
-import { PositionCloser } from "./execution/position-closer.js";
+// ============================================================
+// MOCK ACCOUNT STATE (replaced by IBKR API in production)
+// ============================================================
 
-// Self-improvement
-import { SelfTuner } from "./strategies/self-tuner.js";
-import { ShadowTracker } from "./strategies/shadow-tracker.js";
-import { EmpiricalModel } from "./strategies/empirical-model.js";
+function getPaperAccountState(config: GeckoConfig): AccountState {
+  return {
+    equity: createFact(config.startingCapital, 'paper', 'verified', 60_000),
+    buyingPower: createFact(config.startingCapital * 2, 'paper', 'verified', 60_000),
+    openPositions: createFact([], 'paper', 'verified', 60_000),
+    dailyPnl: createFact(0, 'paper', 'verified', 60_000),
+    pendingOrders: createFact([], 'paper', 'verified', 60_000),
+  };
+}
 
-const log = createLogger("main");
+// ============================================================
+// MAIN AGENT LOOP
+// ============================================================
+
+async function runScoutCycle(account: AccountState): Promise<void> {
+  log.info('Scout cycle starting');
+
+  // 1. SCOUT: Find opportunities
+  const opportunities: Opportunity[] = [];
+
+  try {
+    const edgarOpps = await scanEdgar();
+    opportunities.push(...edgarOpps);
+  } catch (err) {
+    log.error('EDGAR scan failed', { error: err instanceof Error ? err.message : String(err) });
+  }
+
+  try {
+    const regShoOpps = await scanThresholdList();
+    opportunities.push(...regShoOpps);
+  } catch (err) {
+    log.error('Reg SHO scan failed', { error: err instanceof Error ? err.message : String(err) });
+  }
+
+  if (opportunities.length === 0) {
+    log.debug('No opportunities found this cycle');
+    return;
+  }
+
+  log.info(`Found ${opportunities.length} opportunities`);
+
+  // 2. For each opportunity: ANALYST -> SENTINEL -> EXECUTOR
+  for (const opp of opportunities) {
+    recordOpportunity(opp);
+
+    // ANALYST: Generate typed action
+    const action = analyzeOpportunity(opp, account);
+    if (!action) {
+      log.debug('Analyst passed on opportunity', { id: opp.id, type: opp.type });
+      continue;
+    }
+    recordAction(action);
+
+    // SENTINEL: Adjudicate
+    const verdict = adjudicate(action, account);
+    recordVerdict(verdict);
+
+    switch (verdict.type) {
+      case 'PASS':
+        log.info('Action APPROVED', {
+          ticker: action.ticker,
+          strategy: action.strategy,
+          size: action.positionSizeDollars,
+          conviction: action.conviction,
+        });
+
+        // EXECUTOR: In paper mode, just log. In live, would submit to IBKR.
+        log.info('PAPER TRADE: Would execute', {
+          ticker: action.ticker,
+          side: action.side,
+          quantity: action.quantity,
+          limitPrice: action.limitPrice,
+          stopLoss: action.stopLoss,
+          takeProfit: action.takeProfit,
+        });
+        break;
+
+      case 'HOLD':
+        log.info('Action HELD for review', {
+          ticker: action.ticker,
+          reasons: verdict.reasons,
+        });
+        break;
+
+      case 'REJECT':
+        log.info('Action REJECTED', {
+          ticker: action.ticker,
+          reasons: verdict.reasons,
+          failed: verdict.constraintsFailed,
+        });
+        break;
+
+      case 'ESCALATE':
+        log.warn('Action ESCALATED to human', {
+          ticker: action.ticker,
+          reasons: verdict.reasons,
+        });
+        // TODO: Send Telegram alert for human review
+        break;
+
+      case 'SUSPEND':
+        log.warn('Action SUSPENDED (stale state)', {
+          ticker: action.ticker,
+          reasons: verdict.reasons,
+        });
+        break;
+    }
+  }
+}
+
+// ============================================================
+// STARTUP
+// ============================================================
 
 async function main(): Promise<void> {
-  // Load and validate config
-  let config: AppConfig;
-  try {
-    config = loadConfig();
-  } catch (err) {
-    // Can't use logger if config fails (log level not set)
-    process.stderr.write(`FATAL: Config error: ${err instanceof Error ? err.message : String(err)}\n`);
-    process.exit(1);
-  }
-
+  const config = loadConfig();
   setLogLevel(config.logLevel);
-  log.info("Project Gecko starting", {
-    liveTrading: config.liveTrading,
-    killSwitch: config.killSwitch,
-    maxPositionSize: config.maxPositionSize,
-    maxTotalExposure: config.maxTotalExposure,
-    minSpreadThreshold: config.minSpreadThreshold,
+
+  log.info('Project Gecko v2 starting', {
+    mode: config.liveTrading ? 'LIVE' : 'PAPER',
+    broker: config.brokerId,
+    capital: config.startingCapital,
+    strategies: {
+      netNet: config.enableNetNet,
+      spinoff: config.enableSpinoff,
+      pead: config.enablePead,
+      regSho: config.enableRegSho,
+    },
   });
 
-  // Initialize feeds
-  const binance = new BinanceFeed(config.binanceWsUrl);
-  const coinbase = new CoinbaseFeed(config.coinbaseWsUrl);
-  const polyRest = new PolymarketRestClient(config.polymarketClobUrl);
-  const polyWs = new PolymarketWsFeed();
-  const aggregator = new FeedAggregator(binance, coinbase, polyWs);
+  // Load CIK-ticker mapping
+  await loadCikTickerMap();
 
-  // Initialize execution
-  const positions = new PositionTracker();
-  const orderBuilder = new OrderBuilder(config);
-  const riskManager = new RiskManager(config, positions, aggregator);
+  // Initialize account state
+  const account = getPaperAccountState(config);
+  setPeakEquity(config.startingCapital);
 
-  // Only initialize order signing if live trading is possible
-  if (config.liveTrading) {
+  log.info('System initialized. Starting agent loop.');
+
+  // Run scout cycle every 60 seconds
+  const SCOUT_INTERVAL_MS = 60_000;
+
+  const runLoop = async (): Promise<void> => {
     try {
-      await orderBuilder.initialize();
-      log.info("Order builder ready for live trading");
+      await runScoutCycle(account);
     } catch (err) {
-      log.error("Failed to initialize order builder, disabling live trading", {
+      log.error('Scout cycle error', {
         error: err instanceof Error ? err.message : String(err),
       });
-      riskManager.activateKillSwitch("Order builder initialization failed");
-    }
-  }
-
-  const executor = new OrderExecutor(config, orderBuilder, riskManager, positions, polyRest);
-
-  // Initialize wallet monitor
-  const walletMonitor = new WalletMonitor(config, riskManager);
-  if (config.polygonRpcUrl) {
-    await walletMonitor.start().catch((err) => {
-      log.warn("Wallet monitor failed to start (balance monitoring disabled)", {
-        error: err instanceof Error ? err.message : String(err),
-      });
-    });
-  }
-
-  // Self-improvement engine
-  const selfTuner = new SelfTuner(config);
-  const empiricalModel = new EmpiricalModel();
-  const shadowTracker = new ShadowTracker(polyRest, selfTuner, empiricalModel);
-
-  // Initialize monitoring
-  const telegram = new TelegramNotifier(config.telegramBotToken, config.telegramChatId);
-  const discord = new DiscordNotifier(config.discordWebhookUrl);
-  const pnlTracker = new PnlTracker(positions);
-  const healthChecker = new HealthChecker(binance, coinbase, polyWs, positions, riskManager, walletMonitor);
-  const dailyReporter = new DailyReporter(config, pnlTracker, healthChecker, telegram, discord, selfTuner, shadowTracker);
-
-  // Position auto-closer (take-profit, stop-loss, max hold time)
-  const positionCloser = new PositionCloser(config, positions, executor, aggregator, pnlTracker, telegram, selfTuner);
-
-  // Opportunity handler: shared across all strategies
-  const handleOpportunity = async (opp: Opportunity): Promise<void> => {
-    log.info("Opportunity detected", {
-      id: opp.id,
-      strategy: opp.strategy,
-      spread: opp.expectedSpread.toFixed(2),
-      confidence: opp.confidence.toFixed(2),
-    });
-
-    dailyReporter.incrementOpportunities();
-
-    // Track every opportunity for shadow learning (even if not traded)
-    shadowTracker.trackOpportunity(opp);
-
-    // Check if this strategy has been auto-disabled by the self-tuner
-    if (!selfTuner.isStrategyEnabled(opp.strategy)) {
-      log.info("Opportunity skipped: strategy auto-disabled by self-tuner", {
-        strategy: opp.strategy,
-        id: opp.id,
-      });
-      return;
-    }
-
-    // Execute immediately, no waiting on notifications
-    const result = await executor.executeOpportunity(opp);
-    if (result && (result.status === "filled" || result.status === "partial")) {
-      // Fire-and-forget: notify AFTER execution, don't block the trading loop
-      const msg = `Trade: ${opp.strategy}\n${opp.description}\nFill: $${result.fillPrice} x ${result.fillSize}`;
-      telegram.sendAlert("Trade", msg).catch(() => {});
-      discord.sendEmbed("Trade", msg, 0x00ff00).catch(() => {});
     }
   };
 
-  // Initialize strategies
-  const temporalArb = new TemporalArbStrategy(config, aggregator, polyRest, polyWs, selfTuner, empiricalModel);
-  temporalArb.setOpportunityHandler((opp) => {
-    handleOpportunity(opp).catch((err) => {
-      log.error("Error handling temporal-arb opportunity", {
-        error: err instanceof Error ? err.message : String(err),
-      });
-    });
-  });
+  // Initial run
+  await runLoop();
 
-  const correlatedContracts = new CorrelatedContractsStrategy(config, polyRest);
-  correlatedContracts.setOpportunityHandler((opp) => {
-    handleOpportunity(opp).catch((err) => {
-      log.error("Error handling correlated-contracts opportunity", {
-        error: err instanceof Error ? err.message : String(err),
-      });
-    });
-  });
+  // Recurring loop
+  setInterval(runLoop, SCOUT_INTERVAL_MS);
 
-  // Start everything
-  log.info("Starting feeds...");
-  binance.start();
-  coinbase.start();
-  polyWs.start();
+  // Daily summary at midnight UTC
+  const scheduleDaily = (): void => {
+    const now = new Date();
+    const midnight = new Date(now);
+    midnight.setUTCHours(24, 0, 0, 0);
+    const msUntilMidnight = midnight.getTime() - now.getTime();
 
-  log.info("Starting strategies...");
-  await temporalArb.start();
-  correlatedContracts.start();
-
-  log.info("Starting monitoring...");
-  healthChecker.start();
-  dailyReporter.start();
-  positionCloser.start();
-  shadowTracker.start();
-
-  // Send startup notification
-  const startupMsg = [
-    `Mode: ${config.liveTrading ? "LIVE TRADING" : "SCAN ONLY"}`,
-    `Max Position: $${config.maxPositionSize}`,
-    `Max Exposure: $${config.maxTotalExposure}`,
-    `Min Spread: ${config.minSpreadThreshold}%`,
-    `Kill Switch: ${config.killSwitch ? "ACTIVE" : "inactive"}`,
-    `Wallet Balance: $${walletMonitor.getBalance().toFixed(2)}`,
-    `Open Positions: ${positions.getOpenPositionCount()} ($${positions.getTotalExposure().toFixed(2)} exposure)`,
-  ].join("\n");
-
-  await Promise.all([
-    telegram.sendAlert("Gecko Bot Started", startupMsg),
-    discord.sendEmbed("Gecko Bot Started", startupMsg, 0x0099ff),
-  ]).catch((err) => {
-    log.warn("Startup notification failed", {
-      error: err instanceof Error ? err.message : String(err),
-    });
-  });
-
-  log.info("Project Gecko fully initialized and running");
-
-  // Graceful shutdown
-  let shuttingDown = false;
-  const shutdown = async (signal: string): Promise<void> => {
-    if (shuttingDown) return; // Prevent double shutdown
-    shuttingDown = true;
-    log.info(`Shutdown signal received: ${signal}`);
-
-    // Stop strategies first (no new trades)
-    temporalArb.stop();
-    correlatedContracts.stop();
-
-    // Stop monitoring, position management, shadow tracker
-    shadowTracker.stop();
-    positionCloser.stop();
-    healthChecker.stop();
-    dailyReporter.stop();
-    walletMonitor.stop();
-    clearInterval(heartbeatTimer);
-
-    // Cancel all open orders on the exchange
-    if (config.liveTrading) {
-      await executor.cancelAllOrders().catch((err) => {
-        log.error("Failed to cancel orders on shutdown", {
-          error: err instanceof Error ? err.message : String(err),
-        });
-      });
-    }
-
-    // Stop feeds and aggregator cleanup
-    aggregator.stop();
-    binance.stop();
-    coinbase.stop();
-    polyWs.stop();
-
-    // Best-effort notification with timeout
-    try {
-      await Promise.race([
-        Promise.all([
-          telegram.sendAlert("Gecko Bot Stopped", `Shutdown: ${signal}`),
-          discord.sendEmbed("Gecko Bot Stopped", `Shutdown: ${signal}`, 0xff0000),
-        ]),
-        new Promise((resolve) => setTimeout(resolve, 5000)),
-      ]);
-    } catch {
-      log.warn("Shutdown notification failed");
-    }
-
-    log.info("Shutdown complete");
-    process.exit(0);
+    setTimeout(() => {
+      const summary = generateDailySummary();
+      log.info('Daily summary', { summary });
+      scheduleDaily(); // Reschedule
+    }, msUntilMidnight);
   };
+  scheduleDaily();
 
-  process.on("SIGINT", () => { shutdown("SIGINT").catch(() => process.exit(1)); });
-  process.on("SIGTERM", () => { shutdown("SIGTERM").catch(() => process.exit(1)); });
-
-  // Unhandled rejection safety net: alert and continue (PM2 will restart if needed)
-  process.on("unhandledRejection", (reason) => {
-    log.error("Unhandled promise rejection", {
-      error: reason instanceof Error ? reason.message : String(reason),
-    });
-    telegram.sendAlert("UNHANDLED REJECTION",
-      reason instanceof Error ? reason.message : String(reason),
-    ).catch(() => { /* best effort */ });
-  });
-
-  // Keep alive heartbeat
-  const heartbeatTimer = setInterval(() => {
-    log.debug("Heartbeat", {
-      positions: positions.getOpenPositionCount(),
-      exposure: positions.getTotalExposure(),
-    });
-  }, 300_000);
+  // Keep alive
+  log.info('Agent loop running. Press Ctrl+C to stop.');
 }
 
 main().catch((err) => {
-  process.stderr.write(`FATAL: ${err instanceof Error ? err.message : String(err)}\n`);
+  log.error('Fatal error', { error: err instanceof Error ? err.message : String(err) });
   process.exit(1);
 });

@@ -1,208 +1,239 @@
-// All shared interfaces and types for Project Gecko
+/**
+ * Core types for Project Gecko v2 -- Multi-Strategy Trading Agent
+ *
+ * Architecture: D0-inspired constrained autonomy
+ * - Verified State: every fact carries freshness, provenance, authority
+ * - Typed Boundary: model reasons in language, system executes typed actions
+ * - Constraint Layer: verdicts issued outside model visibility
+ * - Closed Loop: outcomes feed back as verified state
+ */
 
-// -- Price and Market Data --
+// ============================================================
+// VERIFIED STATE -- Facts with freshness/provenance/authority
+// ============================================================
 
-export interface SpotPrice {
-  readonly symbol: string;       // "BTC" | "ETH"
-  readonly price: number;
-  readonly timestamp: number;    // Unix ms
-  readonly source: "binance" | "coinbase";
+export type Freshness = 'live' | 'recent' | 'stale' | 'unknown';
+export type Provenance = 'verified' | 'discovered' | 'untrusted';
+export type LogLevel = 'debug' | 'info' | 'warn' | 'error';
+
+export interface VerifiedFact<T> {
+  readonly value: T;
+  readonly timestamp: number;           // Unix ms when fact was obtained
+  readonly freshness: Freshness;
+  readonly provenance: Provenance;
+  readonly source: string;              // "ibkr" | "edgar" | "nyse" | "calculated"
+  readonly maxAgeMs: number;            // After this duration, freshness becomes 'stale'
 }
 
-export interface PriceState {
-  readonly binance: SpotPrice | null;
-  readonly coinbase: SpotPrice | null;
-  readonly confirmedPrice: number | null;   // Only set when both feeds agree
-  readonly lastUpdate: number;
+export function createFact<T>(
+  value: T,
+  source: string,
+  provenance: Provenance = 'verified',
+  maxAgeMs: number = 60_000
+): VerifiedFact<T> {
+  return {
+    value,
+    timestamp: Date.now(),
+    freshness: 'live',
+    provenance,
+    source,
+    maxAgeMs,
+  };
 }
 
-export interface PolymarketToken {
-  readonly tokenId: string;
-  readonly outcome: "YES" | "NO";
-  readonly price: number;
-  readonly winner: boolean;
+export function isFresh<T>(fact: VerifiedFact<T>): boolean {
+  return (Date.now() - fact.timestamp) < fact.maxAgeMs;
 }
 
-export interface PolymarketMarket {
-  readonly conditionId: string;
-  readonly questionId: string;
-  readonly question: string;
-  readonly slug: string;
-  readonly tokens: readonly PolymarketToken[];
-  readonly active: boolean;
-  readonly closed: boolean;
-  readonly negRisk: boolean;
-  readonly endDateIso: string;
-  readonly volume: number;
-  readonly liquidity: number;
-  readonly eventSlug: string;
-  readonly eventTitle: string;
+export function getFreshness<T>(fact: VerifiedFact<T>): Freshness {
+  const age = Date.now() - fact.timestamp;
+  if (age < fact.maxAgeMs) return 'live';
+  if (age < fact.maxAgeMs * 3) return 'recent';
+  return 'stale';
 }
 
-export interface OrderBookLevel {
-  readonly price: number;
-  readonly size: number;
-}
+// ============================================================
+// ACCOUNT STATE
+// ============================================================
 
-export interface OrderBookSnapshot {
-  readonly tokenId: string;
-  readonly bids: readonly OrderBookLevel[];
-  readonly asks: readonly OrderBookLevel[];
-  readonly bestBid: number;
-  readonly bestAsk: number;
-  readonly midpoint: number;
-  readonly spread: number;
-  readonly depth: number;        // Total USDC depth
-  readonly timestamp: number;
-}
-
-export interface ExecutableDepth {
-  readonly maxSize: number;      // Max USDC fillable within slippage
-  readonly levels: number;       // Number of book levels consumed
-  readonly worstPrice: number;   // Worst price level touched
-  readonly midpoint: number;     // Midpoint at time of calculation
-  readonly slippagePct: number;  // Actual slippage at maxSize
-}
-
-// -- Trading --
-
-export type TradeSide = "BUY" | "SELL";
-export type OrderType = "GTC" | "FOK" | "GTD" | "FAK";
-
-export interface TradeParams {
-  readonly tokenId: string;
-  readonly side: TradeSide;
-  readonly price: number;
-  readonly size: number;          // USDC amount
-  readonly orderType: OrderType;
-  readonly conditionId: string;
-  readonly negRisk: boolean;
-}
-
-export interface TradeResult {
-  readonly orderId: string;
-  readonly status: "filled" | "partial" | "rejected" | "error";
-  readonly fillPrice: number;
-  readonly fillSize: number;
-  readonly fees: number;
-  readonly timestamp: number;
-  readonly error?: string;
+export interface AccountState {
+  readonly equity: VerifiedFact<number>;
+  readonly buyingPower: VerifiedFact<number>;
+  readonly openPositions: VerifiedFact<Position[]>;
+  readonly dailyPnl: VerifiedFact<number>;
+  readonly pendingOrders: VerifiedFact<PendingOrder[]>;
 }
 
 export interface Position {
-  readonly conditionId: string;
-  readonly tokenId: string;
-  readonly side: TradeSide;
-  readonly entryPrice: number;
-  readonly size: number;
-  readonly openTimestamp: number;
-  readonly market: string;        // question/description
-  readonly strategy: StrategyType;
-  readonly opportunityMetadata: Record<string, unknown>;
-  currentPrice: number;
-  unrealizedPnl: number;
+  readonly symbol: string;
+  readonly side: 'long' | 'short';
+  readonly quantity: number;
+  readonly avgCost: number;
+  readonly currentPrice: number;
+  readonly unrealizedPnl: number;
+  readonly strategy: string;            // Which strategy opened this
+  readonly entryTimestamp: number;
 }
 
-export interface TradeRecord {
-  readonly ts: string;
-  readonly market: string;
-  readonly conditionId: string;
-  readonly side: TradeSide;
-  readonly tokenId: string;
-  readonly price: number;
-  readonly size: number;
+export interface PendingOrder {
   readonly orderId: string;
-  readonly status: string;
-  readonly fillPrice: number;
-  readonly fees: number;
-  readonly pnl: number | null;
-  readonly strategy: StrategyType;
+  readonly symbol: string;
+  readonly side: 'buy' | 'sell';
+  readonly quantity: number;
+  readonly limitPrice: number;
+  readonly status: 'submitted' | 'partial' | 'pending_cancel';
 }
 
-// -- Strategies --
+// ============================================================
+// OPPORTUNITIES -- What Scout finds
+// ============================================================
 
-export type StrategyType = "temporal-arb" | "cross-platform" | "correlated-contracts";
+export type OpportunityType =
+  | 'REG_SHO'
+  | 'PEAD'
+  | 'SPINOFF'
+  | 'INSIDER_CLUSTER'
+  | 'NET_NET'
+  | 'FILING_TONE_SHIFT'
+  | 'PREMARKET_ANOMALY'
+  | 'TREASURY_AUCTION'
+  | 'HYG_DISLOCATION';
+
+export type Urgency = 'IMMEDIATE' | 'TODAY' | 'THIS_WEEK' | 'MONITOR';
 
 export interface Opportunity {
-  readonly id: string;
-  readonly strategy: StrategyType;
+  readonly id: string;                  // Unique ID for tracking
+  readonly type: OpportunityType;
+  readonly ticker: string;
+  readonly urgency: Urgency;
+  readonly detectedAt: number;          // Unix ms
+  readonly data: Record<string, unknown>;  // Type-specific raw data
+  readonly sourceUrl?: string;          // EDGAR link, etc.
+  readonly summary: string;             // Human-readable one-liner
+}
+
+// ============================================================
+// STRATEGY ACTIONS -- Typed boundary between reasoning and execution
+// ============================================================
+
+export type ActionSide = 'BUY' | 'SELL';
+export type InstrumentType = 'SHARES' | 'CALL_OPTION' | 'PUT_OPTION' | 'DEBIT_SPREAD' | 'CREDIT_SPREAD';
+
+export interface StrategyAction {
+  readonly id: string;                  // Unique action ID
+  readonly opportunityId: string;       // Links back to the opportunity
+  readonly strategy: string;            // "pead_spread" | "reg_sho" | "net_net" etc.
+  readonly ticker: string;
+  readonly side: ActionSide;
+  readonly instrumentType: InstrumentType;
+  readonly quantity: number;            // Shares or contracts
+  readonly limitPrice: number;          // Max price willing to pay
+  readonly stopLoss: number;            // Hard stop
+  readonly takeProfit: number;          // Target exit
+  readonly maxHoldDays: number;         // Force exit after this many days
+  readonly positionSizeDollars: number; // Total $ allocated
+  readonly conviction: number;          // 0-100, from Analyst
+  readonly rationale: string;           // Why this trade (for logging)
   readonly timestamp: number;
-  readonly description: string;
-  readonly expectedSpread: number; // percentage
-  readonly confidence: number;     // 0.0 - 1.0
-  readonly params: TradeParams;
-  readonly metadata: Record<string, unknown>;
+  // Options-specific fields (null for shares)
+  readonly optionsExpiry?: string;      // "2026-05-16"
+  readonly optionsStrike?: number;
+  readonly spreadWidth?: number;        // For spreads
 }
 
-export interface StrategyState {
-  readonly enabled: boolean;
-  readonly lastScan: number;
-  readonly opportunitiesFound: number;
-  readonly tradesExecuted: number;
+// ============================================================
+// VERDICTS -- Constraint layer output
+// ============================================================
+
+export type VerdictType = 'PASS' | 'HOLD' | 'REJECT' | 'ESCALATE' | 'SUSPEND';
+
+export interface Verdict {
+  readonly type: VerdictType;
+  readonly action: StrategyAction;
+  readonly reasons: string[];           // Why this verdict
+  readonly timestamp: number;
+  readonly constraintsFailed: string[]; // Which specific rules failed
+  readonly constraintsPassed: string[]; // Which rules passed
 }
 
-// -- Feed Status --
+// ============================================================
+// EXECUTION RESULTS
+// ============================================================
 
-export type FeedStatus = "connected" | "connecting" | "disconnected" | "error";
+export type FillStatus = 'filled' | 'partial' | 'rejected' | 'cancelled' | 'pending';
 
-export interface FeedHealth {
-  readonly name: string;
-  readonly status: FeedStatus;
-  readonly lastMessage: number;   // Unix ms
-  readonly reconnectCount: number;
-  readonly error?: string;
+export interface ExecutionResult {
+  readonly actionId: string;
+  readonly orderId: string;
+  readonly status: FillStatus;
+  readonly filledQuantity: number;
+  readonly filledPrice: number;
+  readonly commission: number;
+  readonly slippage: number;            // Difference from limit price
+  readonly timestamp: number;
+  readonly venueResponse: string;       // Raw broker response
 }
 
-// -- Config --
+// ============================================================
+// TRADE RECORDS -- Closed-loop feedback
+// ============================================================
 
-export interface AppConfig {
-  // Wallet
-  readonly privateKey: string;
-  readonly walletAddress: string;
-  readonly funderAddress: string;
-  readonly signatureType: number;
+export interface TradeRecord {
+  readonly id: string;
+  readonly opportunityId: string;
+  readonly actionId: string;
+  readonly strategy: string;
+  readonly ticker: string;
+  readonly side: ActionSide;
+  readonly instrumentType: InstrumentType;
+  // Entry
+  readonly entryPrice: number;
+  readonly entryTimestamp: number;
+  readonly entryConviction: number;
+  // Exit
+  readonly exitPrice: number;
+  readonly exitTimestamp: number;
+  readonly exitReason: 'target' | 'stop' | 'time' | 'manual' | 'kill_switch';
+  // Outcome
+  readonly pnlDollars: number;
+  readonly pnlPercent: number;
+  readonly holdDays: number;
+  readonly commissions: number;
+  // Feedback
+  readonly analystRationale: string;
+  readonly verdictType: VerdictType;
+  readonly constraintsFailed: string[];
+}
 
-  // Polymarket
-  readonly polymarketApiKey: string;
-  readonly polymarketSecret: string;
-  readonly polymarketPassphrase: string;
-  readonly polymarketClobUrl: string;
-  readonly polymarketChainId: number;
+// ============================================================
+// SYSTEM CONFIG
+// ============================================================
 
-  // Polygon RPC
-  readonly polygonRpcUrl: string;
-  readonly polygonWsUrl: string;
-
-  // Feeds
-  readonly binanceWsUrl: string;
-  readonly coinbaseWsUrl: string;
-
-  // Kalshi (optional)
-  readonly kalshiApiKey: string;
-  readonly kalshiPrivateKeyPath: string;
-  readonly kalshiApiUrl: string;
-
-  // Trading
-  readonly minSpreadThreshold: number;
-  readonly maxPositionSize: number;
-  readonly maxTotalExposure: number;
-  readonly maxOpenPositions: number;
-  readonly minLiquidity: number;
-  readonly killSwitch: boolean;
-  readonly liveTrading: boolean;
-
-  // Monitoring
+export interface GeckoConfig {
+  // Account
+  readonly startingCapital: number;
+  readonly brokerId: 'ibkr' | 'alpaca' | 'paper';
+  // API Keys (loaded from .env)
+  readonly claudeApiKey: string;
   readonly telegramBotToken: string;
   readonly telegramChatId: string;
-  readonly discordWebhookUrl: string;
-
+  // Trading mode
+  readonly liveTrading: boolean;        // false = paper trade
+  readonly maxPositionPercent: number;  // Max % of account per position (e.g., 0.12)
+  readonly maxDeployedPercent: number;  // Max % of account deployed (e.g., 0.60)
+  readonly dailyLossLimitPercent: number; // Daily loss limit (e.g., 0.03)
+  // Strategies enabled
+  readonly enableNetNet: boolean;
+  readonly enableSpinoff: boolean;
+  readonly enablePead: boolean;
+  readonly enableRegSho: boolean;
   // Logging
   readonly logLevel: LogLevel;
 }
 
-// -- Logging --
-
-export type LogLevel = "debug" | "info" | "warn" | "error";
+// ============================================================
+// LOG ENTRY (for structured logging)
+// ============================================================
 
 export interface LogEntry {
   readonly ts: string;
@@ -210,48 +241,4 @@ export interface LogEntry {
   readonly component: string;
   readonly message: string;
   readonly data?: Record<string, unknown>;
-}
-
-// -- WebSocket --
-
-export interface WsManagerConfig {
-  readonly url: string;
-  readonly name: string;
-  readonly pingInterval?: number;     // ms, default 30000
-  readonly pongTimeout?: number;      // ms, default 10000
-  readonly maxReconnectDelay?: number; // ms, default 60000
-  readonly initialReconnectDelay?: number; // ms, default 1000
-}
-
-// -- Monitoring --
-
-export interface DailySummary {
-  readonly date: string;          // YYYY-MM-DD
-  readonly totalTrades: number;
-  readonly winningTrades: number;
-  readonly losingTrades: number;
-  readonly totalPnl: number;
-  readonly totalFees: number;
-  readonly netPnl: number;
-  readonly maxDrawdown: number;
-  readonly opportunities: number;
-  readonly strategies: Record<StrategyType, StrategyState>;
-}
-
-export interface FillStats {
-  fokAttempts: number;
-  fokFills: number;
-  gtcAttempts: number;
-  gtcFills: number;
-  gtcCancelled: number;
-}
-
-export interface HealthStatus {
-  readonly timestamp: number;
-  readonly feeds: readonly FeedHealth[];
-  readonly positions: number;
-  readonly totalExposure: number;
-  readonly walletBalance: number;
-  readonly killSwitch: boolean;
-  readonly uptime: number;
 }
