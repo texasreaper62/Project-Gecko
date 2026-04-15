@@ -1,7 +1,8 @@
 module.exports = {
   apps: [{
-    name: "predictionarb",
-    script: "dist/index.js",
+    name: "gecko-v2",
+    script: "npx",
+    args: "tsx src/index.ts",
     cwd: __dirname,
     instances: 1,
     autorestart: true,
@@ -9,6 +10,14 @@ module.exports = {
     max_memory_restart: "500M",
     env: {
       NODE_ENV: "production",
+      STARTING_CAPITAL: "5000",
+      BROKER_ID: "paper",
+      LIVE_TRADING: "false",
+      ENABLE_NET_NET: "true",
+      ENABLE_SPINOFF: "true",
+      ENABLE_PEAD: "false",
+      ENABLE_REG_SHO: "true",
+      LOG_LEVEL: "info",
     },
     log_date_format: "YYYY-MM-DD HH:mm:ss Z",
     error_file: "logs/error.log",

@@ -183,6 +183,111 @@ export function analyzeInsiderCluster(
   });
 }
 
+/**
+ * Analyze a PEAD (post-earnings drift) opportunity.
+ */
+export function analyzePead(
+  opp: Opportunity,
+  account: AccountState
+): StrategyAction | null {
+  const equity = account.equity.value;
+  const positionSize = Math.min(equity * 0.10, 600);
+  if (positionSize < 100) return null;
+
+  const direction = opp.data.direction as string;
+  const surprisePercent = opp.data.surprisePercent as number;
+  const side: ActionSide = direction === 'positive' ? 'BUY' : 'SELL';
+
+  // Conviction scales with surprise magnitude
+  let conviction = 55;
+  if (Math.abs(surprisePercent) > 20) conviction = 70;
+  else if (Math.abs(surprisePercent) > 15) conviction = 65;
+  else if (Math.abs(surprisePercent) > 10) conviction = 60;
+
+  // Adjust for track record
+  const stats = getStrategyStats('pead');
+  if (stats.totalTrades >= 10 && stats.winRate > 0.60) conviction += 5;
+  if (stats.totalTrades >= 10 && stats.winRate < 0.45) conviction -= 10;
+
+  const estimatedPrice = 50; // Placeholder - real system queries IBKR
+
+  return buildAction({
+    opportunityId: opp.id,
+    strategy: 'pead',
+    ticker: opp.ticker,
+    side,
+    instrumentType: 'DEBIT_SPREAD',
+    quantity: Math.max(1, Math.floor(positionSize / 250)), // ~$250 per spread
+    limitPrice: 2.50, // Spread cost placeholder
+    stopLoss: 0, // Defined by spread max loss
+    takeProfit: 4.50, // ~80% profit target on spread
+    maxHoldDays: 45,
+    positionSizeDollars: positionSize,
+    conviction,
+    rationale: `PEAD: ${opp.ticker} ${direction} surprise ${Math.abs(surprisePercent).toFixed(1)}%. Historical drift 2-3% over 60 days. Options amplification via debit spread.`,
+    optionsExpiry: undefined, // Will be calculated from current date + 60 DTE
+    spreadWidth: 5.00,
+  });
+}
+
+/**
+ * Analyze a net-net deep value opportunity.
+ */
+export function analyzeNetNet(
+  opp: Opportunity,
+  account: AccountState
+): StrategyAction | null {
+  const equity = account.equity.value;
+  // Net-nets: smaller positions, more diversified (target 20 names)
+  const positionSize = Math.min(equity * 0.05, 300);
+  if (positionSize < 50) return null;
+
+  const ncavPerShare = opp.data.ncavPerShare as number;
+  if (!ncavPerShare || ncavPerShare <= 0) return null;
+
+  // Base conviction for net-nets is moderate
+  // The edge comes from diversification, not individual picks
+  const conviction = 62;
+
+  // Estimate limit price as 70% of NCAV (we want to buy BELOW NCAV)
+  const limitPrice = ncavPerShare * 0.70;
+  const quantity = Math.floor(positionSize / limitPrice);
+  if (quantity < 1) return null;
+
+  return buildAction({
+    opportunityId: opp.id,
+    strategy: 'net_net',
+    ticker: opp.ticker,
+    side: 'BUY',
+    instrumentType: 'SHARES',
+    quantity,
+    limitPrice: Math.round(limitPrice * 100) / 100,
+    stopLoss: limitPrice * 0.70, // 30% stop (net-nets can be volatile)
+    takeProfit: ncavPerShare * 1.10, // Target: 10% above NCAV
+    maxHoldDays: 365,
+    positionSizeDollars: positionSize,
+    conviction,
+    rationale: `Net-net: ${opp.ticker} trading below NCAV. NCAV/share: $${ncavPerShare.toFixed(2)}. Buying at $${limitPrice.toFixed(2)} (70% of NCAV). Historical 20-25% annualized.`,
+  });
+}
+
+/**
+ * Analyze a material event (8-K filing).
+ * Lower conviction since we can't read the filing content without Claude.
+ */
+export function analyzeFilingEvent(
+  opp: Opportunity,
+  account: AccountState
+): StrategyAction | null {
+  // Without Claude API, we can't properly analyze 8-K filings
+  // Return null to skip, or low-conviction action if we want to flag for review
+  log.info('8-K filing detected, needs Claude analysis for full evaluation', {
+    ticker: opp.ticker,
+    entity: opp.data.entityName,
+  });
+  return null;
+}
+
 // ============================================================
 // MAIN ANALYSIS DISPATCH
 // ============================================================
@@ -199,17 +304,11 @@ export function analyzeOpportunity(
     case 'INSIDER_CLUSTER':
       return analyzeInsiderCluster(opp, account);
     case 'FILING_TONE_SHIFT':
-      // TODO: Claude API deep analysis of 8-K filing
-      log.info('Filing tone shift analysis not yet implemented', { ticker: opp.ticker });
-      return null;
+      return analyzeFilingEvent(opp, account);
     case 'PEAD':
-      // TODO: Post-earnings drift analysis
-      log.info('PEAD analysis not yet implemented', { ticker: opp.ticker });
-      return null;
+      return analyzePead(opp, account);
     case 'NET_NET':
-      // TODO: Net-net NCAV analysis
-      log.info('Net-net analysis not yet implemented', { ticker: opp.ticker });
-      return null;
+      return analyzeNetNet(opp, account);
     default:
       log.warn('Unknown opportunity type', { type: opp.type });
       return null;
