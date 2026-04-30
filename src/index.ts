@@ -82,7 +82,7 @@ async function processOpportunity(
   recordOpportunity(opp);
 
   // ANALYST: Generate typed action
-  const action = analyzeOpportunity(opp, account);
+  const action = await analyzeOpportunity(opp, account, config.claudeApiKey || undefined);
   if (!action) {
     log.debug('Analyst passed on opportunity', { id: opp.id, type: opp.type });
     return;

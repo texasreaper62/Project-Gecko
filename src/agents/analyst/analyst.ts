@@ -1,16 +1,14 @@
 /**
- * ANALYST: Claude-Powered Analysis Agent
+ * ANALYST: Analysis Agent
  *
- * Takes opportunities from Scout, reasons about them using Claude,
- * and outputs typed StrategyActions.
+ * Takes opportunities from Scout, analyzes them, outputs typed StrategyActions.
  *
- * D0 Principle: "The model reasons freely in natural language.
- * The system executes typed actions."
+ * Two modes:
+ * - Rule-based (fast, always available, fallback)
+ * - Claude-powered (deep analysis when API key is configured)
  *
  * The Analyst NEVER sees the constraint rules. It proposes actions.
  * The Sentinel adjudicates.
- *
- * Uses Claude Haiku for fast triage, Sonnet for deep analysis.
  */
 
 import type {
@@ -22,12 +20,10 @@ import type {
 } from '../../core/types.js';
 import { createLogger } from '../../core/logger.js';
 import { getStrategyStats } from '../recorder/trade-recorder.js';
+import { getQuote } from '../../feeds/market-data.js';
+import { analyzeWithClaude } from './claude-client.js';
 
 const log = createLogger('analyst');
-
-// ============================================================
-// STRATEGY ACTION BUILDER
-// ============================================================
 
 let actionCounter = 0;
 
@@ -57,27 +53,35 @@ function buildAction(params: {
 }
 
 // ============================================================
-// ANALYSIS FUNCTIONS (per strategy type)
+// LIVE PRICE LOOKUP
 // ============================================================
 
-/**
- * Analyze a spin-off opportunity.
- * For now, uses rule-based analysis. Will be upgraded to Claude API.
- */
-export function analyzeSpinoff(
+async function getLivePrice(ticker: string): Promise<number | null> {
+  const quote = await getQuote(ticker);
+  if (!quote) return null;
+  return quote.value.price;
+}
+
+// ============================================================
+// STRATEGY ANALYSIS FUNCTIONS
+// ============================================================
+
+async function analyzeSpinoff(
   opp: Opportunity,
   account: AccountState
-): StrategyAction | null {
-  // Rule-based triage (will be replaced by Claude Haiku)
-  // Spin-offs are bought as shares, held 3-6 months
+): Promise<StrategyAction | null> {
   const equity = account.equity.value;
-  const positionSize = Math.min(equity * 0.10, 600);
+  const positionSize = Math.min(equity * 0.10, equity * 0.12);
 
-  if (positionSize < 100) return null;
+  if (positionSize < 200) return null;
 
-  // Estimate a limit price (placeholder -- real system queries IBKR)
-  const estimatedPrice = 25; // Will be replaced by live quote
-  const quantity = Math.floor(positionSize / estimatedPrice);
+  const price = await getLivePrice(opp.ticker);
+  if (!price) {
+    log.info('No live price for spin-off, skipping', { ticker: opp.ticker });
+    return null;
+  }
+
+  const quantity = Math.floor(positionSize / price);
   if (quantity < 1) return null;
 
   return buildAction({
@@ -87,37 +91,37 @@ export function analyzeSpinoff(
     side: 'BUY',
     instrumentType: 'SHARES',
     quantity,
-    limitPrice: estimatedPrice,
-    stopLoss: estimatedPrice * 0.90,     // 10% stop
-    takeProfit: estimatedPrice * 1.25,   // 25% target
+    limitPrice: price,
+    stopLoss: Math.round(price * 0.90 * 100) / 100,
+    takeProfit: Math.round(price * 1.25 * 100) / 100,
     maxHoldDays: 180,
-    positionSizeDollars: positionSize,
-    conviction: 70,                       // Base conviction for spin-offs
-    rationale: `Spin-off detected: ${opp.summary}. Index funds likely dumping. Historical 7-10% excess return in first 12 months.`,
+    positionSizeDollars: Math.round(quantity * price * 100) / 100,
+    conviction: 70,
+    rationale: `Spin-off detected: ${opp.summary}. Index funds likely dumping. Current price $${price.toFixed(2)}.`,
   });
 }
 
-/**
- * Analyze a Reg SHO forced covering opportunity.
- */
-export function analyzeRegSho(
+async function analyzeRegSho(
   opp: Opportunity,
   account: AccountState
-): StrategyAction | null {
+): Promise<StrategyAction | null> {
   const equity = account.equity.value;
-  const positionSize = Math.min(equity * 0.08, 500);
+  const positionSize = Math.min(equity * 0.08, equity * 0.10);
 
-  if (positionSize < 100) return null;
+  if (positionSize < 200) return null;
 
-  const estimatedPrice = 20; // Placeholder
-  const quantity = Math.floor(positionSize / estimatedPrice);
+  const price = await getLivePrice(opp.ticker);
+  if (!price) {
+    log.info('No live price for Reg SHO stock, skipping', { ticker: opp.ticker });
+    return null;
+  }
+
+  const quantity = Math.floor(positionSize / price);
   if (quantity < 1) return null;
 
-  // Check strategy track record
   const stats = getStrategyStats('reg_sho');
   let conviction = 65;
   if (stats.totalTrades >= 10) {
-    // Adjust conviction based on track record
     if (stats.winRate > 0.60) conviction = 75;
     else if (stats.winRate < 0.45) conviction = 50;
   }
@@ -129,39 +133,37 @@ export function analyzeRegSho(
     side: 'BUY',
     instrumentType: 'SHARES',
     quantity,
-    limitPrice: estimatedPrice,
-    stopLoss: estimatedPrice * 0.92,     // 8% stop
-    takeProfit: estimatedPrice * 1.04,   // 4% target (forced covering pop)
+    limitPrice: price,
+    stopLoss: Math.round(price * 0.92 * 100) / 100,
+    takeProfit: Math.round(price * 1.04 * 100) / 100,
     maxHoldDays: 10,
-    positionSizeDollars: positionSize,
+    positionSizeDollars: Math.round(quantity * price * 100) / 100,
     conviction,
-    rationale: `Reg SHO threshold list: ${opp.ticker}. Forced buy-to-cover within 13 days. ${JSON.stringify(opp.data)}`,
+    rationale: `Reg SHO: ${opp.ticker} at $${price.toFixed(2)}. Forced buy-to-cover within 13 days.`,
   });
 }
 
-/**
- * Analyze an insider cluster opportunity.
- */
-export function analyzeInsiderCluster(
+async function analyzeInsiderCluster(
   opp: Opportunity,
   account: AccountState
-): StrategyAction | null {
+): Promise<StrategyAction | null> {
   const equity = account.equity.value;
-  const positionSize = Math.min(equity * 0.08, 500);
+  const positionSize = Math.min(equity * 0.08, equity * 0.10);
 
-  if (positionSize < 100) return null;
+  if (positionSize < 200) return null;
+
+  const price = await getLivePrice(opp.ticker);
+  if (!price) return null;
 
   const buyerCount = (opp.data.buyerCount as number) ?? 0;
   const isActivist = (opp.data.isActivist as boolean) ?? false;
 
-  // Higher conviction for more buyers or activist involvement
   let conviction = 60;
   if (buyerCount >= 5) conviction = 80;
   else if (buyerCount >= 3) conviction = 70;
   if (isActivist) conviction = Math.min(conviction + 15, 90);
 
-  const estimatedPrice = 30; // Placeholder
-  const quantity = Math.floor(positionSize / estimatedPrice);
+  const quantity = Math.floor(positionSize / price);
   if (quantity < 1) return null;
 
   return buildAction({
@@ -171,45 +173,45 @@ export function analyzeInsiderCluster(
     side: 'BUY',
     instrumentType: 'SHARES',
     quantity,
-    limitPrice: estimatedPrice,
-    stopLoss: estimatedPrice * 0.88,
-    takeProfit: estimatedPrice * 1.15,
+    limitPrice: price,
+    stopLoss: Math.round(price * 0.88 * 100) / 100,
+    takeProfit: Math.round(price * 1.15 * 100) / 100,
     maxHoldDays: 60,
-    positionSizeDollars: positionSize,
+    positionSizeDollars: Math.round(quantity * price * 100) / 100,
     conviction,
     rationale: isActivist
-      ? `Activist 13D filing: ${opp.summary}. Historical +5-7% abnormal return.`
-      : `Insider cluster: ${buyerCount} insiders buying in 14 days. Historical +4-8% over 12 months.`,
+      ? `Activist 13D: ${opp.summary}. Price $${price.toFixed(2)}.`
+      : `Insider cluster: ${buyerCount} buyers in 14 days. Price $${price.toFixed(2)}.`,
   });
 }
 
-/**
- * Analyze a PEAD (post-earnings drift) opportunity.
- */
-export function analyzePead(
+async function analyzePead(
   opp: Opportunity,
   account: AccountState
-): StrategyAction | null {
+): Promise<StrategyAction | null> {
   const equity = account.equity.value;
-  const positionSize = Math.min(equity * 0.10, 600);
-  if (positionSize < 100) return null;
+  const positionSize = Math.min(equity * 0.10, equity * 0.12);
+  if (positionSize < 300) return null;
+
+  const price = await getLivePrice(opp.ticker);
+  if (!price) return null;
 
   const direction = opp.data.direction as string;
   const surprisePercent = opp.data.surprisePercent as number;
   const side: ActionSide = direction === 'positive' ? 'BUY' : 'SELL';
 
-  // Conviction scales with surprise magnitude
   let conviction = 55;
   if (Math.abs(surprisePercent) > 20) conviction = 70;
   else if (Math.abs(surprisePercent) > 15) conviction = 65;
   else if (Math.abs(surprisePercent) > 10) conviction = 60;
 
-  // Adjust for track record
   const stats = getStrategyStats('pead');
   if (stats.totalTrades >= 10 && stats.winRate > 0.60) conviction += 5;
   if (stats.totalTrades >= 10 && stats.winRate < 0.45) conviction -= 10;
 
-  const estimatedPrice = 50; // Placeholder - real system queries IBKR
+  // For debit spreads: estimate cost as ~$3 per spread, 2 spreads per $1500 allocation
+  const spreadCost = 3.00;
+  const numSpreads = Math.max(1, Math.floor(positionSize / (spreadCost * 100)));
 
   return buildAction({
     opportunityId: opp.id,
@@ -217,42 +219,46 @@ export function analyzePead(
     ticker: opp.ticker,
     side,
     instrumentType: 'DEBIT_SPREAD',
-    quantity: Math.max(1, Math.floor(positionSize / 250)), // ~$250 per spread
-    limitPrice: 2.50, // Spread cost placeholder
-    stopLoss: 0, // Defined by spread max loss
-    takeProfit: 4.50, // ~80% profit target on spread
+    quantity: numSpreads,
+    limitPrice: spreadCost,
+    stopLoss: 0,
+    takeProfit: spreadCost * 1.80,
     maxHoldDays: 45,
-    positionSizeDollars: positionSize,
+    positionSizeDollars: Math.round(numSpreads * spreadCost * 100 * 100) / 100,
     conviction,
-    rationale: `PEAD: ${opp.ticker} ${direction} surprise ${Math.abs(surprisePercent).toFixed(1)}%. Historical drift 2-3% over 60 days. Options amplification via debit spread.`,
-    optionsExpiry: undefined, // Will be calculated from current date + 60 DTE
+    rationale: `PEAD: ${opp.ticker} ${direction} surprise ${Math.abs(surprisePercent).toFixed(1)}%. Price $${price.toFixed(2)}. ${numSpreads} debit spreads.`,
     spreadWidth: 5.00,
   });
 }
 
-/**
- * Analyze a net-net deep value opportunity.
- */
-export function analyzeNetNet(
+async function analyzeNetNet(
   opp: Opportunity,
   account: AccountState
-): StrategyAction | null {
+): Promise<StrategyAction | null> {
   const equity = account.equity.value;
-  // Net-nets: smaller positions, more diversified (target 20 names)
-  const positionSize = Math.min(equity * 0.05, 300);
-  if (positionSize < 50) return null;
+  const positionSize = Math.min(equity * 0.05, equity * 0.06);
+  if (positionSize < 100) return null;
 
   const ncavPerShare = opp.data.ncavPerShare as number;
   if (!ncavPerShare || ncavPerShare <= 0) return null;
 
-  // Base conviction for net-nets is moderate
-  // The edge comes from diversification, not individual picks
-  const conviction = 62;
+  const price = await getLivePrice(opp.ticker);
+  if (!price) return null;
 
-  // Estimate limit price as 70% of NCAV (we want to buy BELOW NCAV)
-  const limitPrice = ncavPerShare * 0.70;
-  const quantity = Math.floor(positionSize / limitPrice);
+  // Only buy if price is below NCAV (that's the whole point)
+  if (price >= ncavPerShare) {
+    log.debug('Stock price above NCAV, not a net-net', {
+      ticker: opp.ticker,
+      price,
+      ncav: ncavPerShare,
+    });
+    return null;
+  }
+
+  const quantity = Math.floor(positionSize / price);
   if (quantity < 1) return null;
+
+  const discount = ((ncavPerShare - price) / ncavPerShare) * 100;
 
   return buildAction({
     opportunityId: opp.id,
@@ -261,41 +267,59 @@ export function analyzeNetNet(
     side: 'BUY',
     instrumentType: 'SHARES',
     quantity,
-    limitPrice: Math.round(limitPrice * 100) / 100,
-    stopLoss: limitPrice * 0.70, // 30% stop (net-nets can be volatile)
-    takeProfit: ncavPerShare * 1.10, // Target: 10% above NCAV
+    limitPrice: Math.round(price * 100) / 100,
+    stopLoss: Math.round(price * 0.70 * 100) / 100,
+    takeProfit: Math.round(ncavPerShare * 1.10 * 100) / 100,
     maxHoldDays: 365,
-    positionSizeDollars: positionSize,
-    conviction,
-    rationale: `Net-net: ${opp.ticker} trading below NCAV. NCAV/share: $${ncavPerShare.toFixed(2)}. Buying at $${limitPrice.toFixed(2)} (70% of NCAV). Historical 20-25% annualized.`,
+    positionSizeDollars: Math.round(quantity * price * 100) / 100,
+    conviction: 62,
+    rationale: `Net-net: ${opp.ticker} at $${price.toFixed(2)}, NCAV $${ncavPerShare.toFixed(2)} (${discount.toFixed(0)}% discount).`,
   });
-}
-
-/**
- * Analyze a material event (8-K filing).
- * Lower conviction since we can't read the filing content without Claude.
- */
-export function analyzeFilingEvent(
-  opp: Opportunity,
-  account: AccountState
-): StrategyAction | null {
-  // Without Claude API, we can't properly analyze 8-K filings
-  // Return null to skip, or low-conviction action if we want to flag for review
-  log.info('8-K filing detected, needs Claude analysis for full evaluation', {
-    ticker: opp.ticker,
-    entity: opp.data.entityName,
-  });
-  return null;
 }
 
 // ============================================================
 // MAIN ANALYSIS DISPATCH
 // ============================================================
 
-export function analyzeOpportunity(
+export async function analyzeOpportunity(
   opp: Opportunity,
-  account: AccountState
-): StrategyAction | null {
+  account: AccountState,
+  claudeApiKey?: string
+): Promise<StrategyAction | null> {
+  // Try Claude first if configured (for supported types)
+  if (claudeApiKey && ['SPINOFF', 'INSIDER_CLUSTER', 'FILING_TONE_SHIFT'].includes(opp.type)) {
+    const claudeResult = await analyzeWithClaude(claudeApiKey, opp, account);
+    if (claudeResult && claudeResult.shouldTrade) {
+      const price = await getLivePrice(opp.ticker);
+      if (!price) return null;
+
+      const equity = account.equity.value;
+      const positionSize = Math.min(equity * 0.10, equity * 0.12);
+      const quantity = Math.floor(positionSize / price);
+      if (quantity < 1) return null;
+
+      const instrument: InstrumentType = claudeResult.instrumentPreference === 'OPTIONS'
+        ? 'DEBIT_SPREAD' : 'SHARES';
+
+      return buildAction({
+        opportunityId: opp.id,
+        strategy: opp.type.toLowerCase(),
+        ticker: opp.ticker,
+        side: claudeResult.side,
+        instrumentType: instrument,
+        quantity,
+        limitPrice: price,
+        stopLoss: Math.round(price * (1 - claudeResult.suggestedStopPercent) * 100) / 100,
+        takeProfit: Math.round(price * (1 + claudeResult.suggestedTargetPercent) * 100) / 100,
+        maxHoldDays: claudeResult.suggestedHoldDays,
+        positionSizeDollars: Math.round(quantity * price * 100) / 100,
+        conviction: claudeResult.conviction,
+        rationale: claudeResult.rationale,
+      });
+    }
+  }
+
+  // Fallback to rule-based analysis
   switch (opp.type) {
     case 'SPINOFF':
       return analyzeSpinoff(opp, account);
@@ -303,12 +327,13 @@ export function analyzeOpportunity(
       return analyzeRegSho(opp, account);
     case 'INSIDER_CLUSTER':
       return analyzeInsiderCluster(opp, account);
-    case 'FILING_TONE_SHIFT':
-      return analyzeFilingEvent(opp, account);
     case 'PEAD':
       return analyzePead(opp, account);
     case 'NET_NET':
       return analyzeNetNet(opp, account);
+    case 'FILING_TONE_SHIFT':
+      log.info('8-K filing needs Claude for analysis', { ticker: opp.ticker });
+      return null;
     default:
       log.warn('Unknown opportunity type', { type: opp.type });
       return null;
