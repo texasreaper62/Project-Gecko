@@ -35,6 +35,8 @@ import { OrderRouter } from "./execution/order-router.js";
 import { FillWatcher } from "./execution/fill-watcher.js";
 import { TelegramNotifier } from "./monitoring/telegram.js";
 import { DiscordNotifier } from "./monitoring/discord.js";
+import { LlmClassifier } from "./intelligence/llm-classifier.js";
+import { SelfTuner } from "./intelligence/self-tuner.js";
 import type {
   AccountSnapshot,
   AppConfig,
@@ -143,6 +145,14 @@ async function main(): Promise<void> {
   const telegram = new TelegramNotifier(config.telegramBotToken, config.telegramChatId);
   const discord = new DiscordNotifier(config.discordWebhookUrl);
 
+  // ----- Intelligence -----
+  const llm = new LlmClassifier({
+    apiKey: config.anthropicApiKey,
+    model: config.llmModel,
+    enabled: config.llmEnabled && !!config.anthropicApiKey,
+  });
+  const tuner = new SelfTuner();
+
   // ----- Stream data routing -----
   const historical = new HistoricalBars(rest);
   const scanner = new PremarketScanner(config, rest, historical);
@@ -213,6 +223,8 @@ async function main(): Promise<void> {
   await runDailyLoop({
     config,
     scanner,
+    llm,
+    tuner,
     orb,
     dte0,
     positionMonitor,
@@ -253,6 +265,8 @@ async function main(): Promise<void> {
 interface DailyLoopArgs {
   readonly config: AppConfig;
   readonly scanner: PremarketScanner;
+  readonly llm: LlmClassifier;
+  readonly tuner: SelfTuner;
   readonly orb: OrbStrategy;
   readonly dte0: Dte0SpyStrategy;
   readonly positionMonitor: PositionMonitor;
@@ -261,7 +275,7 @@ interface DailyLoopArgs {
 }
 
 async function runDailyLoop(args: DailyLoopArgs): Promise<void> {
-  const { config, scanner, orb, dte0, positionMonitor, refreshAccount, notifyStartup } = args;
+  const { config, scanner, llm, tuner, orb, dte0, positionMonitor, refreshAccount, notifyStartup } = args;
 
   positionMonitor.start();
   await notifyStartup(`Started. live=${config.liveTrading} orb=${config.orbEnabled} dte0=${config.dte0Enabled}`);
@@ -286,10 +300,25 @@ async function runDailyLoop(args: DailyLoopArgs): Promise<void> {
     if (config.orbEnabled && scannedToday !== today && minsOfDay >= 9 * 60 && minsOfDay < 9 * 60 + 25) {
       try {
         log.info("Premarket scan starting");
-        const candidates = await scanner.scan();
-        const top = candidates.slice(0, 15);
-        log.info("Premarket scan complete", { count: top.length });
-        orb.loadCandidates(top);
+        const raw = await scanner.scan();
+        const top = raw.slice(0, 20);
+
+        // LLM classification, gated by self-tuner score floor.
+        const classifications = await llm.classify(top);
+        const floor = tuner.getLlmScoreFloor();
+        const scored = top
+          .map((c, i) => ({ candidate: c, result: classifications[i] }))
+          .filter((p) => p.result.score >= floor && p.result.direction !== "AVOID")
+          .slice(0, 15);
+
+        log.info("Premarket scan + classification complete", {
+          rawCount: raw.length,
+          topConsidered: top.length,
+          surviving: scored.length,
+          floor,
+        });
+
+        orb.loadCandidates(scored.map((p) => p.candidate));
         scannedToday = today;
       } catch (err) {
         log.error("Premarket scan failed", { error: errMsg(err) });
