@@ -12,8 +12,16 @@ const log = createLogger("position-tracker");
 const POSITIONS_LOG = "data/positions.jsonl";
 const OUTCOMES_LOG = "data/outcomes.jsonl";
 
+export type OpenHandler = (position: Position) => void;
+export type CloseHandler = (position: Position, exitPrice: number, pnl: number, fees: number) => void;
+
 export class PositionTracker {
   private positions: Map<string, Position> = new Map();
+  private openHandler: OpenHandler | null = null;
+  private closeHandler: CloseHandler | null = null;
+
+  setOpenHandler(h: OpenHandler): void { this.openHandler = h; }
+  setCloseHandler(h: CloseHandler): void { this.closeHandler = h; }
 
   open(args: {
     readonly instrument: Instrument;
@@ -43,6 +51,11 @@ export class PositionTracker {
       qty: position.quantity,
       entry: position.entryPrice,
     });
+    try {
+      this.openHandler?.(position);
+    } catch (err) {
+      log.error("open handler threw", { error: err instanceof Error ? err.message : String(err) });
+    }
     return position;
   }
 
@@ -84,6 +97,11 @@ export class PositionTracker {
       pnl: pnl.toFixed(2),
       holdMs: Date.now() - pos.openTimestamp,
     });
+    try {
+      this.closeHandler?.(pos, exitPrice, pnl, fees);
+    } catch (err) {
+      log.error("close handler threw", { error: err instanceof Error ? err.message : String(err) });
+    }
     return { pnl, position: pos };
   }
 
