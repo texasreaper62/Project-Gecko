@@ -24,6 +24,7 @@ import type {
 } from "../core/types.js";
 import type { OrderRouter } from "./order-router.js";
 import type { PositionTracker } from "./position-tracker.js";
+import type { FillWatcher } from "./fill-watcher.js";
 import type { QuoteCache } from "../data/quote-cache.js";
 
 const log = createLogger("position-monitor");
@@ -45,6 +46,8 @@ export class PositionMonitor {
     private readonly positions: PositionTracker,
     private readonly router: OrderRouter,
     private readonly quotes: QuoteCache,
+    private readonly fillWatcher: FillWatcher,
+    private readonly liveTrading: boolean,
   ) {}
 
   start(): void {
@@ -164,6 +167,10 @@ export class PositionMonitor {
         instrument: instrumentKey(pos.instrument),
         reason: result.reason,
       });
+      return;
+    }
+    if (result.orderId && this.liveTrading) {
+      this.fillWatcher.watch(result.orderId, signal, "close");
     }
   }
 }

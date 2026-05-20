@@ -32,6 +32,7 @@ import { RiskManager } from "./risk/risk-manager.js";
 import { PositionTracker } from "./execution/position-tracker.js";
 import { PositionMonitor } from "./execution/position-monitor.js";
 import { OrderRouter } from "./execution/order-router.js";
+import { FillWatcher } from "./execution/fill-watcher.js";
 import { TelegramNotifier } from "./monitoring/telegram.js";
 import { DiscordNotifier } from "./monitoring/discord.js";
 import type {
@@ -133,8 +134,10 @@ async function main(): Promise<void> {
 
   // ----- Execution -----
   const router = new OrderRouter(config, rest, risk, accountHash);
+  const fillWatcher = new FillWatcher(rest, positions, accountHash);
+  fillWatcher.start();
   const quotes = new QuoteCache();
-  const positionMonitor = new PositionMonitor(positions, router, quotes);
+  const positionMonitor = new PositionMonitor(positions, router, quotes, fillWatcher, config.liveTrading);
 
   // ----- Notifications -----
   const telegram = new TelegramNotifier(config.telegramBotToken, config.telegramChatId);
@@ -161,6 +164,12 @@ async function main(): Promise<void> {
     const msg = `${tag}: ${signal.description}\n${result.reason}`;
     telegram.sendAlert(`Signal ${tag}`, msg).catch(() => {});
     discord.sendEmbed(`Signal ${tag}`, msg, result.accepted ? 0x00ff00 : 0xff8800).catch(() => {});
+
+    // Hand off to the fill watcher only when a real order id came back. The
+    // dry-run path has no orderId, so the watcher would poll forever.
+    if (result.accepted && result.orderId && config.liveTrading) {
+      fillWatcher.watch(result.orderId, signal, "open");
+    }
   };
 
   orb.setSignalHandler((s) => { handleSignal(s).catch((err) => log.error("orb handler", { error: errMsg(err) })); });
@@ -225,6 +234,7 @@ async function main(): Promise<void> {
     orb.stop();
     dte0.stop();
     positionMonitor.stop();
+    fillWatcher.stop();
     stream.stop();
     auth.stopAutoRefresh();
     clearInterval(accountTimer);
