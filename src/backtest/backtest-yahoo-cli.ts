@@ -34,19 +34,19 @@ const DEFAULT_SYMBOLS: readonly string[] = [
   "PLTR", "SOFI", "AFRM", "MARA", "RIOT", "NIO", "RIVN", "GME", "AMC", "F",
 ];
 
-// ORB constants (must mirror src/strategies/orb.ts).
+// ORB constants (mirror src/strategies/orb.ts; can be overridden via CLI).
 const OR_START_MIN = 9 * 60 + 30;
 const OR_END_MIN = 9 * 60 + 45;
-const TRADE_CUTOFF_MIN = 11 * 60 + 30;
 const OR_MIN_WIDTH_PCT = 0.5;
 const OR_MAX_WIDTH_PCT = 5.0;
-const RR_TARGET = 2;
 const SLIPPAGE_PER_SIDE = 0.01;
 
 const DEFAULT_MIN_GAP_PCT = 2.0;
 const DEFAULT_MIN_PRICE = 5.0;
-const DEFAULT_MAX_PRICE = 100.0;       // Wider than live config; many watchlist names recently above $50
+const DEFAULT_MAX_PRICE = 100.0;
 const DEFAULT_RISK_PCT = 1.0;
+const DEFAULT_RR = 2.0;
+const DEFAULT_TIME_STOP_MIN = 11 * 60 + 30;   // 11:30 ET
 
 interface Args {
   symbols: string[];
@@ -54,6 +54,8 @@ interface Args {
   interval: "1m" | "5m" | "15m";
   minGapPct: number;
   maxConcurrent: number;
+  rrTarget: number;
+  timeStopMin: number;
 }
 
 function parseArgs(): Args {
@@ -63,6 +65,8 @@ function parseArgs(): Args {
     interval: "5m",
     minGapPct: DEFAULT_MIN_GAP_PCT,
     maxConcurrent: 3,
+    rrTarget: DEFAULT_RR,
+    timeStopMin: DEFAULT_TIME_STOP_MIN,
   };
   for (const a of process.argv.slice(2)) {
     if (a.startsWith("--symbols=")) {
@@ -79,6 +83,17 @@ function parseArgs(): Args {
       out.minGapPct = Number(a.slice("--gap=".length));
     } else if (a.startsWith("--concurrent=")) {
       out.maxConcurrent = Number(a.slice("--concurrent=".length));
+    } else if (a.startsWith("--rr=")) {
+      out.rrTarget = Number(a.slice("--rr=".length));
+    } else if (a.startsWith("--timestop=")) {
+      // Accept HH:MM (e.g. 13:00) or absolute minutes from midnight.
+      const v = a.slice("--timestop=".length);
+      if (v.includes(":")) {
+        const [h, m] = v.split(":").map(Number);
+        out.timeStopMin = h * 60 + m;
+      } else {
+        out.timeStopMin = Number(v);
+      }
     }
   }
   return out;
@@ -181,6 +196,8 @@ async function main(): Promise<void> {
         bars: c.bars,
         equity,
         minGapPct: args.minGapPct,
+        rrTarget: args.rrTarget,
+        timeStopMin: args.timeStopMin,
       });
       if (trade) {
         trades.push(trade);
@@ -248,8 +265,10 @@ function simulateDay(args: {
   readonly bars: readonly Bar[];
   readonly equity: number;
   readonly minGapPct: number;
+  readonly rrTarget: number;
+  readonly timeStopMin: number;
 }): BacktestTrade | null {
-  const { symbol, date, prevClose, bars, equity, minGapPct } = args;
+  const { symbol, date, prevClose, bars, equity, minGapPct, rrTarget, timeStopMin } = args;
 
   // Find first regular-session bar.
   const firstRegular = bars.find((b) => minutesOfDayET(b.timestamp) >= OR_START_MIN);
@@ -276,14 +295,18 @@ function simulateDay(args: {
   const orWidthPct = midpoint > 0 ? (orHigh - orLow) / midpoint * 100 : 0;
   if (orWidthPct < OR_MIN_WIDTH_PCT || orWidthPct > OR_MAX_WIDTH_PCT) return null;
 
-  // Scan 09:45-11:30 for first breakout.
+  // Scan from 09:45 onward for first breakout. Time-stop is configurable;
+  // include bars up to AND including the cutoff so the time-stop fires.
   const triggerBars = bars.filter((b) => {
     const m = minutesOfDayET(b.timestamp);
-    return m >= OR_END_MIN && m < TRADE_CUTOFF_MIN;
+    return m >= OR_END_MIN && m <= timeStopMin;
   }).sort((a, b) => a.timestamp - b.timestamp);
 
   for (let i = 0; i < triggerBars.length; i++) {
     const b = triggerBars[i];
+    const bMin = minutesOfDayET(b.timestamp);
+    if (bMin >= timeStopMin) break; // No room to enter
+
     let direction: "LONG" | "SHORT" | null = null;
     if (b.close > orHigh) direction = "LONG";
     else if (b.close < orLow) direction = "SHORT";
@@ -299,8 +322,8 @@ function simulateDay(args: {
     if (stopDist <= 0) return null;
 
     const take = direction === "LONG"
-      ? entryPrice + RR_TARGET * stopDist
-      : entryPrice - RR_TARGET * stopDist;
+      ? entryPrice + rrTarget * stopDist
+      : entryPrice - rrTarget * stopDist;
 
     const riskUsd = equity * DEFAULT_RISK_PCT / 100;
     const shares = Math.floor(riskUsd / stopDist);
@@ -331,7 +354,7 @@ function simulateDay(args: {
         }
       }
 
-      if (fwdMin >= TRADE_CUTOFF_MIN) {
+      if (fwdMin >= timeStopMin) {
         const exit = direction === "LONG" ? fwd.close - SLIPPAGE_PER_SIDE : fwd.close + SLIPPAGE_PER_SIDE;
         return makeTrade(symbol, date, direction, entryPrice, exit, stop, take, shares, "time", fwd.timestamp, b.timestamp);
       }
