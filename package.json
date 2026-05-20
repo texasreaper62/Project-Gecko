@@ -1,22 +1,16 @@
 {
-  "name": "predictionarb",
-  "version": "0.1.0",
+  "name": "gecko",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
   "main": "dist/index.js",
   "scripts": {
     "build": "tsc",
     "dev": "node --import tsx src/index.ts",
-    "start": "node dist/index.js",
-    "generate-key": "node --import tsx src/generate-api-key.ts",
-    "test-connection": "node --import tsx src/test-connection.ts",
-    "ws-diagnostic": "node --import tsx src/ws-diagnostic.ts"
+    "start": "node dist/index.js"
   },
   "dependencies": {
-    "@polymarket/clob-client": "latest",
-    "@polymarket/order-utils": "latest",
     "dotenv": "^16",
-    "ethers": "^6",
     "ws": "^8"
   },
   "devDependencies": {
