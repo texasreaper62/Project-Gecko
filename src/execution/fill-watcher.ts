@@ -15,13 +15,14 @@
 //   - on timeout: best-effort cancel, log
 
 import { createLogger } from "../core/logger.js";
+import { nowIso } from "../utils/time.js";
 import type { Position, TradeSignal } from "../core/types.js";
 import type { SchwabRest } from "../brokers/schwab/rest.js";
 import type {
-  SchwabOrderActivity,
   SchwabOrderResponse,
 } from "../brokers/schwab/types.js";
 import type { PositionTracker } from "./position-tracker.js";
+import type { SelfTuner } from "../intelligence/self-tuner.js";
 
 const log = createLogger("fill-watcher");
 
@@ -43,6 +44,7 @@ export class FillWatcher {
     private readonly rest: SchwabRest,
     private readonly positions: PositionTracker,
     private readonly accountHash: string,
+    private readonly tuner: SelfTuner | null = null,
   ) {}
 
   start(): void {
@@ -158,6 +160,24 @@ export class FillWatcher {
     if (!result) {
       log.warn("Close fill received but no tracked position to close", {
         signalId: signal.id,
+      });
+      return;
+    }
+    if (this.tuner) {
+      this.tuner.recordOutcome({
+        ts: nowIso(),
+        key: signal.order.instrument.assetClass === "equity"
+          ? `EQ:${signal.order.instrument.symbol}`
+          : `OPT:${signal.order.instrument.osiSymbol}`,
+        strategy: result.position.strategy,
+        side: result.position.side,
+        qty: result.position.quantity,
+        entryPrice: result.position.entryPrice,
+        exitPrice: fill.price,
+        fees: fill.fees,
+        pnl: result.pnl,
+        holdMs: Date.now() - result.position.openTimestamp,
+        metadata: result.position.metadata,
       });
     }
   }

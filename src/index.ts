@@ -134,9 +134,17 @@ async function main(): Promise<void> {
   const positions = new PositionTracker();
   const risk = new RiskManager(config, dailyStop, pdt, positions);
 
+  // ----- Intelligence (created before execution so fill-watcher can wire it) -----
+  const llm = new LlmClassifier({
+    apiKey: config.anthropicApiKey,
+    model: config.llmModel,
+    enabled: config.llmEnabled && !!config.anthropicApiKey,
+  });
+  const tuner = new SelfTuner();
+
   // ----- Execution -----
   const router = new OrderRouter(config, rest, risk, accountHash);
-  const fillWatcher = new FillWatcher(rest, positions, accountHash);
+  const fillWatcher = new FillWatcher(rest, positions, accountHash, tuner);
   fillWatcher.start();
   const quotes = new QuoteCache();
   const positionMonitor = new PositionMonitor(positions, router, quotes, fillWatcher, config.liveTrading);
@@ -144,14 +152,6 @@ async function main(): Promise<void> {
   // ----- Notifications -----
   const telegram = new TelegramNotifier(config.telegramBotToken, config.telegramChatId);
   const discord = new DiscordNotifier(config.discordWebhookUrl);
-
-  // ----- Intelligence -----
-  const llm = new LlmClassifier({
-    apiKey: config.anthropicApiKey,
-    model: config.llmModel,
-    enabled: config.llmEnabled && !!config.anthropicApiKey,
-  });
-  const tuner = new SelfTuner();
 
   // ----- Stream data routing -----
   const historical = new HistoricalBars(rest);
