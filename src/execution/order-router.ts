@@ -48,6 +48,23 @@ export class OrderRouter {
       return { accepted: false, reason: riskResult.reason };
     }
 
+    return this.dispatch(signal, "live");
+  }
+
+  // Submit a close order. Skips position-dedup and position-count caps
+  // (we WANT to close the existing position), but still honors kill switch.
+  async submitClose(signal: TradeSignal): Promise<RouterSubmitResult> {
+    appendJsonl(SIGNALS_LOG, { ts: nowIso(), signal, close: true });
+
+    if (this.risk.isKillSwitchActive()) {
+      log.warn("Close blocked: kill switch active", { signalId: signal.id });
+      return { accepted: false, reason: "Kill switch active" };
+    }
+
+    return this.dispatch(signal, "close");
+  }
+
+  private async dispatch(signal: TradeSignal, mode: "live" | "close"): Promise<RouterSubmitResult> {
     let payload;
     try {
       payload = signal.order.instrument.assetClass === "equity"
@@ -63,20 +80,21 @@ export class OrderRouter {
       log.info("Dry-run: order built but not submitted", {
         signalId: signal.id,
         strategy: signal.strategy,
+        mode,
         payload,
       });
-      appendJsonl(ORDERS_LOG, { ts: nowIso(), mode: "dry-run", signal, payload });
+      appendJsonl(ORDERS_LOG, { ts: nowIso(), mode: "dry-run", flow: mode, signal, payload });
       return { accepted: true, reason: "dry-run (LIVE_TRADING=false)" };
     }
 
     try {
       const { orderId } = await this.rest.placeOrder(this.accountHash, payload);
-      appendJsonl(ORDERS_LOG, { ts: nowIso(), mode: "live", signalId: signal.id, orderId, signal, payload });
-      log.info("Order submitted", { signalId: signal.id, strategy: signal.strategy, orderId });
+      appendJsonl(ORDERS_LOG, { ts: nowIso(), mode: "live", flow: mode, signalId: signal.id, orderId, signal, payload });
+      log.info("Order submitted", { signalId: signal.id, strategy: signal.strategy, flow: mode, orderId });
       return { accepted: true, orderId, reason: "submitted" };
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      log.error("Order submission failed", { signalId: signal.id, error: msg });
+      log.error("Order submission failed", { signalId: signal.id, flow: mode, error: msg });
       return { accepted: false, reason: `submit error: ${msg}` };
     }
   }
