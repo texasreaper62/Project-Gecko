@@ -41,12 +41,14 @@ import { MultiTimeframeValidator } from "../intelligence/multi-tf.js";
 import { MarketInternals } from "../intelligence/market-internals.js";
 import { NewsReader } from "../intelligence/news-reader.js";
 import { PatternMatcher } from "../intelligence/pattern-matcher.js";
+import { RegimeDetector } from "../intelligence/regime-detector.js";
+import { ConvictionSizer } from "../risk/conviction-sizer.js";
 import { etParts } from "../utils/time.js";
 import { YahooHistoricalBars } from "../data/yahoo-historical.js";
 import type { AppConfig, AccountSnapshot, TradeSignal, Bar } from "../core/types.js";
 import type { GapCandidate } from "../scanner/premarket.js";
 
-const DEFAULT_SYMBOLS = ["PLTR", "SOFI", "MARA", "RIOT", "NIO", "RIVN", "F"];
+const DEFAULT_SYMBOLS = ["SPY", "PLTR", "SOFI", "MARA", "RIOT", "NIO", "RIVN", "F"];
 
 interface Args {
   symbols: string[];
@@ -190,6 +192,13 @@ async function main(): Promise<void> {
     news: newsReader,
     patterns: patternMatcher,
   });
+
+  // Conviction-based sizing: brain conviction drives risk per trade.
+  router.setConvictionSizer(new ConvictionSizer());
+
+  // Regime detector: market regime tweaks the size multiplier.
+  const regimeDetector = new RegimeDetector(quotes);
+  router.setRegimeDetector(regimeDetector);
   router.setBrain({
     brain,
     getOpenPositions: () => positions.all(),
@@ -257,8 +266,12 @@ async function main(): Promise<void> {
         });
         if (arr.length > 200) arr.shift();
         barsBySymbol.set(t.symbol.toUpperCase(), arr);
+        // Feed SPY/QQQ into the regime detector if present.
+        if (t.symbol === "SPY") regimeDetector.recordSpy(t.last, t.timestamp);
       }
       orb.handleEquityTick(ticks);
+      // Refresh regime every tick (cheap; recomputes once per minute internally).
+      regimeDetector.refresh();
       // Synchronous exit check on every tick batch (cheap; no-op when no open positions).
       positionMonitor.probeNow().catch(() => { /* logged inside */ });
     }

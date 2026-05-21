@@ -20,6 +20,8 @@ import type { Broker, BrokerOrderRequest } from "../brokers/broker.js";
 import type { RiskManager } from "../risk/risk-manager.js";
 import type { AccountSnapshot, Position } from "../core/types.js";
 import type { AgentBrain, MarketContext } from "../intelligence/agent-brain.js";
+import type { ConvictionSizer } from "../risk/conviction-sizer.js";
+import type { RegimeDetector } from "../intelligence/regime-detector.js";
 import type { ConfluenceEngine, CheckResult } from "../intelligence/confluence.js";
 import type { MultiTimeframeValidator } from "../intelligence/multi-tf.js";
 import type { MarketInternals } from "../intelligence/market-internals.js";
@@ -54,6 +56,8 @@ export interface ConfluenceStack {
 export class OrderRouter {
   private brainProvider: BrainContextProvider | null = null;
   private confluence: ConfluenceStack | null = null;
+  private convictionSizer: ConvictionSizer | null = null;
+  private regimeDetector: RegimeDetector | null = null;
 
   constructor(
     private readonly config: AppConfig,
@@ -67,6 +71,19 @@ export class OrderRouter {
 
   setConfluence(stack: ConfluenceStack): void {
     this.confluence = stack;
+  }
+
+  // Wire conviction-based sizing. When set, the brain's conviction score
+  // drives a tiered risk-percent that overrides the strategy's default
+  // sizing (1% becomes 1-3.5% based on conviction).
+  setConvictionSizer(sizer: ConvictionSizer): void {
+    this.convictionSizer = sizer;
+  }
+
+  // Wire regime-aware sizing. When set, the current market regime adds a
+  // size multiplier (0.4-1.3) on top of conviction sizing.
+  setRegimeDetector(rd: RegimeDetector): void {
+    this.regimeDetector = rd;
   }
 
   async submit(signal: TradeSignal, account: AccountSnapshot): Promise<RouterSubmitResult> {
@@ -182,12 +199,67 @@ export class OrderRouter {
 
     let approvedSignal = signal;
     if (brainResult) {
-      const br: { approved: TradeSignal | null; decision: { conviction: number; reasoning: string } } = brainResult;
+      const br: { approved: TradeSignal | null; decision: { conviction: number; reasoning: string; sizeMultiplier?: number } } = brainResult;
       if (!br.approved) {
         log.info("Brain rejected", { signalId: signal.id, conviction: br.decision.conviction, latencyMs: Date.now() - t0 });
         return { accepted: false, reason: `brain rejected (conviction ${br.decision.conviction}): ${br.decision.reasoning}` };
       }
       approvedSignal = br.approved;
+
+      // Conviction-based sizing: the higher the brain's conviction, the bigger
+      // the position. Stacks with regime-aware sizing if both are wired.
+      if (this.convictionSizer && this.regimeDetector) {
+        const conv = br.decision.conviction;
+        const convictionRiskPct = this.convictionSizer.riskPctFor(conv);
+        const regimeSnap = this.regimeDetector.get();
+        const regimeMul = regimeSnap.sizeMultiplier;
+        const baseRisk = this.config.maxRiskPerTradePct;
+        const finalRiskPct = Math.min(5.0, Math.max(0.5, convictionRiskPct * regimeMul));
+        const scale = finalRiskPct / baseRisk;
+        const newQty = Math.max(1, Math.round(approvedSignal.order.quantity * scale));
+        log.info("Conviction/regime sizing", {
+          signalId: signal.id,
+          conviction: conv,
+          convictionRiskPct: convictionRiskPct.toFixed(2),
+          regime: regimeSnap.regime,
+          regimeMul: regimeMul.toFixed(2),
+          finalRiskPct: finalRiskPct.toFixed(2),
+          qtyBefore: approvedSignal.order.quantity,
+          qtyAfter: newQty,
+        });
+        approvedSignal = {
+          ...approvedSignal,
+          order: { ...approvedSignal.order, quantity: newQty },
+          riskUsd: approvedSignal.riskUsd * scale,
+          rewardUsd: approvedSignal.rewardUsd * scale,
+          metadata: {
+            ...approvedSignal.metadata,
+            convictionRiskPct,
+            regime: regimeSnap.regime,
+            finalRiskPct,
+          },
+        };
+      } else if (this.convictionSizer) {
+        const conv = br.decision.conviction;
+        const convictionRiskPct = this.convictionSizer.riskPctFor(conv);
+        const baseRisk = this.config.maxRiskPerTradePct;
+        const scale = convictionRiskPct / baseRisk;
+        const newQty = Math.max(1, Math.round(approvedSignal.order.quantity * scale));
+        log.info("Conviction sizing", {
+          signalId: signal.id,
+          conviction: conv,
+          riskPct: convictionRiskPct.toFixed(2),
+          qtyBefore: approvedSignal.order.quantity,
+          qtyAfter: newQty,
+        });
+        approvedSignal = {
+          ...approvedSignal,
+          order: { ...approvedSignal.order, quantity: newQty },
+          riskUsd: approvedSignal.riskUsd * scale,
+          rewardUsd: approvedSignal.rewardUsd * scale,
+          metadata: { ...approvedSignal.metadata, convictionRiskPct },
+        };
+      }
     }
 
     const riskResult = this.risk.check(approvedSignal, account);
