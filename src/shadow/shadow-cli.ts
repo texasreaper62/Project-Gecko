@@ -230,6 +230,9 @@ async function main(): Promise<void> {
   const orb = new OrbStrategy(config, broker);
   orb.setAccountProvider(() => accountSnapshot());
   orb.setEconomicCalendar(new EconomicCalendar());
+  // Walk-forward parameter optimizer: ORB reads tuned values for OR widths
+  // and RR target. Updated by SelfTuner every 10 closed trades.
+  orb.setWalkForward(tuner.getWalkForward());
 
   const meanReversion = new MeanReversionStrategy(config, broker, ["SPY", "QQQ"]);
   meanReversion.setAccountProvider(() => accountSnapshot());

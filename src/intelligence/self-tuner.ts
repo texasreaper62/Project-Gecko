@@ -87,14 +87,20 @@ interface TuningState {
   strategies: Record<string, StrategyStats>;
 }
 
-// Hook called after every outcome so external components (ConvictionSizer)
-// can recompute their adaptive parameters.
+// Hook called after every outcome so external components (ConvictionSizer,
+// WalkForwardOptimizer) can recompute their adaptive parameters.
 export type OutcomeListener = (outcomes: readonly OutcomeRecord[]) => void;
+
+// Walk-forward optimizer integration. SelfTuner triggers it every N tunes.
+import { WalkForwardOptimizer } from "./walk-forward.js";
 
 export class SelfTuner {
   private state: TuningState;
   private outcomes: OutcomeRecord[];
   private listeners: OutcomeListener[] = [];
+  private walkForward = new WalkForwardOptimizer();
+
+  getWalkForward(): WalkForwardOptimizer { return this.walkForward; }
 
   // Subscribe to outcome updates. Called on every recordOutcome().
   onOutcome(fn: OutcomeListener): void { this.listeners.push(fn); }
@@ -309,6 +315,11 @@ export class SelfTuner {
 
     // Drift detection after each tune pass.
     this.applyDrift();
+    // Walk-forward parameter optimization on a less-frequent cadence
+    // (every 10 outcomes once we cross the minimum).
+    if (this.state.totalOutcomes % 10 === 0) {
+      this.walkForward.optimize();
+    }
 
     this.state.ts = nowIso();
     appendJsonl(TUNING_FILE, this.state);

@@ -33,6 +33,7 @@ import type { Strategy } from "./base.js";
 import type { GapCandidate } from "../scanner/premarket.js";
 import type { Broker, NormalizedTick } from "../brokers/broker.js";
 import type { EconomicCalendar } from "../intelligence/economic-calendar.js";
+import type { WalkForwardOptimizer } from "../intelligence/walk-forward.js";
 
 const log = createLogger("orb");
 
@@ -95,6 +96,19 @@ export class OrbStrategy implements Strategy {
   private calendar: EconomicCalendar | null = null;
   setEconomicCalendar(cal: EconomicCalendar): void {
     this.calendar = cal;
+  }
+
+  // Optional walk-forward optimizer; when present, ORB reads tuned params
+  // (orMinWidthPct, orMaxWidthPct, rrTarget) instead of hardcoded defaults.
+  private walkForward: WalkForwardOptimizer | null = null;
+  setWalkForward(wf: WalkForwardOptimizer): void {
+    this.walkForward = wf;
+  }
+
+  private param(name: string, def: number): number {
+    if (!this.walkForward) return def;
+    const v = this.walkForward.paramValue("orb", name);
+    return v > 0 ? v : def;
   }
 
   // Seed with today's candidates from the premarket scanner. Should be called
@@ -230,8 +244,10 @@ export class OrbStrategy implements Strategy {
 
     const midpoint = (state.orHigh + state.orLow) / 2;
     const orWidthPct = midpoint > 0 ? (state.orHigh - state.orLow) / midpoint * 100 : 0;
-    if (orWidthPct < OR_MIN_WIDTH_PCT) return;
-    if (orWidthPct > OR_MAX_WIDTH_PCT) return;
+    const minWidth = this.param("orMinWidthPct", OR_MIN_WIDTH_PCT);
+    const maxWidth = this.param("orMaxWidthPct", OR_MAX_WIDTH_PCT);
+    if (orWidthPct < minWidth) return;
+    if (orWidthPct > maxWidth) return;
 
     const close = state.currentMinuteClose;
     let direction: "LONG" | "SHORT" | null = null;
@@ -268,9 +284,10 @@ export class OrbStrategy implements Strategy {
       return;
     }
 
+    const rrTarget = this.param("rrTarget", RR_TARGET);
     const take = direction === "LONG"
-      ? entry + RR_TARGET * stopDist
-      : entry - RR_TARGET * stopDist;
+      ? entry + rrTarget * stopDist
+      : entry - rrTarget * stopDist;
 
     const instrument: EquityInstrument = { assetClass: "equity", symbol: state.symbol };
     const signal: TradeSignal = {
@@ -289,7 +306,7 @@ export class OrbStrategy implements Strategy {
       stopPrice: stop,
       takeProfitPrice: take,
       riskUsd: sized.riskUsd,
-      rewardUsd: sized.riskUsd * RR_TARGET,
+      rewardUsd: sized.riskUsd * rrTarget,
       metadata: {
         orHigh: state.orHigh,
         orLow: state.orLow,
