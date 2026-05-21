@@ -98,14 +98,21 @@ export class OrderRouter {
         }),
       ];
 
-      // Fail-fast on tier 1: require at least 2 of the 3 non-strategy checks
-      // to vote with the direction with confidence >= 0.4.
+      // Fail-fast on tier 1.
+      // - REJECT if any non-strategy check votes against the trade with confidence.
+      // - Otherwise require at least 1 supporting check OR a high-confidence
+      //   strategy trigger when no other check has enough data to vote (cold
+      //   start). This lets the bot trade from a fresh install where the
+      //   pattern matcher has no analogs and multi-tf has no bar history.
       const nonStrat = tier1Checks.filter((c) => c.name !== "strategy-trigger");
       const positives = nonStrat.filter((c) => c.vote > 0.15 && c.confidence >= 0.4).length;
       const negatives = nonStrat.filter((c) => c.vote < -0.15 && c.confidence >= 0.4).length;
-      if (negatives >= 1 || positives < 2) {
-        log.info("Tier 1 fast-fail", { signalId: signal.id, positives, negatives, latencyMs: Date.now() - t0 });
-        return { accepted: false, reason: `tier-1 confluence: ${positives} supporting, ${negatives} opposing` };
+      const nonStratWithData = nonStrat.filter((c) => c.confidence >= 0.3).length;
+      const canColdStart = nonStratWithData === 0;       // no other check has data
+      const passTier1 = negatives === 0 && (positives >= 1 || canColdStart);
+      if (!passTier1) {
+        log.info("Tier 1 fast-fail", { signalId: signal.id, positives, negatives, withData: nonStratWithData, latencyMs: Date.now() - t0 });
+        return { accepted: false, reason: `tier-1 confluence: ${positives} supporting, ${negatives} opposing, ${nonStratWithData} with data` };
       }
 
       // FAST LANE: if tier 1 is overwhelming, skip Claude entirely and fire.
