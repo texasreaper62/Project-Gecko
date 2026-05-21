@@ -141,13 +141,38 @@ function main(): void {
 
   // Overall
   const s = summarize(outs);
+  // Anthropic spend in the same window
+  const spend = readJsonl<{ ts: string; component: string; model: string; costUsd: number }>("data/anthropic-spend.jsonl");
+  const spendInWindow = args.sinceMs > 0
+    ? spend.filter((r) => new Date(r.ts).getTime() >= args.sinceMs)
+    : spend;
+  const apiSpendUsd = spendInWindow.reduce((acc, r) => acc + (r.costUsd ?? 0), 0);
+  const netPnl = s.pnl - apiSpendUsd;
+
   process.stdout.write("===== Lifetime Summary =====\n");
   process.stdout.write(`  Trades:        ${s.n}\n`);
   process.stdout.write(`  Win rate:      ${fmtPct(s.winRate)} (${s.wins}W / ${s.n - s.wins}L)\n`);
-  process.stdout.write(`  Total P&L:     ${fmtMoney(s.pnl)}\n`);
+  process.stdout.write(`  Gross P&L:     ${fmtMoney(s.pnl)}\n`);
+  process.stdout.write(`  Anthropic API: ${fmtMoney(-apiSpendUsd)}  (${spendInWindow.length} calls)\n`);
+  process.stdout.write(`  NET P&L:       ${fmtMoney(netPnl)}\n`);
   process.stdout.write(`  Profit factor: ${s.pf === Infinity ? "inf" : s.pf.toFixed(2)}\n`);
   process.stdout.write(`  Avg win:       ${fmtMoney(s.avgWin)}\n`);
   process.stdout.write(`  Avg loss:      ${fmtMoney(s.avgLoss)}\n`);
+
+  // Breakdown of API spend by component (if any)
+  if (spendInWindow.length > 0) {
+    const byComponent = new Map<string, { calls: number; usd: number }>();
+    for (const r of spendInWindow) {
+      const cur = byComponent.get(r.component) ?? { calls: 0, usd: 0 };
+      cur.calls++;
+      cur.usd += r.costUsd ?? 0;
+      byComponent.set(r.component, cur);
+    }
+    process.stdout.write(`\n  API spend by component:\n`);
+    for (const [comp, v] of Array.from(byComponent.entries()).sort((a, b) => b[1].usd - a[1].usd)) {
+      process.stdout.write(`    ${comp.padEnd(20)} ${String(v.calls).padStart(4)} calls  ${fmtMoney(-v.usd)}  (avg ${fmtMoney(-v.usd / v.calls)}/call)\n`);
+    }
+  }
 
   // By strategy
   printBucketed("By strategy", bucketize(outs, (o) => o.strategy));

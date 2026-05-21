@@ -115,6 +115,7 @@ async function main(): Promise<void> {
     anthropicApiKey: process.env.ANTHROPIC_API_KEY ?? "",
     llmEnabled: args.newsEnabled,
     llmModel: process.env.LLM_MODEL ?? "claude-sonnet-4-6",
+    llmModelBrain: process.env.LLM_MODEL_BRAIN ?? "claude-opus-4-7",
     agentBrainEnabled: args.brainEnabled,
     agentBrainMinConviction: 70,
     agentBrainMinConvictionLong: 55,
@@ -155,7 +156,7 @@ async function main(): Promise<void> {
   // Shadow uses a permissive conviction threshold (60) so we can measure how
   // the agent would have actually traded on real bars. Production keeps 70.
   const brain = new AgentBrain({
-    apiKey: config.anthropicApiKey, model: config.llmModel,
+    apiKey: config.anthropicApiKey, model: config.llmModelBrain,
     enabled: config.agentBrainEnabled && !!config.anthropicApiKey,
     minConviction: args.brainEnabled ? 60 : config.agentBrainMinConviction,
     minConvictionLong: args.brainEnabled ? 55 : undefined,

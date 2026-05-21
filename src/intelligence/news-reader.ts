@@ -150,7 +150,9 @@ export class NewsReader {
       const text = await resp.text().catch(() => "");
       throw new Error(`Anthropic HTTP ${resp.status}: ${text.slice(0, 200)}`);
     }
-    const json = (await resp.json()) as { content?: { type: string; text: string }[] };
+    const json = (await resp.json()) as { content?: { type: string; text: string }[]; usage?: import("./anthropic-cost-tracker.js").AnthropicUsage };
+    const { costTracker } = await import("./anthropic-cost-tracker.js");
+    costTracker.record("news-reader", this.config.model, json.usage);
     const text = json.content?.find((c) => c.type === "text")?.text ?? "";
     const start = text.indexOf("{");
     const end = text.lastIndexOf("}");

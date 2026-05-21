@@ -134,7 +134,7 @@ async function main(): Promise<void> {
   const tuner = new SelfTuner();
   const brain = new AgentBrain({
     apiKey: config.anthropicApiKey,
-    model: config.llmModel,
+    model: config.llmModelBrain,                 // Opus 4.7 by default
     enabled: config.agentBrainEnabled && !!config.anthropicApiKey,
     minConviction: config.agentBrainMinConviction,
   });

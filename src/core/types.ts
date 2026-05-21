@@ -169,10 +169,14 @@ export interface AppConfig {
   // IBKR
   readonly ibkrBaseUrl: string;          // default https://localhost:5000/v1/api
 
-  // LLM (Anthropic Claude for setup classification)
+  // LLM (Anthropic Claude). Two model knobs — the brain uses the more capable
+  // (and slightly more expensive) Opus tier because brain decisions move
+  // trades. News reader + premarket classifier use Sonnet — cheaper, higher
+  // volume, lower stakes per call.
   readonly anthropicApiKey: string;
   readonly llmEnabled: boolean;
-  readonly llmModel: string;
+  readonly llmModel: string;             // default Sonnet — used by news reader + classifier
+  readonly llmModelBrain: string;        // default Opus 4.7 — used by AgentBrain
 
   // Agent brain (Claude validates EVERY trade with full market context)
   readonly agentBrainEnabled: boolean;

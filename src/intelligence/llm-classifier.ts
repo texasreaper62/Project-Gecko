@@ -44,7 +44,12 @@ interface AnthropicResponse {
   readonly content?: { type: string; text: string }[];
   readonly stop_reason?: string;
   readonly model?: string;
-  readonly usage?: { input_tokens: number; output_tokens: number };
+  readonly usage?: {
+    input_tokens: number;
+    output_tokens: number;
+    cache_creation_input_tokens?: number;
+    cache_read_input_tokens?: number;
+  };
   readonly error?: { type: string; message: string };
 }
 
@@ -133,6 +138,8 @@ export class LlmClassifier {
     if (parsed.error) {
       throw new Error(`Anthropic error: ${parsed.error.type} ${parsed.error.message}`);
     }
+    const { costTracker } = await import("./anthropic-cost-tracker.js");
+    costTracker.record("llm-classifier", this.config.model, parsed.usage);
     const text = parsed.content?.find((c) => c.type === "text")?.text ?? "";
     return parseLlmResponse(candidate, text);
   }

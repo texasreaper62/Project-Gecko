@@ -266,8 +266,11 @@ export class AgentBrain {
       const text = await resp.text().catch(() => "");
       throw new Error(`Anthropic HTTP ${resp.status}: ${text.slice(0, 300)}`);
     }
-    const json = await resp.json() as { content?: { type: string; text: string }[]; error?: { message: string } };
+    const json = await resp.json() as { content?: { type: string; text: string }[]; error?: { message: string }; usage?: import("./anthropic-cost-tracker.js").AnthropicUsage };
     if (json.error) throw new Error(`Anthropic error: ${json.error.message}`);
+    // Track spend.
+    const { costTracker } = await import("./anthropic-cost-tracker.js");
+    costTracker.record("agent-brain", this.config.model, json.usage);
     const text = json.content?.find((c) => c.type === "text")?.text ?? "";
     return parseDecision(text);
   }

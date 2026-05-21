@@ -74,6 +74,7 @@ export function loadConfig(): AppConfig {
     anthropicApiKey: optional("ANTHROPIC_API_KEY", ""),
     llmEnabled: optionalBool("LLM_ENABLED", true),
     llmModel: optional("LLM_MODEL", "claude-sonnet-4-6"),
+    llmModelBrain: optional("LLM_MODEL_BRAIN", "claude-opus-4-7"),
 
     // Agent brain
     agentBrainEnabled: optionalBool("AGENT_BRAIN_ENABLED", true),

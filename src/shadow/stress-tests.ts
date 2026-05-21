@@ -20,7 +20,7 @@ const config: AppConfig = {
   broker: "schwab",
   schwabClientId: "x", schwabClientSecret: "x", schwabRedirectUri: "", schwabAccountHash: "x",
   ibkrBaseUrl: "",
-  anthropicApiKey: "", llmEnabled: false, llmModel: "claude-sonnet-4-6",
+  anthropicApiKey: "", llmEnabled: false, llmModel: "claude-sonnet-4-6", llmModelBrain: "claude-opus-4-7",
   agentBrainEnabled: false, agentBrainMinConviction: 70,
   agentBrainMinConvictionLong: 60, agentBrainMinConvictionShort: 75,
   kellyEnabled: false, kellyFraction: 0.25, regimeAwareEnabled: false,
