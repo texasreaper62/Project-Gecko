@@ -14,12 +14,17 @@
 
 import { createLogger } from "../core/logger.js";
 import { appendJsonl } from "../utils/persistence.js";
-import { nowIso } from "../utils/time.js";
+import { nowIso, etParts } from "../utils/time.js";
 import type { AppConfig, TradeSignal } from "../core/types.js";
 import type { SchwabRest } from "../brokers/schwab/rest.js";
 import type { RiskManager } from "../risk/risk-manager.js";
 import type { AccountSnapshot, Position } from "../core/types.js";
 import type { AgentBrain, MarketContext } from "../intelligence/agent-brain.js";
+import type { ConfluenceEngine, CheckResult } from "../intelligence/confluence.js";
+import type { MultiTimeframeValidator } from "../intelligence/multi-tf.js";
+import type { MarketInternals } from "../intelligence/market-internals.js";
+import type { NewsReader } from "../intelligence/news-reader.js";
+import type { PatternMatcher } from "../intelligence/pattern-matcher.js";
 import { buildEquityOrder, buildOptionOrder } from "./order-builder.js";
 
 const log = createLogger("order-router");
@@ -39,8 +44,17 @@ export interface BrainContextProvider {
   getOpenPositions(): readonly Position[];
 }
 
+export interface ConfluenceStack {
+  readonly engine: ConfluenceEngine;
+  readonly multiTf: MultiTimeframeValidator;
+  readonly internals: MarketInternals;
+  readonly news: NewsReader;
+  readonly patterns: PatternMatcher;
+}
+
 export class OrderRouter {
   private brainProvider: BrainContextProvider | null = null;
+  private confluence: ConfluenceStack | null = null;
 
   constructor(
     private readonly config: AppConfig,
@@ -49,27 +63,102 @@ export class OrderRouter {
     private readonly accountHash: string,
   ) {}
 
-  // Wire the AI brain. When set, every entry (not close) is validated by Claude
-  // before risk check + execution.
   setBrain(provider: BrainContextProvider): void {
     this.brainProvider = provider;
   }
 
+  setConfluence(stack: ConfluenceStack): void {
+    this.confluence = stack;
+  }
+
   async submit(signal: TradeSignal, account: AccountSnapshot): Promise<RouterSubmitResult> {
+    const t0 = Date.now();
     appendJsonl(SIGNALS_LOG, { ts: nowIso(), signal });
 
-    let approvedSignal = signal;
-    if (this.brainProvider && this.brainProvider.brain.isEnabled()) {
-      const { approved, decision } = await this.brainProvider.brain.decide(
-        signal,
-        account,
-        this.brainProvider.getOpenPositions(),
-        this.brainProvider.getContext(signal),
-      );
-      if (!approved) {
-        return { accepted: false, reason: `brain rejected (conviction ${decision.conviction}): ${decision.reasoning}` };
+    // ---- TIER 1: instant checks (<100 ms). Fail-fast. ----
+    let tier1Checks: CheckResult[] = [];
+    let direction: "LONG" | "SHORT" = "LONG";
+    let symbol = "";
+    if (this.confluence) {
+      direction = signalDirection(signal);
+      symbol = signal.order.instrument.assetClass === "equity"
+        ? signal.order.instrument.symbol
+        : signal.order.instrument.underlying;
+      const etP = etParts();
+      tier1Checks = [
+        { name: "strategy-trigger", vote: 1, confidence: 0.7, weight: 1.0, detail: signal.strategy },
+        this.confluence.multiTf.evaluate(symbol, direction),
+        this.confluence.internals.evaluate(direction),
+        this.confluence.patterns.evaluate({
+          strategy: signal.strategy,
+          direction,
+          hourOfDay: etP.hour,
+          dayOfWeek: etP.dayOfWeek,
+          gapPct: typeof signal.metadata.gapPct === "number" ? signal.metadata.gapPct as number : undefined,
+          orWidthPct: typeof signal.metadata.orWidthPct === "number" ? signal.metadata.orWidthPct as number : undefined,
+          underlyingMovePct: typeof signal.metadata.movePct === "number" ? signal.metadata.movePct as number : undefined,
+        }),
+      ];
+
+      // Fail-fast on tier 1: require at least 2 of the 3 non-strategy checks
+      // to vote with the direction with confidence >= 0.4.
+      const nonStrat = tier1Checks.filter((c) => c.name !== "strategy-trigger");
+      const positives = nonStrat.filter((c) => c.vote > 0.15 && c.confidence >= 0.4).length;
+      const negatives = nonStrat.filter((c) => c.vote < -0.15 && c.confidence >= 0.4).length;
+      if (negatives >= 1 || positives < 2) {
+        log.info("Tier 1 fast-fail", { signalId: signal.id, positives, negatives, latencyMs: Date.now() - t0 });
+        return { accepted: false, reason: `tier-1 confluence: ${positives} supporting, ${negatives} opposing` };
       }
-      approvedSignal = approved;
+    }
+
+    // ---- TIER 2: slow Claude calls IN PARALLEL ----
+    const slowPromises: Promise<unknown>[] = [];
+    let newsResult: CheckResult | null = null;
+    let brainResult: { approved: TradeSignal | null; decision: { go: boolean; conviction: number; sizeMultiplier: number; reasoning: string; revisedStop?: number; revisedTake?: number } } | null = null;
+
+    if (this.confluence) {
+      slowPromises.push(
+        this.confluence.news.evaluate(symbol, direction)
+          .then((r) => { newsResult = r; })
+          .catch((err) => {
+            newsResult = { name: "news", vote: 0, confidence: 0, weight: 0.8, detail: `err:${errStr(err)}` };
+          }),
+      );
+    }
+    if (this.brainProvider && this.brainProvider.brain.isEnabled()) {
+      const provider = this.brainProvider;
+      slowPromises.push(
+        provider.brain.decide(signal, account, provider.getOpenPositions(), provider.getContext(signal))
+          .then((r) => { brainResult = r; })
+          .catch(() => {
+            brainResult = { approved: null, decision: { go: false, conviction: 0, sizeMultiplier: 0, reasoning: "brain error" } };
+          }),
+      );
+    }
+    if (slowPromises.length > 0) {
+      await Promise.all(slowPromises);
+    }
+
+    // Run final confluence with tier 2 included.
+    if (this.confluence) {
+      const allChecks = [...tier1Checks];
+      if (newsResult) allChecks.push(newsResult);
+      const conf = this.confluence.engine.evaluate(signal.id, direction, allChecks);
+      if (!conf.passed) {
+        log.info("Confluence failed (tier 2)", { signalId: signal.id, latencyMs: Date.now() - t0 });
+        return { accepted: false, reason: `confluence failed: ${conf.reasoning}` };
+      }
+      (signal.metadata as Record<string, unknown>).confluenceScore = conf.score;
+    }
+
+    let approvedSignal = signal;
+    if (brainResult) {
+      const br: { approved: TradeSignal | null; decision: { conviction: number; reasoning: string } } = brainResult;
+      if (!br.approved) {
+        log.info("Brain rejected", { signalId: signal.id, conviction: br.decision.conviction, latencyMs: Date.now() - t0 });
+        return { accepted: false, reason: `brain rejected (conviction ${br.decision.conviction}): ${br.decision.reasoning}` };
+      }
+      approvedSignal = br.approved;
     }
 
     const riskResult = this.risk.check(approvedSignal, account);
@@ -77,6 +166,7 @@ export class OrderRouter {
       return { accepted: false, reason: riskResult.reason };
     }
 
+    log.info("All gates passed", { signalId: signal.id, latencyMs: Date.now() - t0 });
     return this.dispatch(approvedSignal, "live");
   }
 
@@ -144,4 +234,17 @@ export class OrderRouter {
       return false;
     }
   }
+}
+
+function errStr(e: unknown): string {
+  return e instanceof Error ? e.message : String(e);
+}
+
+function signalDirection(signal: TradeSignal): "LONG" | "SHORT" {
+  const side = signal.order.side;
+  if (side === "BUY" || side === "BUY_TO_OPEN") return "LONG";
+  if (side === "SELL_TO_OPEN") return "SHORT";
+  // SELL on equity in our system is used for short-entry too; check metadata.
+  if (side === "SELL" && signal.metadata?.breakoutDirection === "SHORT") return "SHORT";
+  return "LONG";
 }

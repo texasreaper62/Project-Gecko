@@ -38,6 +38,11 @@ import { DiscordNotifier } from "./monitoring/discord.js";
 import { LlmClassifier } from "./intelligence/llm-classifier.js";
 import { SelfTuner } from "./intelligence/self-tuner.js";
 import { AgentBrain } from "./intelligence/agent-brain.js";
+import { ConfluenceEngine } from "./intelligence/confluence.js";
+import { MultiTimeframeValidator } from "./intelligence/multi-tf.js";
+import { MarketInternals } from "./intelligence/market-internals.js";
+import { NewsReader } from "./intelligence/news-reader.js";
+import { PatternMatcher } from "./intelligence/pattern-matcher.js";
 import type {
   AccountSnapshot,
   AppConfig,
@@ -148,6 +153,17 @@ async function main(): Promise<void> {
     enabled: config.agentBrainEnabled && !!config.anthropicApiKey,
     minConviction: config.agentBrainMinConviction,
   });
+  const confluenceEngine = new ConfluenceEngine({
+    minSignals: 4,
+    minScore: 0.65,
+    requireUnanimity: false,    // allow up to 1 dissenter
+  });
+  const patternMatcher = new PatternMatcher();
+  const newsReader = new NewsReader({
+    apiKey: config.anthropicApiKey,
+    model: config.llmModel,
+    enabled: config.llmEnabled && !!config.anthropicApiKey,
+  });
 
   // ----- Execution -----
   const router = new OrderRouter(config, rest, risk, accountHash);
@@ -155,6 +171,38 @@ async function main(): Promise<void> {
   fillWatcher.start();
   const quotes = new QuoteCache();
   const positionMonitor = new PositionMonitor(positions, router, quotes, fillWatcher, config.liveTrading);
+
+  // Multi-timeframe validator pulls bars from HistoricalBars cache; the
+  // strategies themselves keep these warm via the streaming layer + scanner.
+  const multiTf = new MultiTimeframeValidator({
+    getBars: (symbol, resolution, n) => {
+      const ms = resolutionToMs(resolution);
+      const end = Date.now();
+      const start = end - n * ms - 60_000;
+      // Synchronous best-effort: pull from the on-disk cache via HistoricalBars.
+      // The fetch returns a promise; we expose a sync helper that returns
+      // whatever's cached. If nothing cached, we return an empty array — the
+      // validator handles that gracefully.
+      try {
+        return (historical as { peekCache?: (sym: string, freqType: string, freq: number, startMs: number, endMs: number) => readonly import("./core/types.js").Bar[] }).peekCache?.(symbol, resolution === "60m" ? "minute" : "minute", resolution === "1m" ? 1 : resolution === "5m" ? 5 : resolution === "15m" ? 15 : 60, start, end) ?? [];
+      } catch {
+        return [];
+      }
+    },
+  });
+
+  // Market internals tracker. Watches SPY and a subset of the watchlist for
+  // breadth. Use a static seed list here; the live watchlist gets fed into
+  // the internals tracker via captureOpens() at session start.
+  const internals = new MarketInternals(quotes, ["SPY", "QQQ", "IWM", "DIA"]);
+
+  router.setConfluence({
+    engine: confluenceEngine,
+    multiTf,
+    internals,
+    news: newsReader,
+    patterns: patternMatcher,
+  });
 
   // Wire the AI brain into the router so every entry trade is validated.
   router.setBrain({
@@ -374,6 +422,15 @@ async function runDailyLoop(args: DailyLoopArgs): Promise<void> {
 
 function errMsg(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
+}
+
+function resolutionToMs(res: "1m" | "5m" | "15m" | "60m"): number {
+  switch (res) {
+    case "1m": return 60_000;
+    case "5m": return 5 * 60_000;
+    case "15m": return 15 * 60_000;
+    case "60m": return 60 * 60_000;
+  }
 }
 
 main().catch((err) => {
