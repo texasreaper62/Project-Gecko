@@ -110,6 +110,7 @@ export class IbkrRest {
   }
 
   // Strike list for a given underlying + expiry.
+  // IBKR uses 3-letter month codes (JAN, FEB, etc.) with year suffix, e.g. "MAY26".
   async getOptionStrikes(conid: number, month: string, exchange = "SMART"): Promise<{ call: readonly number[]; put: readonly number[] }> {
     const params = new URLSearchParams({
       conid: String(conid),
@@ -121,6 +122,22 @@ export class IbkrRest {
       `/iserver/secdef/strikes?${params.toString()}`,
     );
     return { call: data.call ?? [], put: data.put ?? [] };
+  }
+
+  // Resolve a specific option contract to its conid. IBKR requires:
+  //   conid (underlying), secType=OPT, month=MMMYY (e.g. "MAY26"), strike, right=C|P
+  async getOptionContractInfo(underlyingConid: number, month: string, strike: number, right: "C" | "P", exchange = "SMART"): Promise<readonly { conid: number; symbol: string; maturityDate: string; strike: number; right: string }[]> {
+    const params = new URLSearchParams({
+      conid: String(underlyingConid),
+      secType: "OPT",
+      month,
+      strike: String(strike),
+      right,
+      exchange,
+    });
+    const data = await this.get<unknown>(`/iserver/secdef/info?${params.toString()}`);
+    if (!Array.isArray(data)) return [];
+    return data as { conid: number; symbol: string; maturityDate: string; strike: number; right: string }[];
   }
 
   // ----- Market data -----

@@ -116,13 +116,116 @@ export class IbkrBroker implements Broker {
     };
   }
 
-  async getOptionChain(_q: OptionChainQuery): Promise<NormalizedOptionChain | null> {
-    // Option chain on IBKR requires: resolve underlying conid -> get
-    // available strikes/months from /iserver/secdef/strikes -> resolve each
-    // contract -> request snapshots in batches. That's a non-trivial walk.
-    // Stubbed for now; will fill in when we need Engine B on IBKR.
-    log.warn("IBKR option chain query not yet implemented");
-    return null;
+  async getOptionChain(q: OptionChainQuery): Promise<NormalizedOptionChain | null> {
+    // Walk IBKR's three-step resolution:
+    // 1. Resolve underlying conid (cached).
+    // 2. Fetch strikes for the target expiration month.
+    // 3. For each ATM-ish strike, fetch /secdef/info to get the contract conid,
+    //    then /marketdata/snapshot for bid/ask/greeks.
+    const underlyingConid = await this.resolveEquityConidCached(q.underlying);
+    const month = ibkrMonth(q.fromDate);
+
+    // Pick a reasonable strike count (~20) centered on current price.
+    const undQuote = await this.getQuote(q.underlying);
+    const underlyingPrice = undQuote?.last ?? 0;
+    if (underlyingPrice <= 0) {
+      log.warn("getOptionChain: no underlying price", { underlying: q.underlying });
+      return null;
+    }
+
+    const strikesResp = await this.rest.getOptionStrikes(underlyingConid, month);
+    const callStrikes = strikesResp.call ?? [];
+    const putStrikes = strikesResp.put ?? [];
+    if (callStrikes.length === 0 && putStrikes.length === 0) {
+      log.info("getOptionChain: no strikes for month", { underlying: q.underlying, month });
+      return null;
+    }
+
+    // Restrict to strikes near the money (10 above + 10 below).
+    const filterAtm = (strikes: readonly number[]): readonly number[] => {
+      const sorted = [...strikes].sort((a, b) => Math.abs(a - underlyingPrice) - Math.abs(b - underlyingPrice));
+      return sorted.slice(0, 20);
+    };
+
+    const callRing = q.contractType === "PUT" ? [] : filterAtm(callStrikes);
+    const putRing = q.contractType === "CALL" ? [] : filterAtm(putStrikes);
+
+    const calls = await this.fetchOptionContracts(underlyingConid, q.underlying, month, callRing, "C");
+    const puts = await this.fetchOptionContracts(underlyingConid, q.underlying, month, putRing, "P");
+
+    return {
+      underlying: q.underlying.toUpperCase(),
+      underlyingPrice,
+      expiration: q.fromDate,
+      calls,
+      puts,
+    };
+  }
+
+  private async fetchOptionContracts(
+    underlyingConid: number,
+    underlying: string,
+    month: string,
+    strikes: readonly number[],
+    right: "C" | "P",
+  ): Promise<NormalizedOptionChain["calls"]> {
+    if (strikes.length === 0) return [];
+
+    // Resolve conids for each strike. Parallel but capped.
+    const concurrency = 4;
+    const allContracts: { conid: number; strike: number; symbol: string; maturityDate: string }[] = [];
+    let cursor = 0;
+    const worker = async (): Promise<void> => {
+      while (cursor < strikes.length) {
+        const idx = cursor++;
+        const strike = strikes[idx];
+        try {
+          const info = await this.rest.getOptionContractInfo(underlyingConid, month, strike, right);
+          for (const c of info) {
+            allContracts.push({ conid: c.conid, strike: c.strike, symbol: c.symbol, maturityDate: c.maturityDate });
+          }
+        } catch (err) {
+          log.debug("getOptionContractInfo failed", { strike, right, error: err instanceof Error ? err.message : String(err) });
+        }
+      }
+    };
+    await Promise.all(Array.from({ length: concurrency }, () => worker()));
+
+    if (allContracts.length === 0) return [];
+
+    // Pull snapshots for all contract conids at once.
+    const conids = allContracts.map((c) => c.conid);
+    const snapshots = await this.rest.getSnapshot(conids, "31,84,86,85,88,7283,7308,7309,7310,7311");
+
+    return allContracts.map((c) => {
+      const snap = snapshots.find((s) => s.conid === c.conid) ?? null;
+      const bid = numOrZero(snap?.["84"]);
+      const ask = numOrZero(snap?.["86"]);
+      const last = numOrZero(snap?.["31"]);
+      const mid = bid > 0 && ask > 0 ? (bid + ask) / 2 : last;
+      const exp = parseIbkrDate(c.maturityDate);   // "20260517"
+      const osi = formatOsiSymbol(underlying, exp, c.strike, right);
+      this.conidCache.set(osi, c.conid);
+      this.conidToSymbol.set(c.conid, osi);
+      return {
+        instrument: {
+          assetClass: "option" as const,
+          underlying: underlying.toUpperCase(),
+          expiration: exp,
+          strike: c.strike,
+          optionType: right === "C" ? "CALL" as const : "PUT" as const,
+          osiSymbol: osi,
+        },
+        bid,
+        ask,
+        mid,
+        // Greeks: 7308 delta, 7309 gamma, 7310 theta, 7311 vega
+        delta: numOrZero(snap?.["7308"]),
+        gamma: numOrZero(snap?.["7309"]),
+        theta: numOrZero(snap?.["7310"]),
+        iv: numOrZero(snap?.["7283"]),
+      };
+    });
   }
 
   async getHistoricalBars(q: HistoricalBarsQuery): Promise<readonly Bar[]> {
@@ -161,8 +264,28 @@ export class IbkrBroker implements Broker {
     }
   }
 
-  async subscribeOptions(_osiSymbols: readonly string[]): Promise<void> {
-    log.warn("IBKR option subscription not yet wired (need OSI -> conid resolver)");
+  async subscribeOptions(osiSymbols: readonly string[]): Promise<void> {
+    for (const osi of osiSymbols) {
+      let conid = this.conidCache.get(osi);
+      if (conid === undefined) {
+        const parsed = parseOsiSymbol(osi);
+        if (!parsed) {
+          log.warn("Could not parse OSI symbol for IBKR subscription", { osi });
+          continue;
+        }
+        const underlyingConid = await this.resolveEquityConidCached(parsed.underlying);
+        const month = ibkrMonth(parsed.expiration);
+        const info = await this.rest.getOptionContractInfo(underlyingConid, month, parsed.strike, parsed.right);
+        if (info.length === 0) {
+          log.warn("IBKR could not resolve option symbol for subscription", { osi });
+          continue;
+        }
+        conid = info[0].conid;
+        this.conidCache.set(osi, conid);
+      }
+      this.conidToSymbol.set(conid, osi);
+      this.stream.subscribeOption(conid);
+    }
   }
 
   async subscribeAccountActivity(): Promise<void> {
@@ -175,9 +298,22 @@ export class IbkrBroker implements Broker {
     if (instrument.assetClass === "equity") {
       return this.resolveEquityConidCached(instrument.symbol);
     }
-    // Option: need underlying conid + month + strike + right.
-    // Deferred; option order routing on IBKR coming next.
-    throw new Error("IBKR option order routing not yet implemented");
+    // Option: try the OSI cache first (populated by getOptionChain). If miss,
+    // resolve via underlying conid + month + strike + right.
+    const cached = this.conidCache.get(instrument.osiSymbol);
+    if (cached !== undefined) return cached;
+
+    const underlyingConid = await this.resolveEquityConidCached(instrument.underlying);
+    const month = ibkrMonth(instrument.expiration);
+    const right: "C" | "P" = instrument.optionType === "CALL" ? "C" : "P";
+    const info = await this.rest.getOptionContractInfo(underlyingConid, month, instrument.strike, right);
+    if (info.length === 0) {
+      throw new Error(`IBKR could not resolve option ${instrument.osiSymbol}`);
+    }
+    const conid = info[0].conid;
+    this.conidCache.set(instrument.osiSymbol, conid);
+    this.conidToSymbol.set(conid, instrument.osiSymbol);
+    return conid;
   }
 
   private async resolveEquityConidCached(symbol: string): Promise<number> {
@@ -251,6 +387,56 @@ function mapSide(s: BrokerOrderRequest["side"]): IbkrOrderRequest["side"] {
     case "SELL_TO_CLOSE":
       return "SELL";
   }
+}
+
+function numOrZero(v: unknown): number {
+  if (typeof v === "number" && Number.isFinite(v)) return v;
+  if (typeof v === "string") {
+    const n = Number(v);
+    if (Number.isFinite(n)) return n;
+  }
+  return 0;
+}
+
+// Convert YYYY-MM-DD to "MMMYY" (IBKR's expected month format).
+function ibkrMonth(yyyymmdd: string): string {
+  const d = new Date(`${yyyymmdd}T00:00:00Z`);
+  const months = ["JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"];
+  const m = months[d.getUTCMonth()];
+  const yy = String(d.getUTCFullYear()).slice(-2);
+  return `${m}${yy}`;
+}
+
+// Parse "20260517" -> "2026-05-17".
+function parseIbkrDate(yyyymmdd: string): string {
+  if (yyyymmdd.length !== 8) return yyyymmdd;
+  return `${yyyymmdd.slice(0, 4)}-${yyyymmdd.slice(4, 6)}-${yyyymmdd.slice(6, 8)}`;
+}
+
+// Build OSI 21-char symbol from underlying + ISO date + strike + right.
+// e.g. SPY 2026-05-17 500.0 C -> "SPY   260517C00500000"
+function formatOsiSymbol(underlying: string, isoDate: string, strike: number, right: "C" | "P"): string {
+  const ticker = underlying.toUpperCase().padEnd(6, " ");
+  const d = new Date(`${isoDate}T00:00:00Z`);
+  const yymmdd = `${String(d.getUTCFullYear()).slice(-2)}${String(d.getUTCMonth() + 1).padStart(2, "0")}${String(d.getUTCDate()).padStart(2, "0")}`;
+  const strikeStr = String(Math.round(strike * 1000)).padStart(8, "0");
+  return `${ticker}${yymmdd}${right}${strikeStr}`;
+}
+
+// Inverse of the above. Returns { underlying, expiration (YYYY-MM-DD), strike, right }.
+function parseOsiSymbol(osi: string): { underlying: string; expiration: string; strike: number; right: "C" | "P" } | null {
+  if (osi.length !== 21) return null;
+  const underlying = osi.slice(0, 6).trim();
+  const yy = osi.slice(6, 8);
+  const mm = osi.slice(8, 10);
+  const dd = osi.slice(10, 12);
+  const right = osi.slice(12, 13);
+  const strikeRaw = osi.slice(13);
+  if (right !== "C" && right !== "P") return null;
+  const yyyy = Number(yy) >= 70 ? `19${yy}` : `20${yy}`;
+  const strike = Number(strikeRaw) / 1000;
+  if (!Number.isFinite(strike)) return null;
+  return { underlying, expiration: `${yyyy}-${mm}-${dd}`, strike, right };
 }
 
 function mapOrderStatus(s: string): BrokerOrderStatus["status"] {
