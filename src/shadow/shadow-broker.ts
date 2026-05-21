@@ -78,7 +78,13 @@ export class ShadowBroker implements Broker {
     };
   }
 
-  // Orders: instant simulated fill at limit price (or last seen price if MARKET).
+  // Orders: instant simulated fill.
+  // - LIMIT orders fill at the limit price (assumes price touched it, which
+  //   is why the strategy submitted the order in the first place).
+  // - MARKET orders fill at the last seen price.
+  // - For close orders fired by position-monitor on stop/take touches, the
+  //   monitor passes the touched price as the limit so we get realistic fills
+  //   instead of riding to the last tick.
   async placeOrder(req: BrokerOrderRequest): Promise<BrokerSubmitResult> {
     this.orderCounter++;
     const orderId = `shadow-${this.orderCounter}-${Date.now()}`;

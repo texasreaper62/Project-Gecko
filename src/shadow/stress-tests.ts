@@ -22,6 +22,8 @@ const config: AppConfig = {
   ibkrBaseUrl: "",
   anthropicApiKey: "", llmEnabled: false, llmModel: "claude-sonnet-4-6",
   agentBrainEnabled: false, agentBrainMinConviction: 70,
+  agentBrainMinConvictionLong: 60, agentBrainMinConvictionShort: 75,
+  kellyEnabled: false, kellyFraction: 0.25, regimeAwareEnabled: false,
   liveTrading: false, killSwitch: false,
   maxRiskPerTradePct: 1.0,
   maxConcurrentEquityPositions: 3, maxConcurrentOptionPositions: 2,

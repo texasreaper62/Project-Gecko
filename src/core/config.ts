@@ -78,6 +78,15 @@ export function loadConfig(): AppConfig {
     // Agent brain
     agentBrainEnabled: optionalBool("AGENT_BRAIN_ENABLED", true),
     agentBrainMinConviction: boundedNumber("AGENT_BRAIN_MIN_CONVICTION", 70, 0, 100),
+    agentBrainMinConvictionLong: boundedNumber("AGENT_BRAIN_MIN_CONVICTION_LONG", 60, 0, 100),
+    agentBrainMinConvictionShort: boundedNumber("AGENT_BRAIN_MIN_CONVICTION_SHORT", 75, 0, 100),
+
+    // Kelly sizing
+    kellyEnabled: optionalBool("KELLY_ENABLED", false),
+    kellyFraction: boundedNumber("KELLY_FRACTION", 0.25, 0.0, 1.0),
+
+    // Regime-aware sizing
+    regimeAwareEnabled: optionalBool("REGIME_AWARE_ENABLED", true),
 
     // Mode
     liveTrading: optionalBool("LIVE_TRADING", false),

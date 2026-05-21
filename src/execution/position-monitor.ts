@@ -67,6 +67,14 @@ export class PositionMonitor {
     }
   }
 
+  // Tick-driven exit check. Used by the shadow harness to evaluate stops/takes
+  // on every tick instead of waiting for the 2-second poll, which is
+  // unrealistic when ticks arrive faster than the poll interval (replay mode,
+  // or extreme bursts in live).
+  async probeNow(): Promise<void> {
+    await this.probe();
+  }
+
   private async probe(): Promise<void> {
     const open = this.positions.all();
     if (open.length === 0) return;

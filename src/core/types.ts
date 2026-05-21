@@ -177,6 +177,15 @@ export interface AppConfig {
   // Agent brain (Claude validates EVERY trade with full market context)
   readonly agentBrainEnabled: boolean;
   readonly agentBrainMinConviction: number;    // 0-100, default 70
+  readonly agentBrainMinConvictionLong: number;   // override for LONG, default 60
+  readonly agentBrainMinConvictionShort: number;  // override for SHORT, default 75
+
+  // Kelly-bounded sizing
+  readonly kellyEnabled: boolean;
+  readonly kellyFraction: number;              // 0.25 = quarter-Kelly (conservative)
+
+  // Regime-aware sizing
+  readonly regimeAwareEnabled: boolean;
 
   // Trading mode
   readonly liveTrading: boolean;

@@ -36,7 +36,9 @@ export interface AgentBrainConfig {
   readonly apiKey: string;
   readonly model: string;
   readonly enabled: boolean;
-  readonly minConviction: number;          // default 70
+  readonly minConviction: number;          // default 70 — base threshold
+  readonly minConvictionLong?: number;     // override for LONG trades
+  readonly minConvictionShort?: number;    // override for SHORT trades
 }
 
 export interface MarketContext {
@@ -132,10 +134,19 @@ export class AgentBrain {
 
     appendJsonl(DECISIONS_LOG, { ts: nowIso(), signal: signal.id, decision });
 
-    if (!decision.go || decision.conviction < this.config.minConviction) {
+    // Asymmetric thresholds: shadow data showed longs 83% / shorts 50% win
+    // rate. Apply stricter conviction floor on shorts.
+    const isLong = signal.order.side === "BUY" || signal.order.side === "BUY_TO_OPEN";
+    const threshold = isLong
+      ? (this.config.minConvictionLong ?? this.config.minConviction)
+      : (this.config.minConvictionShort ?? this.config.minConviction);
+
+    if (!decision.go || decision.conviction < threshold) {
       log.info("AgentBrain rejected signal", {
         signalId: signal.id,
         conviction: decision.conviction,
+        threshold,
+        direction: isLong ? "LONG" : "SHORT",
         reason: decision.reasoning,
       });
       return { approved: null, decision };

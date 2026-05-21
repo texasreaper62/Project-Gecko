@@ -86,14 +86,18 @@ export class ReplayEngine {
       const isEquity = bar.symbol.length <= 6 && !bar.symbol.includes(":");
       const kind = isEquity ? "equity-tick" : "option-tick";
 
-      // Convert one OHLC bar into a sequence of ticks. Simplest: emit close
-      // as the last value. Optional: emit open/high/low as additional ticks
-      // to give strategies more granularity within the bar.
-      const ticks: NormalizedTick[] = [
-        { symbol: bar.symbol, last: bar.close, timestamp: bar.timestamp, volume: bar.volume },
-      ];
-      this.opts.broker.emitTick(kind, ticks);
-      emitted++;
+      // Emit 4 sequential ticks per bar (open -> low -> high -> close). This
+      // gives position-monitor a chance to fire stop/take exits intra-bar at
+      // the actual touched price. Order matters: low before high means if
+      // both a LONG's stop (below) and take (above) would be touched, the
+      // stop fires first — conservative for win-rate estimation.
+      const samples = [bar.open, bar.low, bar.high, bar.close];
+      for (const px of samples) {
+        this.opts.broker.emitTick(kind, [{
+          symbol: bar.symbol, last: px, timestamp: bar.timestamp, volume: bar.volume,
+        }]);
+        emitted++;
+      }
 
       if (this.opts.mode === "realtime" && this.opts.tickIntervalMs) {
         await sleep(this.opts.tickIntervalMs);

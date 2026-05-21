@@ -107,6 +107,11 @@ async function main(): Promise<void> {
     llmModel: process.env.LLM_MODEL ?? "claude-sonnet-4-6",
     agentBrainEnabled: args.brainEnabled,
     agentBrainMinConviction: 70,
+    agentBrainMinConvictionLong: 55,
+    agentBrainMinConvictionShort: 75,
+    kellyEnabled: false,
+    kellyFraction: 0.25,
+    regimeAwareEnabled: false,
     liveTrading: true,             // we want the router to dispatch, ShadowBroker simulates
     killSwitch: false,
     maxRiskPerTradePct: 1.0,
@@ -143,6 +148,8 @@ async function main(): Promise<void> {
     apiKey: config.anthropicApiKey, model: config.llmModel,
     enabled: config.agentBrainEnabled && !!config.anthropicApiKey,
     minConviction: args.brainEnabled ? 60 : config.agentBrainMinConviction,
+    minConvictionLong: args.brainEnabled ? 55 : undefined,
+    minConvictionShort: args.brainEnabled ? 75 : undefined,
   });
   // Shadow uses permissive confluence so we can see the full pipeline execute.
   // The brain is the strict gate; confluence is a cheap pre-filter. Cold-start
@@ -235,6 +242,10 @@ async function main(): Promise<void> {
   setInterval(async () => { cached = await broker.getAccountSnapshot(); }, 5_000).unref?.();
 
   // ----- Stream handler: route shadow ticks to ORB + QuoteCache + bars cache -----
+  // Also drive position-monitor exit checks on EVERY tick so stop/take fills
+  // happen at the correct price. (In live mode the 2-second poll handles
+  // exits; in shadow the 29k-tick burst would otherwise leave the poll firing
+  // only once at the very end with stale prices.)
   broker.setStreamHandler((kind, ticks) => {
     if (kind === "equity-tick") {
       for (const t of ticks) {
@@ -248,6 +259,8 @@ async function main(): Promise<void> {
         barsBySymbol.set(t.symbol.toUpperCase(), arr);
       }
       orb.handleEquityTick(ticks);
+      // Synchronous exit check on every tick batch (cheap; no-op when no open positions).
+      positionMonitor.probeNow().catch(() => { /* logged inside */ });
     }
   });
 
