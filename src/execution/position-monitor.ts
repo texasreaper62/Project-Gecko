@@ -81,6 +81,41 @@ export class PositionMonitor {
     await this.probe();
   }
 
+  // Per-symbol tick-driven exit check. Uses the live tick price directly
+  // instead of reading from QuoteCache. Critical for shadow mode where
+  // multiple symbols' ticks interleave and QuoteCache reads return stale
+  // prices for instruments that haven't ticked recently.
+  //
+  // Call this from the stream handler with the symbol + current tick price
+  // for every equity tick to ensure stops and takes fire at the right
+  // price for the bar that crossed them.
+  async probeSymbol(symbol: string, livePrice: number): Promise<void> {
+    if (!Number.isFinite(livePrice) || livePrice <= 0) return;
+    const now = Date.now();
+    const minsOfDay = nowEtMinutes(now);
+
+    for (const pos of this.positions.all()) {
+      const posSym = pos.instrument.assetClass === "equity"
+        ? pos.instrument.symbol
+        : pos.instrument.underlying;
+      if (posSym !== symbol) continue;
+
+      const key = instrumentKey(pos.instrument);
+      if (this.inFlightCloses.has(key)) continue;
+
+      this.positions.updatePrice(pos.instrument, livePrice);
+      this.maybeTrailToBreakeven(pos, livePrice);
+
+      const reason = this.shouldClose(pos, livePrice, minsOfDay, now);
+      if (!reason) continue;
+
+      this.inFlightCloses.add(key);
+      this.submitClose(pos, livePrice, reason)
+        .catch((err) => log.error("Close submit failed", { key, error: errMsg(err) }))
+        .finally(() => this.inFlightCloses.delete(key));
+    }
+  }
+
   private async probe(): Promise<void> {
     const open = this.positions.all();
     if (open.length === 0) return;

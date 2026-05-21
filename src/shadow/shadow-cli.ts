@@ -307,8 +307,11 @@ async function main(): Promise<void> {
       earningsCatalyst?.handleEquityTick(ticks);
       // Refresh regime every tick (cheap; recomputes once per minute internally).
       regimeDetector.refresh();
-      // Synchronous exit check on every tick batch (cheap; no-op when no open positions).
-      positionMonitor.probeNow().catch(() => { /* logged inside */ });
+      // Per-symbol exit check: use the live tick price (not the cached one,
+      // which may be stale in interleaved replay).
+      for (const t of ticks) {
+        positionMonitor.probeSymbol(t.symbol, t.last).catch(() => {});
+      }
     }
   });
 
