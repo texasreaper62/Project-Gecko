@@ -1,275 +1,432 @@
+// Gecko orchestrator. Wires the broker, scanners, strategies, risk, and
+// execution layers into a running process.
+//
+// Daily cycle:
+//   - Load config and tokens, connect Schwab REST + Stream
+//   - On startup: fetch account hash (cached after first call), snapshot account
+//   - Premarket (08:55-09:25 ET): run premarket scanner, load ORB candidates,
+//     subscribe to LEVELONE_EQUITIES
+//   - 09:30 ET: start ORB strategy, start Engine B (subscribes to SPY 0DTE)
+//   - Continuous: position monitor polls open positions for exit conditions
+//   - 16:00 ET: stop strategies, log daily summary
+//
+// LIVE_TRADING=false:
+//   - Everything runs the same path, but OrderRouter logs orders to JSONL
+//     instead of submitting via REST. Safe for paper-equivalent operation.
+
 import { loadConfig } from "./core/config.js";
 import { createLogger, setLogLevel } from "./core/logger.js";
-import type { AppConfig, Opportunity } from "./core/types.js";
-
-// Feeds
-import { BinanceFeed } from "./feeds/binance-ws.js";
-import { CoinbaseFeed } from "./feeds/coinbase-ws.js";
-import { PolymarketRestClient } from "./feeds/polymarket-rest.js";
-import { PolymarketWsFeed } from "./feeds/polymarket-ws.js";
-import { FeedAggregator } from "./feeds/feed-aggregator.js";
-
-// Strategies
-import { TemporalArbStrategy } from "./strategies/temporal-arb.js";
-import { CorrelatedContractsStrategy } from "./strategies/correlated-contracts.js";
-
-// Execution
-import { OrderBuilder } from "./execution/order-builder.js";
-import { OrderExecutor } from "./execution/order-executor.js";
-import { RiskManager } from "./execution/risk-manager.js";
+import { etDate, etParts, isWeekdayET, sleep } from "./utils/time.js";
+import { createBroker } from "./brokers/factory.js";
+import { SchwabRest } from "./brokers/schwab/rest.js";
+import { SchwabAuth } from "./brokers/schwab/auth.js";
+import { HistoricalBars } from "./data/historical.js";
+import { QuoteCache } from "./data/quote-cache.js";
+import { PremarketScanner } from "./scanner/premarket.js";
+import { OptionsChainMonitor } from "./scanner/options-chain.js";
+import { OrbStrategy } from "./strategies/orb.js";
+import { Dte0SpyStrategy } from "./strategies/dte0-spy.js";
+import { DailyStop } from "./risk/daily-stop.js";
+import { PdtTracker } from "./risk/pdt-tracker.js";
+import { RiskManager } from "./risk/risk-manager.js";
 import { PositionTracker } from "./execution/position-tracker.js";
-
-// Monitoring
+import { PositionMonitor } from "./execution/position-monitor.js";
+import { OrderRouter } from "./execution/order-router.js";
+import { FillWatcher } from "./execution/fill-watcher.js";
 import { TelegramNotifier } from "./monitoring/telegram.js";
 import { DiscordNotifier } from "./monitoring/discord.js";
-import { PnlTracker } from "./monitoring/pnl-tracker.js";
-import { HealthChecker } from "./monitoring/health-check.js";
-import { DailyReporter } from "./monitoring/daily-report.js";
-import { WalletMonitor } from "./monitoring/wallet-monitor.js";
-
-// Position management
-import { PositionCloser } from "./execution/position-closer.js";
-
-// Self-improvement
-import { SelfTuner } from "./strategies/self-tuner.js";
-import { ShadowTracker } from "./strategies/shadow-tracker.js";
-import { EmpiricalModel } from "./strategies/empirical-model.js";
+import { LlmClassifier } from "./intelligence/llm-classifier.js";
+import { SelfTuner } from "./intelligence/self-tuner.js";
+import { AgentBrain } from "./intelligence/agent-brain.js";
+import { ConfluenceEngine } from "./intelligence/confluence.js";
+import { MultiTimeframeValidator } from "./intelligence/multi-tf.js";
+import { MarketInternals } from "./intelligence/market-internals.js";
+import { NewsReader } from "./intelligence/news-reader.js";
+import { PatternMatcher } from "./intelligence/pattern-matcher.js";
+import { RegimeDetector } from "./intelligence/regime-detector.js";
+import { ConvictionSizer } from "./risk/conviction-sizer.js";
+import { EconomicCalendar } from "./intelligence/economic-calendar.js";
+import { MeanReversionStrategy } from "./strategies/mean-reversion.js";
+import type {
+  AccountSnapshot,
+  AppConfig,
+  TradeSignal,
+} from "./core/types.js";
 
 const log = createLogger("main");
 
+const ACCOUNT_REFRESH_MS = 60 * 1000;
+
 async function main(): Promise<void> {
-  // Load and validate config
   let config: AppConfig;
   try {
     config = loadConfig();
   } catch (err) {
-    // Can't use logger if config fails (log level not set)
     process.stderr.write(`FATAL: Config error: ${err instanceof Error ? err.message : String(err)}\n`);
     process.exit(1);
   }
 
   setLogLevel(config.logLevel);
-  log.info("Project Gecko starting", {
+  log.info("Gecko starting", {
     liveTrading: config.liveTrading,
     killSwitch: config.killSwitch,
-    maxPositionSize: config.maxPositionSize,
-    maxTotalExposure: config.maxTotalExposure,
-    minSpreadThreshold: config.minSpreadThreshold,
+    orbEnabled: config.orbEnabled,
+    dte0Enabled: config.dte0Enabled,
+    llmEnabled: config.llmEnabled,
   });
 
-  // Initialize feeds
-  const binance = new BinanceFeed(config.binanceWsUrl);
-  const coinbase = new CoinbaseFeed(config.coinbaseWsUrl);
-  const polyRest = new PolymarketRestClient(config.polymarketClobUrl);
-  const polyWs = new PolymarketWsFeed();
-  const aggregator = new FeedAggregator(binance, coinbase, polyWs);
+  // ----- Broker (Schwab or IBKR per config) -----
+  let broker;
+  try {
+    broker = await createBroker(config);
+  } catch (err) {
+    process.stderr.write(`FATAL: ${err instanceof Error ? err.message : String(err)}\n`);
+    process.exit(1);
+  }
+  log.info("Broker initialized", { broker: broker.name, latencyTargetMs: broker.orderLatencyTargetMs });
 
-  // Initialize execution
-  const positions = new PositionTracker();
-  const orderBuilder = new OrderBuilder(config);
-  const riskManager = new RiskManager(config, positions, aggregator);
+  // For historical data + scanner that still uses Schwab REST directly, we
+  // also instantiate a SchwabRest where possible. Yahoo backtest path uses
+  // its own fetcher; here we only need SchwabRest when BROKER=schwab.
+  const schwabRestForScanner = config.broker === "schwab"
+    ? (() => {
+        const a = new SchwabAuth({
+          clientId: config.schwabClientId,
+          clientSecret: config.schwabClientSecret,
+          redirectUri: config.schwabRedirectUri,
+        });
+        return new SchwabRest(a);
+      })()
+    : null;
 
-  // Only initialize order signing if live trading is possible
-  if (config.liveTrading) {
+  // ----- Account snapshot polling -----
+  const accountState: { current: AccountSnapshot | null } = { current: null };
+  const refreshAccount = async (): Promise<void> => {
     try {
-      await orderBuilder.initialize();
-      log.info("Order builder ready for live trading");
+      accountState.current = await broker.getAccountSnapshot();
     } catch (err) {
-      log.error("Failed to initialize order builder, disabling live trading", {
+      log.warn("Account snapshot refresh failed", {
         error: err instanceof Error ? err.message : String(err),
       });
-      riskManager.activateKillSwitch("Order builder initialization failed");
     }
+  };
+  await refreshAccount();
+  const accountTimer = setInterval(() => {
+    refreshAccount().catch(() => { /* logged inside */ });
+  }, ACCOUNT_REFRESH_MS);
+  accountTimer.unref?.();
+
+  // ----- Risk layer -----
+  const dailyStop = new DailyStop(config.dailyLossLimitPct);
+  if (accountState.current) {
+    dailyStop.resetForDay(etDate(), accountState.current.equity);
   }
+  const pdt = new PdtTracker(config.maxDayTrades);
+  const positions = new PositionTracker();
+  const risk = new RiskManager(config, dailyStop, pdt, positions);
 
-  const executor = new OrderExecutor(config, orderBuilder, riskManager, positions, polyRest);
+  // ----- Intelligence (created before execution so fill-watcher can wire it) -----
+  const llm = new LlmClassifier({
+    apiKey: config.anthropicApiKey,
+    model: config.llmModel,
+    enabled: config.llmEnabled && !!config.anthropicApiKey,
+  });
+  const tuner = new SelfTuner();
+  const brain = new AgentBrain({
+    apiKey: config.anthropicApiKey,
+    model: config.llmModelBrain,                 // Opus 4.7 by default
+    enabled: config.agentBrainEnabled && !!config.anthropicApiKey,
+    minConviction: config.agentBrainMinConviction,
+  });
+  const confluenceEngine = new ConfluenceEngine({
+    minSignals: 4,
+    minScore: 0.65,
+    requireUnanimity: false,    // allow up to 1 dissenter
+  });
+  const patternMatcher = new PatternMatcher();
+  const newsReader = new NewsReader({
+    apiKey: config.anthropicApiKey,
+    model: config.llmModel,
+    enabled: config.llmEnabled && !!config.anthropicApiKey,
+  });
 
-  // Initialize wallet monitor
-  const walletMonitor = new WalletMonitor(config, riskManager);
-  if (config.polygonRpcUrl) {
-    await walletMonitor.start().catch((err) => {
-      log.warn("Wallet monitor failed to start (balance monitoring disabled)", {
-        error: err instanceof Error ? err.message : String(err),
-      });
-    });
-  }
+  // ----- Execution -----
+  const router = new OrderRouter(config, broker, risk);
+  const fillWatcher = new FillWatcher(broker, positions, tuner);
+  fillWatcher.start();
+  const quotes = new QuoteCache();
+  const positionMonitor = new PositionMonitor(positions, router, quotes, fillWatcher, config.liveTrading);
 
-  // Self-improvement engine
-  const selfTuner = new SelfTuner(config);
-  const empiricalModel = new EmpiricalModel();
-  const shadowTracker = new ShadowTracker(polyRest, selfTuner, empiricalModel);
+  // Multi-timeframe validator pulls bars from HistoricalBars cache; the
+  // strategies themselves keep these warm via the streaming layer + scanner.
+  const multiTf = new MultiTimeframeValidator({
+    getBars: (symbol, resolution, n) => {
+      const ms = resolutionToMs(resolution);
+      const end = Date.now();
+      const start = end - n * ms - 60_000;
+      // Synchronous best-effort: pull from the on-disk cache via HistoricalBars.
+      // The fetch returns a promise; we expose a sync helper that returns
+      // whatever's cached. If nothing cached, we return an empty array — the
+      // validator handles that gracefully.
+      try {
+        return (historical as { peekCache?: (sym: string, freqType: string, freq: number, startMs: number, endMs: number) => readonly import("./core/types.js").Bar[] }).peekCache?.(symbol, resolution === "60m" ? "minute" : "minute", resolution === "1m" ? 1 : resolution === "5m" ? 5 : resolution === "15m" ? 15 : 60, start, end) ?? [];
+      } catch {
+        return [];
+      }
+    },
+  });
 
-  // Initialize monitoring
+  // Market internals tracker. Watches SPY and a subset of the watchlist for
+  // breadth. Use a static seed list here; the live watchlist gets fed into
+  // the internals tracker via captureOpens() at session start.
+  const internals = new MarketInternals(quotes, ["SPY", "QQQ", "IWM", "DIA"]);
+
+  router.setConfluence({
+    engine: confluenceEngine,
+    multiTf,
+    internals,
+    news: newsReader,
+    patterns: patternMatcher,
+  });
+
+  // Conviction-based sizing + per-strategy adaptive tiers.
+  const convictionSizer = new ConvictionSizer();
+  router.setConvictionSizer(convictionSizer);
+  tuner.onOutcome((outs) => convictionSizer.updateFromOutcomes(outs));
+
+  // Regime-aware sizing. Captures SPY/VIX opens at session start.
+  const regimeDetector = new RegimeDetector(quotes);
+  router.setRegimeDetector(regimeDetector);
+
+  // Wire the AI brain into the router so every entry trade is validated.
+  router.setBrain({
+    brain,
+    getOpenPositions: () => positions.all(),
+    getContext: (signal) => {
+      const p = etParts();
+      const dow = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"][p.dayOfWeek];
+      const spyLast = quotes.getEquityPrice("SPY") ?? undefined;
+      return {
+        timeOfDayEt: `${String(p.hour).padStart(2, "0")}:${String(p.minute).padStart(2, "0")}`,
+        dayOfWeek: dow,
+        spyChangePct: spyLast !== undefined ? undefined : undefined, // populated by orchestrator when reference is available
+        recentBars: undefined,                                       // strategies can enrich signal.metadata with recent bars
+      };
+    },
+  });
+
+  // ----- Notifications -----
   const telegram = new TelegramNotifier(config.telegramBotToken, config.telegramChatId);
   const discord = new DiscordNotifier(config.discordWebhookUrl);
-  const pnlTracker = new PnlTracker(positions);
-  const healthChecker = new HealthChecker(binance, coinbase, polyWs, positions, riskManager, walletMonitor);
-  const dailyReporter = new DailyReporter(config, pnlTracker, healthChecker, telegram, discord, selfTuner, shadowTracker);
 
-  // Position auto-closer (take-profit, stop-loss, max hold time)
-  const positionCloser = new PositionCloser(config, positions, executor, aggregator, pnlTracker, telegram, selfTuner);
+  // ----- Stream data routing -----
+  // Historical bars + scanner + options-chain currently only have Schwab
+  // backends. When BROKER=ibkr these become no-ops (return null/empty).
+  const historical = schwabRestForScanner ? new HistoricalBars(schwabRestForScanner) : null;
+  const scanner = schwabRestForScanner && historical ? new PremarketScanner(config, schwabRestForScanner, historical) : null;
+  const chainMonitor = schwabRestForScanner ? new OptionsChainMonitor(schwabRestForScanner) : null;
+  const orb = new OrbStrategy(config, broker);
+  orb.setEconomicCalendar(new EconomicCalendar());
+  orb.setWalkForward(tuner.getWalkForward());
+  const dte0 = chainMonitor ? new Dte0SpyStrategy(config, broker, chainMonitor) : null;
+  const meanReversion = new MeanReversionStrategy(config, broker, ["SPY", "QQQ"]);
 
-  // Opportunity handler: shared across all strategies
-  const handleOpportunity = async (opp: Opportunity): Promise<void> => {
-    log.info("Opportunity detected", {
-      id: opp.id,
-      strategy: opp.strategy,
-      spread: opp.expectedSpread.toFixed(2),
-      confidence: opp.confidence.toFixed(2),
-    });
+  orb.setAccountProvider(() => accountState.current);
+  meanReversion.setAccountProvider(() => accountState.current);
+  dte0?.setAccountProvider(() => accountState.current);
 
-    dailyReporter.incrementOpportunities();
-
-    // Track every opportunity for shadow learning (even if not traded)
-    shadowTracker.trackOpportunity(opp);
-
-    // Check if this strategy has been auto-disabled by the self-tuner
-    if (!selfTuner.isStrategyEnabled(opp.strategy)) {
-      log.info("Opportunity skipped: strategy auto-disabled by self-tuner", {
-        strategy: opp.strategy,
-        id: opp.id,
-      });
+  const handleSignal = async (signal: TradeSignal): Promise<void> => {
+    const snapshot = accountState.current;
+    if (!snapshot) {
+      log.warn("Signal received but no account snapshot yet", { signalId: signal.id });
       return;
     }
+    const result = await router.submit(signal, snapshot);
+    const tag = result.accepted ? "Accepted" : "Rejected";
+    const msg = `${tag}: ${signal.description}\n${result.reason}`;
+    telegram.sendAlert(`Signal ${tag}`, msg).catch(() => {});
+    discord.sendEmbed(`Signal ${tag}`, msg, result.accepted ? 0x00ff00 : 0xff8800).catch(() => {});
 
-    // Execute immediately, no waiting on notifications
-    const result = await executor.executeOpportunity(opp);
-    if (result && (result.status === "filled" || result.status === "partial")) {
-      // Fire-and-forget: notify AFTER execution, don't block the trading loop
-      const msg = `Trade: ${opp.strategy}\n${opp.description}\nFill: $${result.fillPrice} x ${result.fillSize}`;
-      telegram.sendAlert("Trade", msg).catch(() => {});
-      discord.sendEmbed("Trade", msg, 0x00ff00).catch(() => {});
+    // Hand off to the fill watcher only when a real order id came back. The
+    // dry-run path has no orderId, so the watcher would poll forever.
+    if (result.accepted && result.orderId && config.liveTrading) {
+      fillWatcher.watch(result.orderId, result.approvedSignal ?? signal, "open");
     }
   };
 
-  // Initialize strategies
-  const temporalArb = new TemporalArbStrategy(config, aggregator, polyRest, polyWs, selfTuner, empiricalModel);
-  temporalArb.setOpportunityHandler((opp) => {
-    handleOpportunity(opp).catch((err) => {
-      log.error("Error handling temporal-arb opportunity", {
-        error: err instanceof Error ? err.message : String(err),
-      });
-    });
+  orb.setSignalHandler((s) => { handleSignal(s).catch((err) => log.error("orb handler", { error: errMsg(err) })); });
+  meanReversion.setSignalHandler((s) => { handleSignal(s).catch((err) => log.error("mr handler", { error: errMsg(err) })); });
+  dte0?.setSignalHandler((s) => { handleSignal(s).catch((err) => log.error("dte0 handler", { error: errMsg(err) })); });
+
+  broker.setStreamHandler((kind, ticks) => {
+    if (kind === "equity-tick") {
+      for (const t of ticks) {
+        quotes.setEquityPrice(t.symbol, t.last);
+      }
+      orb.handleEquityTick(ticks);
+      meanReversion.handleEquityTick(ticks);
+      // Feed SPY price into regime detector for adaptive sizing.
+      for (const t of ticks) if (t.symbol === "SPY") regimeDetector.recordSpy(t.last, t.timestamp);
+      regimeDetector.refresh();
+      dte0?.handleEquityTick(ticks);
+    } else if (kind === "option-tick") {
+      for (const t of ticks) {
+        quotes.setOptionPrice(t.symbol, t.last);
+      }
+      dte0?.handleOptionTick(ticks);
+    } else if (kind === "account-activity") {
+      log.info("Broker account-activity event", { count: ticks.length });
+    }
   });
 
-  const correlatedContracts = new CorrelatedContractsStrategy(config, polyRest);
-  correlatedContracts.setOpportunityHandler((opp) => {
-    handleOpportunity(opp).catch((err) => {
-      log.error("Error handling correlated-contracts opportunity", {
-        error: err instanceof Error ? err.message : String(err),
-      });
-    });
+  log.info("Starting broker stream");
+  await broker.start();
+  await broker.subscribeAccountActivity();
+
+  // ----- Daily orchestration -----
+  await runDailyLoop({
+    config,
+    scanner,
+    llm,
+    tuner,
+    orb,
+    meanReversion,
+    dte0,
+    positionMonitor,
+    refreshAccount,
+    notifyStartup: async (msg: string) => {
+      await Promise.allSettled([
+        telegram.sendAlert("Gecko", msg),
+        discord.sendEmbed("Gecko", msg, 0x00aaff),
+      ]);
+    },
   });
-
-  // Start everything
-  log.info("Starting feeds...");
-  binance.start();
-  coinbase.start();
-  polyWs.start();
-
-  log.info("Starting strategies...");
-  await temporalArb.start();
-  correlatedContracts.start();
-
-  log.info("Starting monitoring...");
-  healthChecker.start();
-  dailyReporter.start();
-  positionCloser.start();
-  shadowTracker.start();
-
-  // Send startup notification
-  const startupMsg = [
-    `Mode: ${config.liveTrading ? "LIVE TRADING" : "SCAN ONLY"}`,
-    `Max Position: $${config.maxPositionSize}`,
-    `Max Exposure: $${config.maxTotalExposure}`,
-    `Min Spread: ${config.minSpreadThreshold}%`,
-    `Kill Switch: ${config.killSwitch ? "ACTIVE" : "inactive"}`,
-    `Wallet Balance: $${walletMonitor.getBalance().toFixed(2)}`,
-    `Open Positions: ${positions.getOpenPositionCount()} ($${positions.getTotalExposure().toFixed(2)} exposure)`,
-  ].join("\n");
-
-  await Promise.all([
-    telegram.sendAlert("Gecko Bot Started", startupMsg),
-    discord.sendEmbed("Gecko Bot Started", startupMsg, 0x0099ff),
-  ]).catch((err) => {
-    log.warn("Startup notification failed", {
-      error: err instanceof Error ? err.message : String(err),
-    });
-  });
-
-  log.info("Project Gecko fully initialized and running");
 
   // Graceful shutdown
   let shuttingDown = false;
-  const shutdown = async (signal: string): Promise<void> => {
-    if (shuttingDown) return; // Prevent double shutdown
+  const shutdown = (signal: string): void => {
+    if (shuttingDown) return;
     shuttingDown = true;
     log.info(`Shutdown signal received: ${signal}`);
-
-    // Stop strategies first (no new trades)
-    temporalArb.stop();
-    correlatedContracts.stop();
-
-    // Stop monitoring, position management, shadow tracker
-    shadowTracker.stop();
-    positionCloser.stop();
-    healthChecker.stop();
-    dailyReporter.stop();
-    walletMonitor.stop();
-    clearInterval(heartbeatTimer);
-
-    // Cancel all open orders on the exchange
-    if (config.liveTrading) {
-      await executor.cancelAllOrders().catch((err) => {
-        log.error("Failed to cancel orders on shutdown", {
-          error: err instanceof Error ? err.message : String(err),
-        });
-      });
-    }
-
-    // Stop feeds and aggregator cleanup
-    aggregator.stop();
-    binance.stop();
-    coinbase.stop();
-    polyWs.stop();
-
-    // Best-effort notification with timeout
-    try {
-      await Promise.race([
-        Promise.all([
-          telegram.sendAlert("Gecko Bot Stopped", `Shutdown: ${signal}`),
-          discord.sendEmbed("Gecko Bot Stopped", `Shutdown: ${signal}`, 0xff0000),
-        ]),
-        new Promise((resolve) => setTimeout(resolve, 5000)),
-      ]);
-    } catch {
-      log.warn("Shutdown notification failed");
-    }
-
-    log.info("Shutdown complete");
+    orb.stop();
+    meanReversion.stop();
+    dte0?.stop();
+    positionMonitor.stop();
+    fillWatcher.stop();
+    broker.stop();
+    clearInterval(accountTimer);
     process.exit(0);
   };
+  process.on("SIGINT", () => shutdown("SIGINT"));
+  process.on("SIGTERM", () => shutdown("SIGTERM"));
 
-  process.on("SIGINT", () => { shutdown("SIGINT").catch(() => process.exit(1)); });
-  process.on("SIGTERM", () => { shutdown("SIGTERM").catch(() => process.exit(1)); });
-
-  // Unhandled rejection safety net: alert and continue (PM2 will restart if needed)
   process.on("unhandledRejection", (reason) => {
     log.error("Unhandled promise rejection", {
       error: reason instanceof Error ? reason.message : String(reason),
     });
-    telegram.sendAlert("UNHANDLED REJECTION",
-      reason instanceof Error ? reason.message : String(reason),
-    ).catch(() => { /* best effort */ });
   });
+}
 
-  // Keep alive heartbeat
-  const heartbeatTimer = setInterval(() => {
-    log.debug("Heartbeat", {
-      positions: positions.getOpenPositionCount(),
-      exposure: positions.getTotalExposure(),
-    });
-  }, 300_000);
+interface DailyLoopArgs {
+  readonly config: AppConfig;
+  readonly scanner: PremarketScanner | null;
+  readonly llm: LlmClassifier;
+  readonly tuner: SelfTuner;
+  readonly orb: OrbStrategy;
+  readonly meanReversion: MeanReversionStrategy;
+  readonly dte0: Dte0SpyStrategy | null;
+  readonly positionMonitor: PositionMonitor;
+  readonly refreshAccount: () => Promise<void>;
+  readonly notifyStartup: (msg: string) => Promise<void>;
+}
+
+async function runDailyLoop(args: DailyLoopArgs): Promise<void> {
+  const { config, scanner, llm, tuner, orb, meanReversion, dte0, positionMonitor, refreshAccount, notifyStartup } = args;
+
+  positionMonitor.start();
+  await notifyStartup(`Started. live=${config.liveTrading} orb=${config.orbEnabled} dte0=${config.dte0Enabled}`);
+
+  // Main day loop. We don't aggressively sleep; let timers and stream handlers
+  // do the work. This loop just orchestrates the daily phase transitions.
+  let scannedToday: string | null = null;
+  let startedToday: string | null = null;
+
+  // Run forever. Daily phases are gated by ET time.
+  while (true) {
+    const p = etParts();
+    const today = `${p.date}`;
+    const minsOfDay = p.hour * 60 + p.minute;
+
+    if (!isWeekdayET()) {
+      await sleep(60_000);
+      continue;
+    }
+
+    // Premarket scan window: 09:00-09:25 ET.
+    if (scanner && config.orbEnabled && scannedToday !== today && minsOfDay >= 9 * 60 && minsOfDay < 9 * 60 + 25) {
+      try {
+        log.info("Premarket scan starting");
+        const raw = await scanner.scan();
+        const top = raw.slice(0, 20);
+
+        // LLM classification, gated by self-tuner score floor.
+        const classifications = await llm.classify(top);
+        const floor = tuner.getLlmScoreFloor();
+        const scored = top
+          .map((c, i) => ({ candidate: c, result: classifications[i] }))
+          .filter((p) => p.result.score >= floor && p.result.direction !== "AVOID")
+          .slice(0, 15);
+
+        log.info("Premarket scan + classification complete", {
+          rawCount: raw.length,
+          topConsidered: top.length,
+          surviving: scored.length,
+          floor,
+        });
+
+        orb.loadCandidates(scored.map((p) => p.candidate));
+        scannedToday = today;
+      } catch (err) {
+        log.error("Premarket scan failed", { error: errMsg(err) });
+      }
+    }
+
+    // Strategy start at 09:30 ET (or thereabouts).
+    if (startedToday !== today && minsOfDay >= 9 * 60 + 30 && minsOfDay < 14 * 60) {
+      await refreshAccount();
+      if (config.orbEnabled) {
+        await orb.start().catch((err) => log.error("orb start failed", { error: errMsg(err) }));
+        await meanReversion.start().catch((err) => log.error("mr start failed", { error: errMsg(err) }));
+      }
+      if (dte0 && config.dte0Enabled) {
+        await dte0.start().catch((err) => log.error("dte0 start failed", { error: errMsg(err) }));
+      }
+      startedToday = today;
+    }
+
+    // End-of-day stop at 16:00 ET.
+    if (startedToday === today && minsOfDay >= 16 * 60) {
+      orb.stop();
+      meanReversion.stop();
+      dte0?.stop();
+      startedToday = null;
+    }
+
+    await sleep(30_000);
+  }
+}
+
+function errMsg(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
+function resolutionToMs(res: "1m" | "5m" | "15m" | "60m"): number {
+  switch (res) {
+    case "1m": return 60_000;
+    case "5m": return 5 * 60_000;
+    case "15m": return 15 * 60_000;
+    case "60m": return 60 * 60_000;
+  }
 }
 
 main().catch((err) => {

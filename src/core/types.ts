@@ -1,204 +1,5 @@
-// All shared interfaces and types for Project Gecko
-
-// -- Price and Market Data --
-
-export interface SpotPrice {
-  readonly symbol: string;       // "BTC" | "ETH"
-  readonly price: number;
-  readonly timestamp: number;    // Unix ms
-  readonly source: "binance" | "coinbase";
-}
-
-export interface PriceState {
-  readonly binance: SpotPrice | null;
-  readonly coinbase: SpotPrice | null;
-  readonly confirmedPrice: number | null;   // Only set when both feeds agree
-  readonly lastUpdate: number;
-}
-
-export interface PolymarketToken {
-  readonly tokenId: string;
-  readonly outcome: "YES" | "NO";
-  readonly price: number;
-  readonly winner: boolean;
-}
-
-export interface PolymarketMarket {
-  readonly conditionId: string;
-  readonly questionId: string;
-  readonly question: string;
-  readonly slug: string;
-  readonly tokens: readonly PolymarketToken[];
-  readonly active: boolean;
-  readonly closed: boolean;
-  readonly negRisk: boolean;
-  readonly endDateIso: string;
-  readonly volume: number;
-  readonly liquidity: number;
-  readonly eventSlug: string;
-  readonly eventTitle: string;
-}
-
-export interface OrderBookLevel {
-  readonly price: number;
-  readonly size: number;
-}
-
-export interface OrderBookSnapshot {
-  readonly tokenId: string;
-  readonly bids: readonly OrderBookLevel[];
-  readonly asks: readonly OrderBookLevel[];
-  readonly bestBid: number;
-  readonly bestAsk: number;
-  readonly midpoint: number;
-  readonly spread: number;
-  readonly depth: number;        // Total USDC depth
-  readonly timestamp: number;
-}
-
-export interface ExecutableDepth {
-  readonly maxSize: number;      // Max USDC fillable within slippage
-  readonly levels: number;       // Number of book levels consumed
-  readonly worstPrice: number;   // Worst price level touched
-  readonly midpoint: number;     // Midpoint at time of calculation
-  readonly slippagePct: number;  // Actual slippage at maxSize
-}
-
-// -- Trading --
-
-export type TradeSide = "BUY" | "SELL";
-export type OrderType = "GTC" | "FOK" | "GTD" | "FAK";
-
-export interface TradeParams {
-  readonly tokenId: string;
-  readonly side: TradeSide;
-  readonly price: number;
-  readonly size: number;          // USDC amount
-  readonly orderType: OrderType;
-  readonly conditionId: string;
-  readonly negRisk: boolean;
-}
-
-export interface TradeResult {
-  readonly orderId: string;
-  readonly status: "filled" | "partial" | "rejected" | "error";
-  readonly fillPrice: number;
-  readonly fillSize: number;
-  readonly fees: number;
-  readonly timestamp: number;
-  readonly error?: string;
-}
-
-export interface Position {
-  readonly conditionId: string;
-  readonly tokenId: string;
-  readonly side: TradeSide;
-  readonly entryPrice: number;
-  readonly size: number;
-  readonly openTimestamp: number;
-  readonly market: string;        // question/description
-  readonly strategy: StrategyType;
-  readonly opportunityMetadata: Record<string, unknown>;
-  currentPrice: number;
-  unrealizedPnl: number;
-}
-
-export interface TradeRecord {
-  readonly ts: string;
-  readonly market: string;
-  readonly conditionId: string;
-  readonly side: TradeSide;
-  readonly tokenId: string;
-  readonly price: number;
-  readonly size: number;
-  readonly orderId: string;
-  readonly status: string;
-  readonly fillPrice: number;
-  readonly fees: number;
-  readonly pnl: number | null;
-  readonly strategy: StrategyType;
-}
-
-// -- Strategies --
-
-export type StrategyType = "temporal-arb" | "cross-platform" | "correlated-contracts";
-
-export interface Opportunity {
-  readonly id: string;
-  readonly strategy: StrategyType;
-  readonly timestamp: number;
-  readonly description: string;
-  readonly expectedSpread: number; // percentage
-  readonly confidence: number;     // 0.0 - 1.0
-  readonly params: TradeParams;
-  readonly metadata: Record<string, unknown>;
-}
-
-export interface StrategyState {
-  readonly enabled: boolean;
-  readonly lastScan: number;
-  readonly opportunitiesFound: number;
-  readonly tradesExecuted: number;
-}
-
-// -- Feed Status --
-
-export type FeedStatus = "connected" | "connecting" | "disconnected" | "error";
-
-export interface FeedHealth {
-  readonly name: string;
-  readonly status: FeedStatus;
-  readonly lastMessage: number;   // Unix ms
-  readonly reconnectCount: number;
-  readonly error?: string;
-}
-
-// -- Config --
-
-export interface AppConfig {
-  // Wallet
-  readonly privateKey: string;
-  readonly walletAddress: string;
-  readonly funderAddress: string;
-  readonly signatureType: number;
-
-  // Polymarket
-  readonly polymarketApiKey: string;
-  readonly polymarketSecret: string;
-  readonly polymarketPassphrase: string;
-  readonly polymarketClobUrl: string;
-  readonly polymarketChainId: number;
-
-  // Polygon RPC
-  readonly polygonRpcUrl: string;
-  readonly polygonWsUrl: string;
-
-  // Feeds
-  readonly binanceWsUrl: string;
-  readonly coinbaseWsUrl: string;
-
-  // Kalshi (optional)
-  readonly kalshiApiKey: string;
-  readonly kalshiPrivateKeyPath: string;
-  readonly kalshiApiUrl: string;
-
-  // Trading
-  readonly minSpreadThreshold: number;
-  readonly maxPositionSize: number;
-  readonly maxTotalExposure: number;
-  readonly maxOpenPositions: number;
-  readonly minLiquidity: number;
-  readonly killSwitch: boolean;
-  readonly liveTrading: boolean;
-
-  // Monitoring
-  readonly telegramBotToken: string;
-  readonly telegramChatId: string;
-  readonly discordWebhookUrl: string;
-
-  // Logging
-  readonly logLevel: LogLevel;
-}
+// Shared types for the Gecko equity/option trading bot.
+// Broker-agnostic where possible; Schwab-specific shapes live under brokers/schwab/.
 
 // -- Logging --
 
@@ -212,46 +13,212 @@ export interface LogEntry {
   readonly data?: Record<string, unknown>;
 }
 
-// -- WebSocket --
+// -- WebSocket plumbing --
 
 export interface WsManagerConfig {
   readonly url: string;
   readonly name: string;
-  readonly pingInterval?: number;     // ms, default 30000
-  readonly pongTimeout?: number;      // ms, default 10000
-  readonly maxReconnectDelay?: number; // ms, default 60000
-  readonly initialReconnectDelay?: number; // ms, default 1000
+  readonly pingInterval?: number;
+  readonly pongTimeout?: number;
+  readonly maxReconnectDelay?: number;
+  readonly initialReconnectDelay?: number;
 }
 
-// -- Monitoring --
+export type FeedStatus = "connected" | "connecting" | "disconnected" | "error";
 
-export interface DailySummary {
-  readonly date: string;          // YYYY-MM-DD
-  readonly totalTrades: number;
-  readonly winningTrades: number;
-  readonly losingTrades: number;
-  readonly totalPnl: number;
-  readonly totalFees: number;
-  readonly netPnl: number;
-  readonly maxDrawdown: number;
-  readonly opportunities: number;
-  readonly strategies: Record<StrategyType, StrategyState>;
+export interface FeedHealth {
+  readonly name: string;
+  readonly status: FeedStatus;
+  readonly lastMessage: number;
+  readonly reconnectCount: number;
+  readonly error?: string;
 }
 
-export interface FillStats {
-  fokAttempts: number;
-  fokFills: number;
-  gtcAttempts: number;
-  gtcFills: number;
-  gtcCancelled: number;
+// -- Instrument basics --
+
+export type AssetClass = "equity" | "option";
+export type OptionType = "CALL" | "PUT";
+
+export interface EquityInstrument {
+  readonly assetClass: "equity";
+  readonly symbol: string;
 }
 
-export interface HealthStatus {
+export interface OptionInstrument {
+  readonly assetClass: "option";
+  readonly underlying: string;
+  readonly expiration: string;       // YYYY-MM-DD
+  readonly strike: number;
+  readonly optionType: OptionType;
+  readonly osiSymbol: string;        // OCC OSI 21-character symbol, e.g. "SPY   260612C00500000"
+}
+
+export type Instrument = EquityInstrument | OptionInstrument;
+
+// -- Market data --
+
+export interface Quote {
+  readonly symbol: string;            // equity ticker or OSI
+  readonly bid: number;
+  readonly ask: number;
+  readonly last: number;
+  readonly bidSize: number;
+  readonly askSize: number;
+  readonly timestamp: number;         // Unix ms
+}
+
+export interface Bar {
+  readonly symbol: string;
   readonly timestamp: number;
-  readonly feeds: readonly FeedHealth[];
-  readonly positions: number;
-  readonly totalExposure: number;
-  readonly walletBalance: number;
+  readonly open: number;
+  readonly high: number;
+  readonly low: number;
+  readonly close: number;
+  readonly volume: number;
+}
+
+// -- Orders --
+
+export type OrderSide = "BUY" | "SELL" | "BUY_TO_OPEN" | "SELL_TO_OPEN" | "BUY_TO_CLOSE" | "SELL_TO_CLOSE";
+export type OrderType = "MARKET" | "LIMIT" | "STOP" | "STOP_LIMIT";
+export type TimeInForce = "DAY" | "GTC" | "IOC" | "FOK";
+export type OrderStatus = "pending" | "working" | "filled" | "partial" | "cancelled" | "rejected" | "expired";
+
+export interface OrderRequest {
+  readonly instrument: Instrument;
+  readonly side: OrderSide;
+  readonly quantity: number;          // shares or contracts
+  readonly orderType: OrderType;
+  readonly timeInForce: TimeInForce;
+  readonly limitPrice?: number;
+  readonly stopPrice?: number;
+}
+
+export interface OrderResult {
+  readonly orderId: string;
+  readonly status: OrderStatus;
+  readonly filledQuantity: number;
+  readonly avgFillPrice: number;
+  readonly fees: number;
+  readonly timestamp: number;
+  readonly error?: string;
+}
+
+// -- Positions --
+
+export interface Position {
+  readonly instrument: Instrument;
+  readonly side: "LONG" | "SHORT";
+  readonly entryPrice: number;
+  readonly quantity: number;
+  readonly openTimestamp: number;
+  readonly strategy: StrategyType;
+  readonly metadata: Record<string, unknown>;
+  currentPrice: number;
+  unrealizedPnl: number;
+}
+
+// -- Strategies --
+
+export type StrategyType = "orb" | "dte0-spy" | "mean-reversion" | "pairs-trader" | "earnings-catalyst";
+
+export interface SetupCandidate {
+  readonly instrument: Instrument;
+  readonly strategy: StrategyType;
+  readonly timestamp: number;
+  readonly score: number;             // 0-1, strategy-specific quality score
+  readonly metadata: Record<string, unknown>;
+}
+
+export interface TradeSignal {
+  readonly id: string;
+  readonly strategy: StrategyType;
+  readonly timestamp: number;
+  readonly description: string;
+  readonly order: OrderRequest;
+  readonly stopPrice: number;
+  readonly takeProfitPrice: number;
+  readonly riskUsd: number;
+  readonly rewardUsd: number;
+  readonly metadata: Record<string, unknown>;
+}
+
+// -- Account / risk --
+
+export interface AccountSnapshot {
+  readonly cashBalance: number;
+  readonly buyingPower: number;
+  readonly dayTradeBuyingPower: number;
+  readonly equity: number;
+  readonly dayTradeCount: number;     // rolling 5-day day-trade count
+  readonly timestamp: number;
+}
+
+// -- Config --
+
+export interface AppConfig {
+  // Schwab API
+  readonly schwabClientId: string;
+  readonly schwabClientSecret: string;
+  readonly schwabRedirectUri: string;
+  readonly schwabAccountHash: string;          // account number hash for trading
+
+  // Broker selection
+  readonly broker: "schwab" | "ibkr";
+
+  // IBKR
+  readonly ibkrBaseUrl: string;          // default https://localhost:5000/v1/api
+
+  // LLM (Anthropic Claude). Two model knobs — the brain uses the more capable
+  // (and slightly more expensive) Opus tier because brain decisions move
+  // trades. News reader + premarket classifier use Sonnet — cheaper, higher
+  // volume, lower stakes per call.
+  readonly anthropicApiKey: string;
+  readonly llmEnabled: boolean;
+  readonly llmModel: string;             // default Sonnet — used by news reader + classifier
+  readonly llmModelBrain: string;        // default Opus 4.7 — used by AgentBrain
+
+  // Agent brain (Claude validates EVERY trade with full market context)
+  readonly agentBrainEnabled: boolean;
+  readonly agentBrainMinConviction: number;    // 0-100, default 70
+  readonly agentBrainMinConvictionLong: number;   // override for LONG, default 60
+  readonly agentBrainMinConvictionShort: number;  // override for SHORT, default 75
+
+  // Kelly-bounded sizing
+  readonly kellyEnabled: boolean;
+  readonly kellyFraction: number;              // 0.25 = quarter-Kelly (conservative)
+
+  // Regime-aware sizing
+  readonly regimeAwareEnabled: boolean;
+
+  // Trading mode
+  readonly liveTrading: boolean;
   readonly killSwitch: boolean;
-  readonly uptime: number;
+
+  // Risk
+  readonly maxRiskPerTradePct: number;         // % of account risked per trade (e.g. 1.0)
+  readonly maxConcurrentEquityPositions: number;
+  readonly maxConcurrentOptionPositions: number;
+  readonly dailyLossLimitPct: number;          // halt for the day at this drawdown
+  readonly maxDayTrades: number;               // hard cap per day
+
+  // Engine A (ORB equity)
+  readonly orbEnabled: boolean;
+  readonly orbMinGapPct: number;
+  readonly orbMinPremarketVolume: number;
+  readonly orbMinPrice: number;
+  readonly orbMaxPrice: number;
+
+  // Engine B (0DTE SPY)
+  readonly dte0Enabled: boolean;
+  readonly dte0MaxContractsPerTrade: number;
+  readonly dte0MaxTradesPerDay: number;
+
+  // Notifications
+  readonly telegramBotToken: string;
+  readonly telegramChatId: string;
+  readonly discordWebhookUrl: string;
+
+  // Logging
+  readonly logLevel: LogLevel;
 }

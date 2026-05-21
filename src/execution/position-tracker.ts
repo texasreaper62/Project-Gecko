@@ -1,200 +1,137 @@
-import * as fs from "node:fs";
-import * as path from "node:path";
+// In-memory position tracker. Owns the source of truth for what we are
+// holding RIGHT NOW (from our perspective). Schwab is the actual authority;
+// we reconcile on startup and via ACCT_ACTIVITY pushes.
+
 import { createLogger } from "../core/logger.js";
-import type { Position, TradeResult, TradeParams, TradeRecord, StrategyType } from "../core/types.js";
-import { appendJsonl, readJsonl } from "../utils/persistence.js";
+import { appendJsonl } from "../utils/persistence.js";
 import { nowIso } from "../utils/time.js";
+import type { Instrument, Position, StrategyType } from "../core/types.js";
 
 const log = createLogger("position-tracker");
 
-const POSITIONS_FILE = "data/positions.jsonl";
+const POSITIONS_LOG = "data/positions.jsonl";
+const OUTCOMES_LOG = "data/outcomes.jsonl";
+
+export type OpenHandler = (position: Position) => void;
+export type CloseHandler = (position: Position, exitPrice: number, pnl: number, fees: number) => void;
 
 export class PositionTracker {
-  private readonly positions: Map<string, Position> = new Map();
+  private positions: Map<string, Position> = new Map();
+  private openHandler: OpenHandler | null = null;
+  private closeHandler: CloseHandler | null = null;
 
-  constructor() {
-    this.loadOpenPositions();
-  }
+  setOpenHandler(h: OpenHandler): void { this.openHandler = h; }
+  setCloseHandler(h: CloseHandler): void { this.closeHandler = h; }
 
-  getOpenPositionCount(): number {
-    return this.positions.size;
-  }
-
-  getTotalExposure(): number {
-    let total = 0;
-    for (const pos of this.positions.values()) {
-      total += pos.size;
+  open(args: {
+    readonly instrument: Instrument;
+    readonly side: "LONG" | "SHORT";
+    readonly entryPrice: number;
+    readonly quantity: number;
+    readonly strategy: StrategyType;
+    readonly metadata: Record<string, unknown>;
+  }): Position {
+    const key = instrumentKey(args.instrument);
+    const position: Position = {
+      instrument: args.instrument,
+      side: args.side,
+      entryPrice: args.entryPrice,
+      quantity: args.quantity,
+      openTimestamp: Date.now(),
+      strategy: args.strategy,
+      metadata: args.metadata,
+      currentPrice: args.entryPrice,
+      unrealizedPnl: 0,
+    };
+    this.positions.set(key, position);
+    appendJsonl(POSITIONS_LOG, { ts: nowIso(), event: "open", key, position });
+    log.info("Position opened", {
+      key,
+      side: position.side,
+      qty: position.quantity,
+      entry: position.entryPrice,
+    });
+    try {
+      this.openHandler?.(position);
+    } catch (err) {
+      log.error("open handler threw", { error: err instanceof Error ? err.message : String(err) });
     }
-    return total;
+    return position;
   }
 
-  getPositions(): Position[] {
+  updatePrice(instrument: Instrument, currentPrice: number): void {
+    const key = instrumentKey(instrument);
+    const pos = this.positions.get(key);
+    if (!pos) return;
+    pos.currentPrice = currentPrice;
+    const directionMul = pos.side === "LONG" ? 1 : -1;
+    const contractMul = instrument.assetClass === "option" ? 100 : 1;
+    pos.unrealizedPnl = (currentPrice - pos.entryPrice) * pos.quantity * directionMul * contractMul;
+  }
+
+  close(instrument: Instrument, exitPrice: number, fees: number): { pnl: number; position: Position } | null {
+    const key = instrumentKey(instrument);
+    const pos = this.positions.get(key);
+    if (!pos) return null;
+
+    const directionMul = pos.side === "LONG" ? 1 : -1;
+    const contractMul = instrument.assetClass === "option" ? 100 : 1;
+    const pnl = (exitPrice - pos.entryPrice) * pos.quantity * directionMul * contractMul - fees;
+
+    this.positions.delete(key);
+    appendJsonl(OUTCOMES_LOG, {
+      ts: nowIso(),
+      key,
+      strategy: pos.strategy,
+      side: pos.side,
+      qty: pos.quantity,
+      entryPrice: pos.entryPrice,
+      exitPrice,
+      fees,
+      pnl,
+      holdMs: Date.now() - pos.openTimestamp,
+      metadata: pos.metadata,
+    });
+    log.info("Position closed", {
+      key,
+      pnl: pnl.toFixed(2),
+      holdMs: Date.now() - pos.openTimestamp,
+    });
+    try {
+      this.closeHandler?.(pos, exitPrice, pnl, fees);
+    } catch (err) {
+      log.error("close handler threw", { error: err instanceof Error ? err.message : String(err) });
+    }
+    return { pnl, position: pos };
+  }
+
+  get(instrument: Instrument): Position | null {
+    return this.positions.get(instrumentKey(instrument)) ?? null;
+  }
+
+  hasInstrument(instrument: Instrument): boolean {
+    return this.positions.has(instrumentKey(instrument));
+  }
+
+  all(): readonly Position[] {
     return Array.from(this.positions.values());
   }
 
-  getPosition(tokenId: string): Position | null {
-    return this.positions.get(tokenId) ?? null;
-  }
-
-  getPositionByCondition(conditionId: string): Position | null {
-    for (const pos of this.positions.values()) {
-      if (pos.conditionId === conditionId) return pos;
+  countByAssetClass(assetClass: "equity" | "option"): number {
+    let n = 0;
+    for (const p of this.positions.values()) {
+      if (p.instrument.assetClass === assetClass) n++;
     }
-    return null;
+    return n;
   }
 
-  openPosition(
-    params: TradeParams,
-    result: TradeResult,
-    marketQuestion: string,
-    strategy: StrategyType,
-    opportunityMetadata?: Record<string, unknown>,
-  ): void {
-    const pos: Position = {
-      conditionId: params.conditionId,
-      tokenId: params.tokenId,
-      side: params.side,
-      entryPrice: result.fillPrice,
-      size: result.fillSize,
-      openTimestamp: Date.now(),
-      market: marketQuestion,
-      strategy,
-      opportunityMetadata: opportunityMetadata ?? {},
-      currentPrice: result.fillPrice,
-      unrealizedPnl: 0,
-    };
-
-    this.positions.set(params.tokenId, pos);
-
-    log.info("Position opened", {
-      tokenId: params.tokenId,
-      side: params.side,
-      price: result.fillPrice,
-      size: result.fillSize,
-    });
-
-    // Record the trade (open)
-    const record: TradeRecord = {
-      ts: nowIso(),
-      market: marketQuestion,
-      conditionId: params.conditionId,
-      side: params.side,
-      tokenId: params.tokenId,
-      price: params.price,
-      size: params.size,
-      orderId: result.orderId,
-      status: result.status,
-      fillPrice: result.fillPrice,
-      fees: result.fees,
-      pnl: null,
-      strategy,
-    };
-
-    appendJsonl("data/trades.jsonl", record);
-    this.persistOpenPositions();
-  }
-
-  closePosition(tokenId: string, exitPrice: number, fees: number): number {
-    const pos = this.positions.get(tokenId);
-    if (!pos) {
-      log.warn("Attempted to close non-existent position", { tokenId });
-      return 0;
-    }
-
-    // P&L calculation: (exit - entry) * size for BUY, (entry - exit) * size for SELL
-    const pnl = pos.side === "BUY"
-      ? (exitPrice - pos.entryPrice) * pos.size - fees
-      : (pos.entryPrice - exitPrice) * pos.size - fees;
-
-    this.positions.delete(tokenId);
-
-    log.info("Position closed", {
-      tokenId,
-      entryPrice: pos.entryPrice,
-      exitPrice,
-      size: pos.size,
-      pnl: pnl.toFixed(4),
-    });
-
-    // Record the close event with realized P&L
-    const closeRecord: TradeRecord = {
-      ts: nowIso(),
-      market: pos.market,
-      conditionId: pos.conditionId,
-      side: pos.side === "BUY" ? "SELL" : "BUY",
-      tokenId: pos.tokenId,
-      price: exitPrice,
-      size: pos.size,
-      orderId: "",
-      status: "closed",
-      fillPrice: exitPrice,
-      fees,
-      pnl,
-      strategy: pos.strategy,
-    };
-
-    appendJsonl("data/trades.jsonl", closeRecord);
-    this.persistOpenPositions();
-
-    return pnl;
-  }
-
-  updatePrice(tokenId: string, currentPrice: number): void {
-    const pos = this.positions.get(tokenId);
-    if (!pos) return;
-
-    pos.currentPrice = currentPrice;
-    pos.unrealizedPnl = pos.side === "BUY"
-      ? (currentPrice - pos.entryPrice) * pos.size
-      : (pos.entryPrice - currentPrice) * pos.size;
-  }
-
-  getTotalUnrealizedPnl(): number {
+  unrealizedPnl(): number {
     let total = 0;
-    for (const pos of this.positions.values()) {
-      total += pos.unrealizedPnl;
-    }
+    for (const p of this.positions.values()) total += p.unrealizedPnl;
     return total;
   }
+}
 
-  private persistOpenPositions(): void {
-    // Atomic write: write to temp file then rename (prevents corruption on concurrent calls)
-    try {
-      const dir = path.dirname(POSITIONS_FILE);
-      if (!fs.existsSync(dir)) {
-        fs.mkdirSync(dir, { recursive: true });
-      }
-      const lines = Array.from(this.positions.values())
-        .map((p) => JSON.stringify(p))
-        .join("\n");
-      const tmpFile = POSITIONS_FILE + ".tmp";
-      fs.writeFileSync(tmpFile, lines ? lines + "\n" : "", "utf-8");
-      fs.renameSync(tmpFile, POSITIONS_FILE);
-    } catch (err) {
-      log.error("Failed to persist open positions", {
-        error: err instanceof Error ? err.message : String(err),
-      });
-    }
-  }
-
-  private loadOpenPositions(): void {
-    try {
-      const positions = readJsonl<Position>(POSITIONS_FILE);
-      for (const pos of positions) {
-        if (pos.tokenId && pos.conditionId) {
-          this.positions.set(pos.tokenId, pos);
-        }
-      }
-      if (positions.length > 0) {
-        log.info("Restored open positions from disk", {
-          count: positions.length,
-          exposure: this.getTotalExposure().toFixed(2),
-        });
-      }
-    } catch (err) {
-      log.warn("Could not load open positions", {
-        error: err instanceof Error ? err.message : String(err),
-      });
-    }
-  }
+function instrumentKey(i: Instrument): string {
+  return i.assetClass === "equity" ? `EQ:${i.symbol}` : `OPT:${i.osiSymbol}`;
 }

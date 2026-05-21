@@ -13,19 +13,8 @@ function required(name: string): string {
 
 function optional(name: string, fallback: string): string {
   const val = process.env[name];
-  if (!val || val.trim() === "") {
-    return fallback;
-  }
+  if (!val || val.trim() === "") return fallback;
   return val.trim();
-}
-
-function requiredNumber(name: string): number {
-  const raw = required(name);
-  const num = Number(raw);
-  if (Number.isNaN(num)) {
-    throw new Error(`Environment variable ${name} must be a number, got: ${raw}`);
-  }
-  return num;
 }
 
 function optionalNumber(name: string, fallback: number): number {
@@ -60,57 +49,70 @@ function validateLogLevel(val: string): LogLevel {
   return val as LogLevel;
 }
 
-function validateHex(name: string, value: string): string {
-  if (!/^0x[0-9a-fA-F]+$/.test(value)) {
-    throw new Error(`${name} must be a hex string starting with 0x (got: ${value.slice(0, 6)}...)`);
-  }
-  return value;
+function validateBroker(val: string): "schwab" | "ibkr" {
+  if (val === "schwab" || val === "ibkr") return val;
+  throw new Error(`BROKER must be 'schwab' or 'ibkr', got: ${val}`);
 }
 
 export function loadConfig(): AppConfig {
-  const privateKey = required("PRIVATE_KEY");
-  validateHex("PRIVATE_KEY", privateKey);
-
-  const walletAddress = required("WALLET_ADDRESS");
-  validateHex("WALLET_ADDRESS", walletAddress);
-
+  const broker = validateBroker(optional("BROKER", "ibkr"));
+  const isSchwab = broker === "schwab";
   return {
-    // Wallet
-    privateKey,
-    walletAddress,
-    funderAddress: optional("FUNDER_ADDRESS", ""),
-    signatureType: optionalNumber("SIGNATURE_TYPE", 0),
+    // Broker selection
+    broker,
 
-    // Polymarket
-    polymarketApiKey: required("POLYMARKET_API_KEY"),
-    polymarketSecret: required("POLYMARKET_SECRET"),
-    polymarketPassphrase: required("POLYMARKET_PASSPHRASE"),
-    polymarketClobUrl: optional("POLYMARKET_CLOB_URL", "https://clob.polymarket.com"),
-    polymarketChainId: optionalNumber("POLYMARKET_CHAIN_ID", 137),
+    // Schwab API (required only when BROKER=schwab)
+    schwabClientId: isSchwab ? required("SCHWAB_CLIENT_ID") : optional("SCHWAB_CLIENT_ID", ""),
+    schwabClientSecret: isSchwab ? required("SCHWAB_CLIENT_SECRET") : optional("SCHWAB_CLIENT_SECRET", ""),
+    schwabRedirectUri: optional("SCHWAB_REDIRECT_URI", "https://localhost:8443/callback"),
+    schwabAccountHash: isSchwab ? required("SCHWAB_ACCOUNT_HASH") : optional("SCHWAB_ACCOUNT_HASH", ""),
 
-    // Polygon RPC
-    polygonRpcUrl: required("POLYGON_RPC_URL"),
-    polygonWsUrl: optional("POLYGON_WS_URL", ""),
+    // IBKR
+    ibkrBaseUrl: optional("IBKR_BASE_URL", "https://localhost:5000/v1/api"),
 
-    // Feeds
-    binanceWsUrl: optional("BINANCE_WS_URL", "wss://stream.binance.us:9443/stream?streams=btcusdt@trade/ethusdt@trade"),
-    coinbaseWsUrl: optional("COINBASE_WS_URL", "wss://ws-feed.exchange.coinbase.com"),
+    // LLM
+    anthropicApiKey: optional("ANTHROPIC_API_KEY", ""),
+    llmEnabled: optionalBool("LLM_ENABLED", true),
+    llmModel: optional("LLM_MODEL", "claude-sonnet-4-6"),
+    llmModelBrain: optional("LLM_MODEL_BRAIN", "claude-opus-4-7"),
 
-    // Kalshi (optional for now)
-    kalshiApiKey: optional("KALSHI_API_KEY", ""),
-    kalshiPrivateKeyPath: optional("KALSHI_PRIVATE_KEY_PATH", ""),
-    kalshiApiUrl: optional("KALSHI_API_URL", "https://api.elections.kalshi.com/trade-api/v2"),
+    // Agent brain
+    agentBrainEnabled: optionalBool("AGENT_BRAIN_ENABLED", true),
+    agentBrainMinConviction: boundedNumber("AGENT_BRAIN_MIN_CONVICTION", 70, 0, 100),
+    agentBrainMinConvictionLong: boundedNumber("AGENT_BRAIN_MIN_CONVICTION_LONG", 60, 0, 100),
+    agentBrainMinConvictionShort: boundedNumber("AGENT_BRAIN_MIN_CONVICTION_SHORT", 75, 0, 100),
 
-    // Trading (with bounds validation)
-    minSpreadThreshold: boundedNumber("MIN_SPREAD_THRESHOLD", 5.0, 0.1, 50),
-    maxPositionSize: boundedNumber("MAX_POSITION_SIZE", 50, 1, 10_000),
-    maxTotalExposure: boundedNumber("MAX_TOTAL_EXPOSURE", 1000, 10, 100_000),
-    maxOpenPositions: boundedNumber("MAX_OPEN_POSITIONS", 5, 1, 50),
-    minLiquidity: boundedNumber("MIN_LIQUIDITY", 500, 0, 100_000),
-    killSwitch: optionalBool("KILL_SWITCH", false),
+    // Kelly sizing
+    kellyEnabled: optionalBool("KELLY_ENABLED", false),
+    kellyFraction: boundedNumber("KELLY_FRACTION", 0.25, 0.0, 1.0),
+
+    // Regime-aware sizing
+    regimeAwareEnabled: optionalBool("REGIME_AWARE_ENABLED", true),
+
+    // Mode
     liveTrading: optionalBool("LIVE_TRADING", false),
+    killSwitch: optionalBool("KILL_SWITCH", false),
 
-    // Monitoring
+    // Risk
+    maxRiskPerTradePct: boundedNumber("MAX_RISK_PER_TRADE_PCT", 1.0, 0.1, 5.0),
+    maxConcurrentEquityPositions: boundedNumber("MAX_CONCURRENT_EQUITY_POSITIONS", 3, 1, 20),
+    maxConcurrentOptionPositions: boundedNumber("MAX_CONCURRENT_OPTION_POSITIONS", 2, 1, 10),
+    dailyLossLimitPct: boundedNumber("DAILY_LOSS_LIMIT_PCT", 3.0, 0.5, 20.0),
+    maxDayTrades: boundedNumber("MAX_DAY_TRADES", 4, 1, 20),
+
+    // Engine A (ORB)
+    orbEnabled: optionalBool("ORB_ENABLED", true),
+    orbMinGapPct: boundedNumber("ORB_MIN_GAP_PCT", 2.0, 0.5, 20.0),
+    orbMinPremarketVolume: boundedNumber("ORB_MIN_PREMARKET_VOLUME", 500_000, 10_000, 100_000_000),
+    orbMinPrice: boundedNumber("ORB_MIN_PRICE", 5.0, 1.0, 1000.0),
+    orbMaxPrice: boundedNumber("ORB_MAX_PRICE", 50.0, 5.0, 10_000.0),
+
+    // Engine B (0DTE SPY)
+    dte0Enabled: optionalBool("DTE0_ENABLED", true),
+    dte0MaxContractsPerTrade: boundedNumber("DTE0_MAX_CONTRACTS_PER_TRADE", 1, 1, 10),
+    dte0MaxTradesPerDay: boundedNumber("DTE0_MAX_TRADES_PER_DAY", 2, 1, 10),
+
+    // Notifications
     telegramBotToken: optional("TELEGRAM_BOT_TOKEN", ""),
     telegramChatId: optional("TELEGRAM_CHAT_ID", ""),
     discordWebhookUrl: optional("DISCORD_WEBHOOK_URL", ""),
