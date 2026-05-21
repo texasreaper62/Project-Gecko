@@ -32,6 +32,7 @@ import type {
 import type { Strategy } from "./base.js";
 import type { GapCandidate } from "../scanner/premarket.js";
 import type { Broker, NormalizedTick } from "../brokers/broker.js";
+import type { EconomicCalendar } from "../intelligence/economic-calendar.js";
 
 const log = createLogger("orb");
 
@@ -90,9 +91,23 @@ export class OrbStrategy implements Strategy {
     this.getAccount = fn;
   }
 
+  // Optional economic calendar; when present, ORB skips signals on macro days.
+  private calendar: EconomicCalendar | null = null;
+  setEconomicCalendar(cal: EconomicCalendar): void {
+    this.calendar = cal;
+  }
+
   // Seed with today's candidates from the premarket scanner. Should be called
   // before 09:30 ET. Subscribes to live ticks for each.
   loadCandidates(candidates: readonly GapCandidate[]): void {
+    // Skip the day entirely if it's a high-impact macro release day.
+    if (this.calendar?.shouldSkipOrb()) {
+      log.info("ORB skipping macro release day", {
+        events: this.calendar.eventsOn().map((e) => e.type),
+      });
+      this.candidates.clear();
+      return;
+    }
     this.candidates.clear();
     const symbols: string[] = [];
     for (const c of candidates) {

@@ -35,6 +35,7 @@ import { MeanReversionStrategy } from "../strategies/mean-reversion.js";
 import { PairsTraderStrategy } from "../strategies/pairs-trader.js";
 import { EarningsCatalystStrategy } from "../strategies/earnings-catalyst.js";
 import { SectorStrength, SECTOR_ETFS } from "../intelligence/sector-strength.js";
+import { EconomicCalendar } from "../intelligence/economic-calendar.js";
 import { DailyStop } from "../risk/daily-stop.js";
 import { PdtTracker } from "../risk/pdt-tracker.js";
 import { RiskManager } from "../risk/risk-manager.js";
@@ -224,6 +225,7 @@ async function main(): Promise<void> {
 
   const orb = new OrbStrategy(config, broker);
   orb.setAccountProvider(() => accountSnapshot());
+  orb.setEconomicCalendar(new EconomicCalendar());
 
   const meanReversion = new MeanReversionStrategy(config, broker, ["SPY", "QQQ"]);
   meanReversion.setAccountProvider(() => accountSnapshot());
