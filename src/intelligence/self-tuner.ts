@@ -87,9 +87,17 @@ interface TuningState {
   strategies: Record<string, StrategyStats>;
 }
 
+// Hook called after every outcome so external components (ConvictionSizer)
+// can recompute their adaptive parameters.
+export type OutcomeListener = (outcomes: readonly OutcomeRecord[]) => void;
+
 export class SelfTuner {
   private state: TuningState;
   private outcomes: OutcomeRecord[];
+  private listeners: OutcomeListener[] = [];
+
+  // Subscribe to outcome updates. Called on every recordOutcome().
+  onOutcome(fn: OutcomeListener): void { this.listeners.push(fn); }
 
   constructor() {
     this.outcomes = this.loadOutcomes();
@@ -122,6 +130,11 @@ export class SelfTuner {
     this.updateStrategyStats(record);
     if (this.state.totalOutcomes >= MIN_TRADES_FOR_TUNING) {
       this.tune();
+    }
+    // Notify external subscribers (e.g. ConvictionSizer adapts its tiers).
+    for (const fn of this.listeners) {
+      try { fn(this.outcomes); }
+      catch (err) { log.warn("Outcome listener threw", { error: err instanceof Error ? err.message : String(err) }); }
     }
   }
 

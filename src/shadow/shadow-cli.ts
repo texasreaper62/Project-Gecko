@@ -206,7 +206,11 @@ async function main(): Promise<void> {
   });
 
   // Conviction-based sizing: brain conviction drives risk per trade.
-  router.setConvictionSizer(new ConvictionSizer());
+  const convictionSizer = new ConvictionSizer();
+  router.setConvictionSizer(convictionSizer);
+  // Wire the self-tuner to refresh the conviction sizer's per-strategy
+  // adapted tiers on every closed trade.
+  tuner.onOutcome((outs) => convictionSizer.updateFromOutcomes(outs));
 
   // Regime detector: market regime tweaks the size multiplier.
   const regimeDetector = new RegimeDetector(quotes);

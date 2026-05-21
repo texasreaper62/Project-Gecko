@@ -219,9 +219,11 @@ export class OrderRouter {
 
       // Conviction-based sizing: the higher the brain's conviction, the bigger
       // the position. Stacks with regime-aware sizing if both are wired.
+      // Uses adapted (per-strategy) risk% if available; falls back to default
+      // tier mapping.
       if (this.convictionSizer && this.regimeDetector) {
         const conv = br.decision.conviction;
-        const convictionRiskPct = this.convictionSizer.riskPctFor(conv);
+        const convictionRiskPct = this.convictionSizer.riskPctForStrategy(signal.strategy, conv);
         const regimeSnap = this.regimeDetector.get();
         const regimeMul = regimeSnap.sizeMultiplier;
         const baseRisk = this.config.maxRiskPerTradePct;
@@ -252,7 +254,7 @@ export class OrderRouter {
         };
       } else if (this.convictionSizer) {
         const conv = br.decision.conviction;
-        const convictionRiskPct = this.convictionSizer.riskPctFor(conv);
+        const convictionRiskPct = this.convictionSizer.riskPctForStrategy(signal.strategy, conv);
         const baseRisk = this.config.maxRiskPerTradePct;
         const scale = convictionRiskPct / baseRisk;
         const newQty = Math.max(1, Math.round(approvedSignal.order.quantity * scale));
