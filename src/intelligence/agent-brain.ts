@@ -114,7 +114,8 @@ export class AgentBrain {
     }
 
     const recent = this.loadRecentOutcomes(20);
-    const prompt = buildPrompt(signal, account, openPositions, context, recent);
+    const worstOutcomes = this.loadWorstOutcomes(5);
+    const prompt = buildPrompt(signal, account, openPositions, context, recent, worstOutcomes);
 
     let decision: AgentDecision;
     try {
@@ -176,6 +177,28 @@ export class AgentBrain {
       qtyApproved: scaledQty,
     });
     return { approved, decision };
+  }
+
+  // Specifically loads the WORST recent outcomes so the brain learns from
+  // its mistakes. These are fed in alongside the rolling-window stats so
+  // the brain has concrete "do not repeat" examples in its context.
+  private loadWorstOutcomes(n: number): readonly { strategy: string; pnl: number; side: string; key: string; reasoning: string; conviction: number }[] {
+    try {
+      const all = readJsonl<{ strategy: string; pnl: number; side: string; key: string; metadata?: { brainConviction?: number; brainReasoning?: string } }>(OUTCOMES_LOG);
+      const losers = all.filter((o) => o.pnl < 0)
+        .sort((a, b) => a.pnl - b.pnl)
+        .slice(0, n);
+      return losers.map((o) => ({
+        strategy: o.strategy,
+        pnl: o.pnl,
+        side: o.side,
+        key: o.key,
+        reasoning: o.metadata?.brainReasoning ?? "",
+        conviction: o.metadata?.brainConviction ?? 0,
+      }));
+    } catch {
+      return [];
+    }
   }
 
   private loadRecentOutcomes(n: number): RecentOutcome[] {
@@ -256,6 +279,7 @@ function buildPrompt(
   open: readonly Position[],
   ctx: MarketContext,
   recent: readonly RecentOutcome[],
+  worst: readonly { strategy: string; pnl: number; side: string; key: string; reasoning: string; conviction: number }[],
 ): string {
   const recentWins = recent.filter((r) => r.pnl > 0).length;
   const recentTotal = recent.length;
@@ -302,6 +326,10 @@ function buildPrompt(
     `=== RECENT PERFORMANCE (last ${recentTotal} closed trades) ===`,
     `Wins: ${recentWins}/${recentTotal} (${recentTotal > 0 ? ((recentWins / recentTotal) * 100).toFixed(0) : "0"}%)`,
     `Cumulative P&L: $${recentPnl.toFixed(2)}`,
+    worst.length > 0 ? `` : "",
+    worst.length > 0 ? `=== WORST PAST TRADES (LEARN FROM THESE) ===` : "",
+    worst.length > 0 ? `These trades you previously approved went badly. Avoid setups with similar characteristics:` : "",
+    ...worst.map((w, i) => `${i + 1}. ${w.strategy} ${w.side} ${w.key}: $${w.pnl.toFixed(0)} (your prior conviction: ${w.conviction}). Reasoning at time: "${w.reasoning.slice(0, 200)}"`),
   ].filter((l) => l !== "").join("\n");
 }
 
