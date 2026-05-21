@@ -43,6 +43,10 @@ import { MultiTimeframeValidator } from "./intelligence/multi-tf.js";
 import { MarketInternals } from "./intelligence/market-internals.js";
 import { NewsReader } from "./intelligence/news-reader.js";
 import { PatternMatcher } from "./intelligence/pattern-matcher.js";
+import { RegimeDetector } from "./intelligence/regime-detector.js";
+import { ConvictionSizer } from "./risk/conviction-sizer.js";
+import { EconomicCalendar } from "./intelligence/economic-calendar.js";
+import { MeanReversionStrategy } from "./strategies/mean-reversion.js";
 import type {
   AccountSnapshot,
   AppConfig,
@@ -185,6 +189,15 @@ async function main(): Promise<void> {
     patterns: patternMatcher,
   });
 
+  // Conviction-based sizing + per-strategy adaptive tiers.
+  const convictionSizer = new ConvictionSizer();
+  router.setConvictionSizer(convictionSizer);
+  tuner.onOutcome((outs) => convictionSizer.updateFromOutcomes(outs));
+
+  // Regime-aware sizing. Captures SPY/VIX opens at session start.
+  const regimeDetector = new RegimeDetector(quotes);
+  router.setRegimeDetector(regimeDetector);
+
   // Wire the AI brain into the router so every entry trade is validated.
   router.setBrain({
     brain,
@@ -213,9 +226,13 @@ async function main(): Promise<void> {
   const scanner = schwabRestForScanner && historical ? new PremarketScanner(config, schwabRestForScanner, historical) : null;
   const chainMonitor = schwabRestForScanner ? new OptionsChainMonitor(schwabRestForScanner) : null;
   const orb = new OrbStrategy(config, broker);
+  orb.setEconomicCalendar(new EconomicCalendar());
+  orb.setWalkForward(tuner.getWalkForward());
   const dte0 = chainMonitor ? new Dte0SpyStrategy(config, broker, chainMonitor) : null;
+  const meanReversion = new MeanReversionStrategy(config, broker, ["SPY", "QQQ"]);
 
   orb.setAccountProvider(() => accountState.current);
+  meanReversion.setAccountProvider(() => accountState.current);
   dte0?.setAccountProvider(() => accountState.current);
 
   const handleSignal = async (signal: TradeSignal): Promise<void> => {
@@ -238,6 +255,7 @@ async function main(): Promise<void> {
   };
 
   orb.setSignalHandler((s) => { handleSignal(s).catch((err) => log.error("orb handler", { error: errMsg(err) })); });
+  meanReversion.setSignalHandler((s) => { handleSignal(s).catch((err) => log.error("mr handler", { error: errMsg(err) })); });
   dte0?.setSignalHandler((s) => { handleSignal(s).catch((err) => log.error("dte0 handler", { error: errMsg(err) })); });
 
   broker.setStreamHandler((kind, ticks) => {
@@ -246,6 +264,10 @@ async function main(): Promise<void> {
         quotes.setEquityPrice(t.symbol, t.last);
       }
       orb.handleEquityTick(ticks);
+      meanReversion.handleEquityTick(ticks);
+      // Feed SPY price into regime detector for adaptive sizing.
+      for (const t of ticks) if (t.symbol === "SPY") regimeDetector.recordSpy(t.last, t.timestamp);
+      regimeDetector.refresh();
       dte0?.handleEquityTick(ticks);
     } else if (kind === "option-tick") {
       for (const t of ticks) {
@@ -268,6 +290,7 @@ async function main(): Promise<void> {
     llm,
     tuner,
     orb,
+    meanReversion,
     dte0,
     positionMonitor,
     refreshAccount,
@@ -286,6 +309,7 @@ async function main(): Promise<void> {
     shuttingDown = true;
     log.info(`Shutdown signal received: ${signal}`);
     orb.stop();
+    meanReversion.stop();
     dte0?.stop();
     positionMonitor.stop();
     fillWatcher.stop();
@@ -309,6 +333,7 @@ interface DailyLoopArgs {
   readonly llm: LlmClassifier;
   readonly tuner: SelfTuner;
   readonly orb: OrbStrategy;
+  readonly meanReversion: MeanReversionStrategy;
   readonly dte0: Dte0SpyStrategy | null;
   readonly positionMonitor: PositionMonitor;
   readonly refreshAccount: () => Promise<void>;
@@ -316,7 +341,7 @@ interface DailyLoopArgs {
 }
 
 async function runDailyLoop(args: DailyLoopArgs): Promise<void> {
-  const { config, scanner, llm, tuner, orb, dte0, positionMonitor, refreshAccount, notifyStartup } = args;
+  const { config, scanner, llm, tuner, orb, meanReversion, dte0, positionMonitor, refreshAccount, notifyStartup } = args;
 
   positionMonitor.start();
   await notifyStartup(`Started. live=${config.liveTrading} orb=${config.orbEnabled} dte0=${config.dte0Enabled}`);
@@ -371,6 +396,7 @@ async function runDailyLoop(args: DailyLoopArgs): Promise<void> {
       await refreshAccount();
       if (config.orbEnabled) {
         await orb.start().catch((err) => log.error("orb start failed", { error: errMsg(err) }));
+        await meanReversion.start().catch((err) => log.error("mr start failed", { error: errMsg(err) }));
       }
       if (dte0 && config.dte0Enabled) {
         await dte0.start().catch((err) => log.error("dte0 start failed", { error: errMsg(err) }));
@@ -381,6 +407,7 @@ async function runDailyLoop(args: DailyLoopArgs): Promise<void> {
     // End-of-day stop at 16:00 ET.
     if (startedToday === today && minsOfDay >= 16 * 60) {
       orb.stop();
+      meanReversion.stop();
       dte0?.stop();
       startedToday = null;
     }
