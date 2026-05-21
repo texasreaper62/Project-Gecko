@@ -24,6 +24,12 @@ const TUNING_FILE = "data/tuning-state.jsonl";
 
 const MIN_TRADES_FOR_TUNING = 10;
 const ROLLING_WINDOW = 50;
+
+// Drift detection thresholds.
+const MIN_DRIFT_LIFETIME_N = 15;        // need this much history before drift is evaluable
+const MIN_DRIFT_RECENT_N = 8;           // minimum recent window
+const DRIFT_RECENT_WINDOW = 20;         // size of recent trade window for drift compare
+const DRIFT_Z_THRESHOLD = 1.5;          // |z| > this triggers drift status change
 const LLM_SCORE_MIN = 0;
 const LLM_SCORE_MAX = 10;
 const LLM_SCORE_STEP = 0.5;
@@ -60,6 +66,18 @@ interface StrategyStats {
   enabled: boolean;
   disabledAt: number | null;
   sizeMultiplier: number;
+  driftStatus: "normal" | "drift_down" | "drift_up";
+  lastDriftCheck: number;
+}
+
+export interface DriftReport {
+  readonly strategy: string;
+  readonly status: "normal" | "drift_down" | "drift_up";
+  readonly z: number;
+  readonly recentWinRate: number;
+  readonly lifetimeWinRate: number;
+  readonly recentN: number;
+  readonly lifetimeN: number;
 }
 
 interface TuningState {
@@ -130,6 +148,74 @@ export class SelfTuner {
     ].join("\n");
   }
 
+  // Per-strategy drift detection. Compares the rolling-window win rate to
+  // the lifetime win rate using a z-score on the binomial proportion.
+  // Returns the current drift status for each strategy.
+  //
+  // Side effect: when drift transitions, the strategy's sizeMultiplier
+  // is adjusted defensively (drift_down -> halve, drift_up -> modest +1.2).
+  // Strategies need at least MIN_DRIFT_LIFETIME_N total trades and
+  // MIN_DRIFT_RECENT_N recent trades before drift is evaluated.
+  detectDriftFor(strategy: string): DriftReport | null {
+    const stats = this.state.strategies[strategy];
+    if (!stats || stats.trades < MIN_DRIFT_LIFETIME_N) return null;
+    const recent = this.outcomes
+      .filter((o) => o.strategy === strategy)
+      .slice(-DRIFT_RECENT_WINDOW);
+    if (recent.length < MIN_DRIFT_RECENT_N) return null;
+
+    const recentWins = recent.filter((o) => o.pnl > 0).length;
+    const recentN = recent.length;
+    const recentWR = recentWins / recentN;
+    const lifetimeWR = stats.wins / stats.trades;
+
+    // Standard error of difference between two proportions.
+    const pPooled = (stats.wins + recentWins) / (stats.trades + recentN);
+    const se = Math.sqrt(pPooled * (1 - pPooled) * (1 / stats.trades + 1 / recentN));
+    if (se === 0) return null;
+    const z = (recentWR - lifetimeWR) / se;
+
+    let status: DriftReport["status"];
+    if (z < -DRIFT_Z_THRESHOLD) status = "drift_down";
+    else if (z > DRIFT_Z_THRESHOLD) status = "drift_up";
+    else status = "normal";
+
+    return { strategy, status, z, recentWinRate: recentWR, lifetimeWinRate: lifetimeWR, recentN, lifetimeN: stats.trades };
+  }
+
+  // Apply drift adjustments. Called from tune() after each outcome.
+  private applyDrift(): void {
+    for (const [name, stats] of Object.entries(this.state.strategies)) {
+      const report = this.detectDriftFor(name);
+      if (!report) continue;
+      if (report.status === stats.driftStatus) continue;       // no transition
+
+      const prev = stats.driftStatus;
+      stats.driftStatus = report.status;
+      stats.lastDriftCheck = Date.now();
+
+      if (report.status === "drift_down") {
+        stats.sizeMultiplier = clamp(stats.sizeMultiplier * 0.5, SIZE_MULT_MIN, SIZE_MULT_MAX);
+        log.warn("Strategy drift DOWN detected — halving size", {
+          strategy: name, z: report.z.toFixed(2),
+          recentWR: (report.recentWinRate * 100).toFixed(0) + "%",
+          lifetimeWR: (report.lifetimeWinRate * 100).toFixed(0) + "%",
+          newSizeMul: stats.sizeMultiplier.toFixed(2),
+        });
+      } else if (report.status === "drift_up") {
+        stats.sizeMultiplier = clamp(stats.sizeMultiplier * 1.2, SIZE_MULT_MIN, SIZE_MULT_MAX);
+        log.info("Strategy drift UP detected — modest size bump", {
+          strategy: name, z: report.z.toFixed(2),
+          recentWR: (report.recentWinRate * 100).toFixed(0) + "%",
+          lifetimeWR: (report.lifetimeWinRate * 100).toFixed(0) + "%",
+          newSizeMul: stats.sizeMultiplier.toFixed(2),
+        });
+      } else if (prev !== "normal") {
+        log.info("Strategy drift cleared", { strategy: name, fromStatus: prev });
+      }
+    }
+  }
+
   // ----- Internals -----
 
   private updateStrategyStats(record: OutcomeRecord): void {
@@ -144,6 +230,8 @@ export class SelfTuner {
         enabled: true,
         disabledAt: null,
         sizeMultiplier: 1.0,
+        driftStatus: "normal",
+        lastDriftCheck: 0,
       };
       this.state.strategies[record.strategy] = stats;
     }
@@ -205,6 +293,9 @@ export class SelfTuner {
         stats.sizeMultiplier = clamp(stats.sizeMultiplier - SIZE_MULT_STEP, SIZE_MULT_MIN, SIZE_MULT_MAX);
       }
     }
+
+    // Drift detection after each tune pass.
+    this.applyDrift();
 
     this.state.ts = nowIso();
     appendJsonl(TUNING_FILE, this.state);
