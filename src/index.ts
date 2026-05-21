@@ -17,9 +17,9 @@
 import { loadConfig } from "./core/config.js";
 import { createLogger, setLogLevel } from "./core/logger.js";
 import { etDate, etParts, isWeekdayET, sleep } from "./utils/time.js";
-import { SchwabAuth } from "./brokers/schwab/auth.js";
+import { createBroker } from "./brokers/factory.js";
 import { SchwabRest } from "./brokers/schwab/rest.js";
-import { SchwabStream } from "./brokers/schwab/stream.js";
+import { SchwabAuth } from "./brokers/schwab/auth.js";
 import { HistoricalBars } from "./data/historical.js";
 import { QuoteCache } from "./data/quote-cache.js";
 import { PremarketScanner } from "./scanner/premarket.js";
@@ -71,54 +71,35 @@ async function main(): Promise<void> {
     llmEnabled: config.llmEnabled,
   });
 
-  // ----- Broker auth + clients -----
-  const auth = new SchwabAuth({
-    clientId: config.schwabClientId,
-    clientSecret: config.schwabClientSecret,
-    redirectUri: config.schwabRedirectUri,
-  });
-  const loaded = await auth.load();
-  if (!loaded) {
-    process.stderr.write("FATAL: No persisted tokens. Run `npm run auth` first.\n");
+  // ----- Broker (Schwab or IBKR per config) -----
+  let broker;
+  try {
+    broker = await createBroker(config);
+  } catch (err) {
+    process.stderr.write(`FATAL: ${err instanceof Error ? err.message : String(err)}\n`);
     process.exit(1);
   }
-  auth.startAutoRefresh();
+  log.info("Broker initialized", { broker: broker.name, latencyTargetMs: broker.orderLatencyTargetMs });
 
-  const rest = new SchwabRest(auth);
-  const stream = new SchwabStream(auth, rest);
-
-  // ----- Resolve account hash (from config, verified against API) -----
-  let accountHash = config.schwabAccountHash;
-  try {
-    const accountList = await rest.getAccountNumbers();
-    const match = accountList.find((a) => a.hashValue === config.schwabAccountHash);
-    if (!match) {
-      log.warn("Configured account hash not found in account list; using first available", {
-        configured: config.schwabAccountHash.slice(0, 8) + "...",
-        firstAvailable: accountList[0]?.hashValue.slice(0, 8) + "...",
-      });
-      if (accountList[0]) accountHash = accountList[0].hashValue;
-    }
-  } catch (err) {
-    log.error("Failed to fetch account numbers; using configured hash as-is", {
-      error: err instanceof Error ? err.message : String(err),
-    });
-  }
+  // For historical data + scanner that still uses Schwab REST directly, we
+  // also instantiate a SchwabRest where possible. Yahoo backtest path uses
+  // its own fetcher; here we only need SchwabRest when BROKER=schwab.
+  const schwabRestForScanner = config.broker === "schwab"
+    ? (() => {
+        const a = new SchwabAuth({
+          clientId: config.schwabClientId,
+          clientSecret: config.schwabClientSecret,
+          redirectUri: config.schwabRedirectUri,
+        });
+        return new SchwabRest(a);
+      })()
+    : null;
 
   // ----- Account snapshot polling -----
   const accountState: { current: AccountSnapshot | null } = { current: null };
   const refreshAccount = async (): Promise<void> => {
     try {
-      const acct = await rest.getAccount(accountHash, true);
-      const cur = acct.securitiesAccount.currentBalances;
-      accountState.current = {
-        cashBalance: cur?.cashBalance ?? 0,
-        buyingPower: cur?.buyingPower ?? 0,
-        dayTradeBuyingPower: cur?.dayTradingBuyingPower ?? cur?.buyingPower ?? 0,
-        equity: cur?.equity ?? cur?.liquidationValue ?? 0,
-        dayTradeCount: acct.securitiesAccount.roundTrips ?? 0,
-        timestamp: Date.now(),
-      };
+      accountState.current = await broker.getAccountSnapshot();
     } catch (err) {
       log.warn("Account snapshot refresh failed", {
         error: err instanceof Error ? err.message : String(err),
@@ -166,8 +147,8 @@ async function main(): Promise<void> {
   });
 
   // ----- Execution -----
-  const router = new OrderRouter(config, rest, risk, accountHash);
-  const fillWatcher = new FillWatcher(rest, positions, accountHash, tuner);
+  const router = new OrderRouter(config, broker, risk);
+  const fillWatcher = new FillWatcher(broker, positions, tuner);
   fillWatcher.start();
   const quotes = new QuoteCache();
   const positionMonitor = new PositionMonitor(positions, router, quotes, fillWatcher, config.liveTrading);
@@ -226,14 +207,16 @@ async function main(): Promise<void> {
   const discord = new DiscordNotifier(config.discordWebhookUrl);
 
   // ----- Stream data routing -----
-  const historical = new HistoricalBars(rest);
-  const scanner = new PremarketScanner(config, rest, historical);
-  const chainMonitor = new OptionsChainMonitor(rest);
-  const orb = new OrbStrategy(config, stream);
-  const dte0 = new Dte0SpyStrategy(config, stream, chainMonitor);
+  // Historical bars + scanner + options-chain currently only have Schwab
+  // backends. When BROKER=ibkr these become no-ops (return null/empty).
+  const historical = schwabRestForScanner ? new HistoricalBars(schwabRestForScanner) : null;
+  const scanner = schwabRestForScanner && historical ? new PremarketScanner(config, schwabRestForScanner, historical) : null;
+  const chainMonitor = schwabRestForScanner ? new OptionsChainMonitor(schwabRestForScanner) : null;
+  const orb = new OrbStrategy(config, broker);
+  const dte0 = chainMonitor ? new Dte0SpyStrategy(config, broker, chainMonitor) : null;
 
   orb.setAccountProvider(() => accountState.current);
-  dte0.setAccountProvider(() => accountState.current);
+  dte0?.setAccountProvider(() => accountState.current);
 
   const handleSignal = async (signal: TradeSignal): Promise<void> => {
     const snapshot = accountState.current;
@@ -255,41 +238,28 @@ async function main(): Promise<void> {
   };
 
   orb.setSignalHandler((s) => { handleSignal(s).catch((err) => log.error("orb handler", { error: errMsg(err) })); });
-  dte0.setSignalHandler((s) => { handleSignal(s).catch((err) => log.error("dte0 handler", { error: errMsg(err) })); });
+  dte0?.setSignalHandler((s) => { handleSignal(s).catch((err) => log.error("dte0 handler", { error: errMsg(err) })); });
 
-  stream.setDataHandler((service, content) => {
-    if (service === "LEVELONE_EQUITIES") {
-      // Feed quote cache and route to strategies that subscribe.
-      for (const row of content) {
-        const sym = typeof row["0"] === "string" ? (row["0"] as string) : "";
-        const last = typeof row["3"] === "number" ? (row["3"] as number) : NaN;
-        if (sym && Number.isFinite(last) && last > 0) quotes.setEquityPrice(sym, last);
+  broker.setStreamHandler((kind, ticks) => {
+    if (kind === "equity-tick") {
+      for (const t of ticks) {
+        quotes.setEquityPrice(t.symbol, t.last);
       }
-      orb.handleEquityTick(content);
-      dte0.handleEquityTick(content);
-    } else if (service === "LEVELONE_OPTIONS") {
-      for (const row of content) {
-        const sym = typeof row["0"] === "string" ? (row["0"] as string) : "";
-        // Field 38 = mark; fields 2/3 = bid/ask.
-        const bid = typeof row["2"] === "number" ? (row["2"] as number) : NaN;
-        const ask = typeof row["3"] === "number" ? (row["3"] as number) : NaN;
-        const mark = typeof row["38"] === "number" ? (row["38"] as number) : NaN;
-        const px = Number.isFinite(bid) && Number.isFinite(ask) && bid > 0 && ask > 0
-          ? (bid + ask) / 2
-          : (Number.isFinite(mark) ? mark : NaN);
-        if (sym && Number.isFinite(px) && px > 0) quotes.setOptionPrice(sym, px);
+      orb.handleEquityTick(ticks);
+      dte0?.handleEquityTick(ticks);
+    } else if (kind === "option-tick") {
+      for (const t of ticks) {
+        quotes.setOptionPrice(t.symbol, t.last);
       }
-      dte0.handleOptionTick(content);
-    } else if (service === "ACCT_ACTIVITY") {
-      log.info("ACCT_ACTIVITY event", { count: content.length });
-      // TODO: parse message types and route fills into positions.open(),
-      // cancellations into a router state map. For now, log only.
+      dte0?.handleOptionTick(ticks);
+    } else if (kind === "account-activity") {
+      log.info("Broker account-activity event", { count: ticks.length });
     }
   });
 
-  log.info("Starting stream");
-  await stream.start();
-  stream.subscribeAccountActivity();
+  log.info("Starting broker stream");
+  await broker.start();
+  await broker.subscribeAccountActivity();
 
   // ----- Daily orchestration -----
   await runDailyLoop({
@@ -316,11 +286,10 @@ async function main(): Promise<void> {
     shuttingDown = true;
     log.info(`Shutdown signal received: ${signal}`);
     orb.stop();
-    dte0.stop();
+    dte0?.stop();
     positionMonitor.stop();
     fillWatcher.stop();
-    stream.stop();
-    auth.stopAutoRefresh();
+    broker.stop();
     clearInterval(accountTimer);
     process.exit(0);
   };
@@ -336,11 +305,11 @@ async function main(): Promise<void> {
 
 interface DailyLoopArgs {
   readonly config: AppConfig;
-  readonly scanner: PremarketScanner;
+  readonly scanner: PremarketScanner | null;
   readonly llm: LlmClassifier;
   readonly tuner: SelfTuner;
   readonly orb: OrbStrategy;
-  readonly dte0: Dte0SpyStrategy;
+  readonly dte0: Dte0SpyStrategy | null;
   readonly positionMonitor: PositionMonitor;
   readonly refreshAccount: () => Promise<void>;
   readonly notifyStartup: (msg: string) => Promise<void>;
@@ -369,7 +338,7 @@ async function runDailyLoop(args: DailyLoopArgs): Promise<void> {
     }
 
     // Premarket scan window: 09:00-09:25 ET.
-    if (config.orbEnabled && scannedToday !== today && minsOfDay >= 9 * 60 && minsOfDay < 9 * 60 + 25) {
+    if (scanner && config.orbEnabled && scannedToday !== today && minsOfDay >= 9 * 60 && minsOfDay < 9 * 60 + 25) {
       try {
         log.info("Premarket scan starting");
         const raw = await scanner.scan();
@@ -403,7 +372,7 @@ async function runDailyLoop(args: DailyLoopArgs): Promise<void> {
       if (config.orbEnabled) {
         await orb.start().catch((err) => log.error("orb start failed", { error: errMsg(err) }));
       }
-      if (config.dte0Enabled) {
+      if (dte0 && config.dte0Enabled) {
         await dte0.start().catch((err) => log.error("dte0 start failed", { error: errMsg(err) }));
       }
       startedToday = today;
@@ -412,7 +381,7 @@ async function runDailyLoop(args: DailyLoopArgs): Promise<void> {
     // End-of-day stop at 16:00 ET.
     if (startedToday === today && minsOfDay >= 16 * 60) {
       orb.stop();
-      dte0.stop();
+      dte0?.stop();
       startedToday = null;
     }
 

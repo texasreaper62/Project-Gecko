@@ -31,7 +31,7 @@ import type {
 } from "../core/types.js";
 import type { Strategy } from "./base.js";
 import type { GapCandidate } from "../scanner/premarket.js";
-import type { SchwabStream } from "../brokers/schwab/stream.js";
+import type { Broker, NormalizedTick } from "../brokers/broker.js";
 
 const log = createLogger("orb");
 
@@ -68,8 +68,6 @@ interface CandidateState {
 //   "35" quoteTime (ms)
 //   "36" tradeTime (ms)
 //   "38" mark
-const FIELD_LAST = "3";
-const FIELD_SYMBOL = "0";
 
 export class OrbStrategy implements Strategy {
   readonly name = "orb";
@@ -81,7 +79,7 @@ export class OrbStrategy implements Strategy {
 
   constructor(
     private readonly config: AppConfig,
-    private readonly stream: SchwabStream,
+    private readonly broker: Broker,
   ) {}
 
   setSignalHandler(handler: (signal: TradeSignal) => void): void {
@@ -115,7 +113,9 @@ export class OrbStrategy implements Strategy {
       symbols.push(sym);
     }
     if (symbols.length > 0) {
-      this.stream.subscribeEquities(symbols);
+      this.broker.subscribeEquities(symbols).catch((err) => {
+        log.error("subscribeEquities failed", { error: err instanceof Error ? err.message : String(err) });
+      });
       log.info("ORB candidates loaded", { count: symbols.length, symbols });
     }
   }
@@ -138,17 +138,15 @@ export class OrbStrategy implements Strategy {
     log.info("ORB stopped");
   }
 
-  // Wired by the orchestrator: every LEVELONE_EQUITIES message routes
-  // through here. We pull the last price from field "3".
-  handleEquityTick(content: readonly Record<string, unknown>[]): void {
-    for (const row of content) {
-      const symbol = typeof row[FIELD_SYMBOL] === "string" ? (row[FIELD_SYMBOL] as string) : undefined;
-      const last = typeof row[FIELD_LAST] === "number" ? (row[FIELD_LAST] as number) : undefined;
-      if (!symbol || !Number.isFinite(last ?? NaN) || last! <= 0) continue;
-      const state = this.candidates.get(symbol);
+  // Wired by the orchestrator: every equity tick from the broker stream
+  // routes through here as a NormalizedTick (broker-agnostic shape).
+  handleEquityTick(ticks: readonly NormalizedTick[]): void {
+    for (const t of ticks) {
+      const state = this.candidates.get(t.symbol);
       if (!state) continue;
-      state.lastPrice = last!;
-      this.aggregateMinute(state, last!);
+      if (!Number.isFinite(t.last) || t.last <= 0) continue;
+      state.lastPrice = t.last;
+      this.aggregateMinute(state, t.last);
     }
   }
 

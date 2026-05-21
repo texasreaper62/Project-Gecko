@@ -32,7 +32,7 @@ import type {
   TradeSignal,
 } from "../core/types.js";
 import type { Strategy } from "./base.js";
-import type { SchwabStream } from "../brokers/schwab/stream.js";
+import type { Broker, NormalizedTick } from "../brokers/broker.js";
 import type { OptionsChainMonitor, AtmPair } from "../scanner/options-chain.js";
 
 const log = createLogger("dte0-spy");
@@ -44,11 +44,6 @@ const TRIGGER_MOVE_PCT = 1.0;                    // 1% SPY move arms trigger
 const VWAP_PROXIMITY_PCT = 0.1;                  // within 0.1% of 5-min VWAP = "at" VWAP
 const TICK_SCAN_MS = 1_000;
 
-const FIELD_SYMBOL = "0";
-const FIELD_LAST = "3";        // equities
-const FIELD_OPT_BID = "2";     // options
-const FIELD_OPT_ASK = "3";     // options
-const FIELD_OPT_MARK = "38";   // options
 
 interface FiveMinBar {
   readonly start: number;
@@ -82,7 +77,7 @@ export class Dte0SpyStrategy implements Strategy {
 
   constructor(
     private readonly config: AppConfig,
-    private readonly stream: SchwabStream,
+    private readonly broker: Broker,
     private readonly chainMonitor: OptionsChainMonitor,
   ) {}
 
@@ -102,8 +97,8 @@ export class Dte0SpyStrategy implements Strategy {
       return;
     }
 
-    this.stream.subscribeEquities(["SPY"]);
-    this.stream.subscribeOptions([this.chain.call.instrument.osiSymbol, this.chain.put.instrument.osiSymbol]);
+    await this.broker.subscribeEquities(["SPY"]);
+    await this.broker.subscribeOptions([this.chain.call.instrument.osiSymbol, this.chain.put.instrument.osiSymbol]);
 
     log.info("Engine B armed", {
       underlying: this.chain.underlyingPrice,
@@ -124,30 +119,26 @@ export class Dte0SpyStrategy implements Strategy {
     }
   }
 
-  handleEquityTick(content: readonly Record<string, unknown>[]): void {
-    for (const row of content) {
-      const sym = typeof row[FIELD_SYMBOL] === "string" ? (row[FIELD_SYMBOL] as string) : "";
-      const last = typeof row[FIELD_LAST] === "number" ? (row[FIELD_LAST] as number) : NaN;
-      if (sym !== "SPY" || !Number.isFinite(last) || last <= 0) continue;
-      if (this.spyOpen === 0) this.spyOpen = last;
-      this.spyLast = last;
-      this.aggregateBar(last);
+  handleEquityTick(ticks: readonly NormalizedTick[]): void {
+    for (const t of ticks) {
+      if (t.symbol !== "SPY" || !Number.isFinite(t.last) || t.last <= 0) continue;
+      if (this.spyOpen === 0) this.spyOpen = t.last;
+      this.spyLast = t.last;
+      this.aggregateBar(t.last);
     }
   }
 
-  handleOptionTick(content: readonly Record<string, unknown>[]): void {
+  handleOptionTick(ticks: readonly NormalizedTick[]): void {
     if (!this.chain) return;
-    for (const row of content) {
-      const sym = typeof row[FIELD_SYMBOL] === "string" ? (row[FIELD_SYMBOL] as string) : "";
-      const bid = typeof row[FIELD_OPT_BID] === "number" ? (row[FIELD_OPT_BID] as number) : NaN;
-      const ask = typeof row[FIELD_OPT_ASK] === "number" ? (row[FIELD_OPT_ASK] as number) : NaN;
-      const mark = typeof row[FIELD_OPT_MARK] === "number" ? (row[FIELD_OPT_MARK] as number) : NaN;
-      const mid = Number.isFinite(bid) && Number.isFinite(ask) && bid > 0 && ask > 0
-        ? (bid + ask) / 2
-        : (Number.isFinite(mark) ? mark : NaN);
+    for (const t of ticks) {
+      // Prefer mid (bid+ask)/2 if both present, else mark (carried in t.last
+      // by the SchwabBroker normalization).
+      const mid = t.bid !== undefined && t.ask !== undefined && t.bid > 0 && t.ask > 0
+        ? (t.bid + t.ask) / 2
+        : t.last;
       if (!Number.isFinite(mid) || mid <= 0) continue;
-      if (sym === this.chain.call.instrument.osiSymbol) this.callMark = mid;
-      else if (sym === this.chain.put.instrument.osiSymbol) this.putMark = mid;
+      if (t.symbol === this.chain.call.instrument.osiSymbol) this.callMark = mid;
+      else if (t.symbol === this.chain.put.instrument.osiSymbol) this.putMark = mid;
     }
   }
 

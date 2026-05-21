@@ -17,10 +17,7 @@
 import { createLogger } from "../core/logger.js";
 import { nowIso } from "../utils/time.js";
 import type { Position, TradeSignal } from "../core/types.js";
-import type { SchwabRest } from "../brokers/schwab/rest.js";
-import type {
-  SchwabOrderResponse,
-} from "../brokers/schwab/types.js";
+import type { Broker, BrokerOrderStatus } from "../brokers/broker.js";
 import type { PositionTracker } from "./position-tracker.js";
 import type { SelfTuner } from "../intelligence/self-tuner.js";
 
@@ -41,9 +38,8 @@ export class FillWatcher {
   private timer: ReturnType<typeof setInterval> | null = null;
 
   constructor(
-    private readonly rest: SchwabRest,
+    private readonly broker: Broker,
     private readonly positions: PositionTracker,
-    private readonly accountHash: string,
     private readonly tuner: SelfTuner | null = null,
   ) {}
 
@@ -78,28 +74,27 @@ export class FillWatcher {
 
     for (const [orderId, w] of this.watched) {
       try {
-        const order = await this.rest.getOrder(this.accountHash, orderId);
-        const status = order.status.toUpperCase();
+        const status = await this.broker.getOrderStatus(orderId);
+        if (!status) {
+          if (now > w.deadline) { this.watched.delete(orderId); }
+          continue;
+        }
 
-        if (status === "FILLED" || status === "REPLACED" /* edge case */) {
-          this.onFill(w, order);
+        if (status.status === "FILLED") {
+          this.onFill(w, status);
           this.watched.delete(orderId);
           continue;
         }
-        if (
-          status === "REJECTED" ||
-          status === "CANCELED" ||
-          status === "EXPIRED"
-        ) {
-          log.warn("Order ended without fill", { orderId, status, mode: w.mode });
+        if (status.status === "REJECTED" || status.status === "CANCELED" || status.status === "EXPIRED") {
+          log.warn("Order ended without fill", { orderId, status: status.status, mode: w.mode });
           this.watched.delete(orderId);
           continue;
         }
-        // Otherwise: WORKING / PENDING_* / AWAITING_* / etc. Keep polling.
+        // Otherwise: WORKING / PARTIAL. Keep polling.
 
         if (now > w.deadline) {
           log.warn("Fill timeout, cancelling", { orderId, mode: w.mode });
-          this.rest.cancelOrder(this.accountHash, orderId).catch((err) =>
+          this.broker.cancelOrder(orderId).catch((err) =>
             log.warn("Cancel-on-timeout failed", { orderId, error: errMsg(err) }),
           );
           this.watched.delete(orderId);
@@ -118,8 +113,8 @@ export class FillWatcher {
     }
   }
 
-  private onFill(w: WatchedOrder, order: SchwabOrderResponse): void {
-    const fill = aggregateFill(order);
+  private onFill(w: WatchedOrder, status: BrokerOrderStatus): void {
+    const fill = { quantity: status.filledQuantity, price: status.avgPrice, fees: 0 };
     if (fill.quantity <= 0 || !Number.isFinite(fill.price) || fill.price <= 0) {
       log.warn("Order marked FILLED but fill data missing", { orderId: w.orderId });
       return;
@@ -181,23 +176,6 @@ export class FillWatcher {
       });
     }
   }
-}
-
-function aggregateFill(order: SchwabOrderResponse): { quantity: number; price: number; fees: number } {
-  // Sum fill quantities and weighted-average prices across executionLegs.
-  let qty = 0;
-  let notional = 0;
-  for (const activity of order.orderActivityCollection ?? []) {
-    if (activity.activityType !== "EXECUTION") continue;
-    for (const leg of activity.executionLegs ?? []) {
-      if (!Number.isFinite(leg.price) || !Number.isFinite(leg.quantity)) continue;
-      qty += leg.quantity;
-      notional += leg.price * leg.quantity;
-    }
-  }
-  const price = qty > 0 ? notional / qty : 0;
-  // Schwab includes fee data on the order; not all SDKs surface it. Default to 0.
-  return { quantity: qty, price, fees: 0 };
 }
 
 function errMsg(err: unknown): string {

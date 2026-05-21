@@ -15,8 +15,8 @@
 import { createLogger } from "../core/logger.js";
 import { appendJsonl } from "../utils/persistence.js";
 import { nowIso, etParts } from "../utils/time.js";
-import type { AppConfig, TradeSignal } from "../core/types.js";
-import type { SchwabRest } from "../brokers/schwab/rest.js";
+import type { AppConfig, TradeSignal, OrderRequest } from "../core/types.js";
+import type { Broker, BrokerOrderRequest } from "../brokers/broker.js";
 import type { RiskManager } from "../risk/risk-manager.js";
 import type { AccountSnapshot, Position } from "../core/types.js";
 import type { AgentBrain, MarketContext } from "../intelligence/agent-brain.js";
@@ -25,7 +25,6 @@ import type { MultiTimeframeValidator } from "../intelligence/multi-tf.js";
 import type { MarketInternals } from "../intelligence/market-internals.js";
 import type { NewsReader } from "../intelligence/news-reader.js";
 import type { PatternMatcher } from "../intelligence/pattern-matcher.js";
-import { buildEquityOrder, buildOptionOrder } from "./order-builder.js";
 
 const log = createLogger("order-router");
 
@@ -58,9 +57,8 @@ export class OrderRouter {
 
   constructor(
     private readonly config: AppConfig,
-    private readonly rest: SchwabRest,
+    private readonly broker: Broker,
     private readonly risk: RiskManager,
-    private readonly accountHash: string,
   ) {}
 
   setBrain(provider: BrainContextProvider): void {
@@ -208,33 +206,25 @@ export class OrderRouter {
   }
 
   private async dispatch(signal: TradeSignal, mode: "live" | "close"): Promise<RouterSubmitResult> {
-    let payload;
-    try {
-      payload = signal.order.instrument.assetClass === "equity"
-        ? buildEquityOrder(signal.order)
-        : buildOptionOrder(signal.order);
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      log.error("Order build failed", { signalId: signal.id, error: msg });
-      return { accepted: false, reason: `build error: ${msg}` };
-    }
+    const brokerReq: BrokerOrderRequest = toBrokerOrder(signal.order);
 
     if (!this.config.liveTrading) {
       log.info("Dry-run: order built but not submitted", {
         signalId: signal.id,
         strategy: signal.strategy,
         mode,
-        payload,
+        broker: this.broker.name,
+        brokerReq,
       });
-      appendJsonl(ORDERS_LOG, { ts: nowIso(), mode: "dry-run", flow: mode, signal, payload });
+      appendJsonl(ORDERS_LOG, { ts: nowIso(), mode: "dry-run", flow: mode, signal, brokerReq });
       return { accepted: true, reason: "dry-run (LIVE_TRADING=false)" };
     }
 
     try {
-      const { orderId } = await this.rest.placeOrder(this.accountHash, payload);
-      appendJsonl(ORDERS_LOG, { ts: nowIso(), mode: "live", flow: mode, signalId: signal.id, orderId, signal, payload });
-      log.info("Order submitted", { signalId: signal.id, strategy: signal.strategy, flow: mode, orderId });
-      return { accepted: true, orderId, reason: "submitted" };
+      const result = await this.broker.placeOrder(brokerReq);
+      appendJsonl(ORDERS_LOG, { ts: nowIso(), mode: "live", flow: mode, broker: this.broker.name, signalId: signal.id, orderId: result.orderId, signal });
+      log.info("Order submitted", { signalId: signal.id, strategy: signal.strategy, flow: mode, broker: this.broker.name, orderId: result.orderId });
+      return { accepted: true, orderId: result.orderId, reason: "submitted" };
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       log.error("Order submission failed", { signalId: signal.id, flow: mode, error: msg });
@@ -248,7 +238,7 @@ export class OrderRouter {
       return true;
     }
     try {
-      await this.rest.cancelOrder(this.accountHash, orderId);
+      await this.broker.cancelOrder(orderId);
       return true;
     } catch (err) {
       log.error("Cancel failed", {
@@ -271,4 +261,17 @@ function signalDirection(signal: TradeSignal): "LONG" | "SHORT" {
   // SELL on equity in our system is used for short-entry too; check metadata.
   if (side === "SELL" && signal.metadata?.breakoutDirection === "SHORT") return "SHORT";
   return "LONG";
+}
+
+// Map an OrderRequest (strategy-facing) to a BrokerOrderRequest (broker-facing).
+function toBrokerOrder(r: OrderRequest): BrokerOrderRequest {
+  return {
+    instrument: r.instrument,
+    side: r.side,
+    quantity: r.quantity,
+    orderType: r.orderType,
+    limitPrice: r.limitPrice,
+    stopPrice: r.stopPrice,
+    tif: r.timeInForce === "GTC" || r.timeInForce === "IOC" ? r.timeInForce : "DAY",
+  };
 }
