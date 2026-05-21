@@ -42,6 +42,7 @@ import { MarketInternals } from "../intelligence/market-internals.js";
 import { NewsReader } from "../intelligence/news-reader.js";
 import { PatternMatcher } from "../intelligence/pattern-matcher.js";
 import { etParts } from "../utils/time.js";
+import { YahooHistoricalBars } from "../data/yahoo-historical.js";
 import type { AppConfig, AccountSnapshot, TradeSignal, Bar } from "../core/types.js";
 import type { GapCandidate } from "../scanner/premarket.js";
 
@@ -136,16 +137,21 @@ async function main(): Promise<void> {
   const risk = new RiskManager(config, dailyStop, pdt, positions);
 
   const tuner = new SelfTuner();
+  // Shadow uses a permissive conviction threshold (60) so we can measure how
+  // the agent would have actually traded on real bars. Production keeps 70.
   const brain = new AgentBrain({
     apiKey: config.anthropicApiKey, model: config.llmModel,
     enabled: config.agentBrainEnabled && !!config.anthropicApiKey,
-    minConviction: config.agentBrainMinConviction,
+    minConviction: args.brainEnabled ? 60 : config.agentBrainMinConviction,
   });
-  // Shadow uses permissive confluence so we can see the full pipeline execute
-  // even when news/brain are disabled. Production keeps the strict settings.
+  // Shadow uses permissive confluence so we can see the full pipeline execute.
+  // The brain is the strict gate; confluence is a cheap pre-filter. Cold-start
+  // shadow has no pattern history and limited internals data, so requiring 3+
+  // sources to vote 0.5+ is unrealistic. Production with real running data has
+  // richer signal sources.
   const confluence = new ConfluenceEngine({
-    minSignals: args.brainEnabled && args.newsEnabled ? 3 : 1,
-    minScore: args.brainEnabled && args.newsEnabled ? 0.5 : 0.2,
+    minSignals: args.brainEnabled ? 2 : 1,
+    minScore: args.brainEnabled ? 0.3 : 0.2,
     requireUnanimity: false,
   });
   const patternMatcher = new PatternMatcher();
@@ -245,23 +251,17 @@ async function main(): Promise<void> {
     }
   });
 
-  // ----- Load shadow candidates and run ORB -----
-  // Build synthetic gap candidates so ORB has something to watch. We assume
-  // each requested symbol gapped 3% UP at the open; the actual entry logic
-  // still decides direction based on the realized opening range.
-  const candidates: GapCandidate[] = args.symbols.map((sym) => ({
-    instrument: { assetClass: "equity", symbol: sym },
-    previousClose: 0,
-    premarketPrice: 0,
-    gapPct: 3,
-    premarketVolume: 1_000_000,
-    direction: "UP",
-  }));
-  orb.loadCandidates(candidates);
+  // ----- Pre-compute per-day real gap candidates from historical data -----
+  // For each replay day, derive each symbol's actual gap (previous close vs
+  // first regular-session open). Filter by min gap pct. ORB.loadCandidates()
+  // gets called at each day boundary with the real candidates.
+  const candidatesByDay = await computeDailyGapCandidates(args.symbols, args.days, args.interval);
+  process.stdout.write(`Pre-computed gap candidates: ${candidatesByDay.size} days have qualifying gappers\n`);
+
   await orb.start();
   positionMonitor.start();
 
-  // ----- Run the replay -----
+  // ----- Run the replay with per-day candidate refresh -----
   const replay = new ReplayEngine({
     symbols: args.symbols,
     interval: args.interval,
@@ -269,12 +269,21 @@ async function main(): Promise<void> {
     broker,
     mode: "fast",
     setNow,
+    onNewDay: async (date) => {
+      const dayCands = candidatesByDay.get(date) ?? [];
+      orb.loadCandidates(dayCands);
+      if (dayCands.length > 0) {
+        process.stdout.write(`[${date}] ${dayCands.length} gappers loaded: ${dayCands.map((c) => `${c.instrument.symbol}${c.direction === "UP" ? "+" : "-"}${c.gapPct.toFixed(1)}%`).join(" ")}\n`);
+      }
+    },
   });
 
   const replayResult = await replay.run();
 
-  // Allow async tasks (fill polling on 2s cadence, position monitor) to settle.
-  await sleep(4_500);
+  // Allow async tasks (Claude calls, fill polling, position monitor) to settle.
+  // With brain+news enabled, individual signals can take 10-20 seconds. We
+  // wait until pending router calls have all returned + extra slack.
+  await sleep(args.brainEnabled || args.newsEnabled ? 30_000 : 4_500);
   orb.stop();
   positionMonitor.stop();
   fillWatcher.stop();
@@ -321,6 +330,50 @@ function bucketReason(r: string): string {
 }
 
 function sleep(ms: number): Promise<void> { return new Promise((r) => setTimeout(r, ms)); }
+
+// Pre-compute the real gap candidates per day for each symbol in the watchlist.
+// Method: pull daily bars; for each day, gap = (today's open - yesterday's close)
+// / yesterday's close. Keep symbols with |gap| >= 1% to leave room for ORB
+// (production uses 2-3%; shadow uses 1% for more sample).
+async function computeDailyGapCandidates(
+  symbols: readonly string[],
+  lookbackDays: number,
+  _interval: "1m" | "5m" | "15m",
+): Promise<Map<string, GapCandidate[]>> {
+  const yahoo = new YahooHistoricalBars();
+  const now = realDateNow();
+  const byDay = new Map<string, GapCandidate[]>();
+
+  for (const sym of symbols) {
+    const dailyBars = await yahoo.fetch({
+      symbol: sym,
+      interval: "1d" as never,                 // YahooHistoricalBars only knows 1m/5m/15m/1h/1d — see fetcher types
+      startMs: now - (lookbackDays + 10) * 24 * 60 * 60 * 1000,
+      endMs: now,
+      includePrePost: false,
+    } as never);
+    for (let i = 1; i < dailyBars.length; i++) {
+      const prev = dailyBars[i - 1];
+      const today = dailyBars[i];
+      if (prev.close <= 0 || today.open <= 0) continue;
+      const gapPct = ((today.open - prev.close) / prev.close) * 100;
+      if (Math.abs(gapPct) < 1.0) continue;
+      const date = new Date(today.timestamp).toISOString().slice(0, 10);
+      const cand: GapCandidate = {
+        instrument: { assetClass: "equity", symbol: sym },
+        previousClose: prev.close,
+        premarketPrice: today.open,
+        gapPct,
+        premarketVolume: 1_000_000,
+        direction: gapPct > 0 ? "UP" : "DOWN",
+      };
+      const arr = byDay.get(date) ?? [];
+      arr.push(cand);
+      byDay.set(date, arr);
+    }
+  }
+  return byDay;
+}
 
 main().catch((err) => {
   process.stderr.write(`FATAL: ${err instanceof Error ? err.message : String(err)}\n`);

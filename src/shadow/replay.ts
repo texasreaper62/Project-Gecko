@@ -31,6 +31,10 @@ export interface ReplayOptions {
   readonly tickIntervalMs?: number;     // realtime mode pacing
   // Inject a custom Date.now so strategies see historical timestamps.
   readonly setNow?: (ms: number) => void;
+  // Called when the replay crosses an ET date boundary. Receives the new
+  // YYYY-MM-DD date string. Use this to refresh per-day strategy state
+  // (e.g. ORB candidates with the day's real gap data).
+  readonly onNewDay?: (etDate: string) => Promise<void>;
 }
 
 export class ReplayEngine {
@@ -64,11 +68,20 @@ export class ReplayEngine {
     // patched by the harness to virtual time).
     const startWall = performance.now();
     let emitted = 0;
+    let lastDate = "";
 
     for (const bar of merged) {
       // Set virtual clock to the bar's timestamp so etParts() / market-hours
       // helpers see the right ET wall-clock.
       this.opts.setNow?.(bar.timestamp);
+      const date = etParts(bar.timestamp).date;
+      if (date !== lastDate) {
+        if (this.opts.onNewDay) {
+          try { await this.opts.onNewDay(date); }
+          catch (err) { log.warn("onNewDay handler failed", { date, error: err instanceof Error ? err.message : String(err) }); }
+        }
+        lastDate = date;
+      }
 
       const isEquity = bar.symbol.length <= 6 && !bar.symbol.includes(":");
       const kind = isEquity ? "equity-tick" : "option-tick";

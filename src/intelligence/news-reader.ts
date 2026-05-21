@@ -16,7 +16,7 @@ const log = createLogger("news-reader");
 
 const ANTHROPIC_URL = "https://api.anthropic.com/v1/messages";
 const ANTHROPIC_VERSION = "2023-06-01";
-const SENTIMENT_TIMEOUT_MS = 8_000;
+const SENTIMENT_TIMEOUT_MS = 15_000;
 const HEADLINES_CACHE_TTL_MS = 5 * 60 * 1000;
 const USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15";
 
@@ -137,7 +137,9 @@ export class NewsReader {
         body: JSON.stringify({
           model: this.config.model,
           max_tokens: 200,
-          messages: [{ role: "user", content: prompt }],
+          messages: [
+            { role: "user", content: prompt + "\n\nRespond with ONLY the JSON object. Start with { and end with }. No preamble." },
+          ],
         }),
         signal: controller.signal,
       });

@@ -28,7 +28,7 @@ const log = createLogger("agent-brain");
 
 const ANTHROPIC_URL = "https://api.anthropic.com/v1/messages";
 const ANTHROPIC_VERSION = "2023-06-01";
-const DECISION_TIMEOUT_MS = 8_000;
+const DECISION_TIMEOUT_MS = 20_000;
 const DECISIONS_LOG = "data/agent-decisions.jsonl";
 const OUTCOMES_LOG = "data/outcomes.jsonl";
 
@@ -67,10 +67,35 @@ interface RecentOutcome {
 }
 
 export class AgentBrain {
+  // Concurrency limiter. Anthropic's lower tiers cap concurrent connections
+  // and have a 50 req/min ceiling. We serialize brain calls to ~4 in flight
+  // so bursts don't trigger HTTP 429.
+  private static readonly MAX_CONCURRENT = 4;
+  private inFlight = 0;
+  private queue: Array<() => void> = [];
+
   constructor(private readonly config: AgentBrainConfig) {}
 
   isEnabled(): boolean {
     return this.config.enabled && this.config.apiKey.length > 0;
+  }
+
+  private async acquire(): Promise<void> {
+    if (this.inFlight < AgentBrain.MAX_CONCURRENT) {
+      this.inFlight++;
+      return;
+    }
+    await new Promise<void>((resolve) => this.queue.push(resolve));
+    this.inFlight++;
+  }
+  private release(): void {
+    this.inFlight--;
+    const next = this.queue.shift();
+    if (next) {
+      // Re-acquire happens after we resolve their wait — they take our slot.
+      this.inFlight--;
+      next();
+    }
   }
 
   // Validate a signal. Returns the approved (and possibly modified) signal,
@@ -157,6 +182,15 @@ export class AgentBrain {
   }
 
   private async callClaude(prompt: string): Promise<AgentDecision> {
+    await this.acquire();
+    try {
+      return await this.callClaudeInner(prompt);
+    } finally {
+      this.release();
+    }
+  }
+
+  private async callClaudeInner(prompt: string): Promise<AgentDecision> {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), DECISION_TIMEOUT_MS);
 
@@ -185,7 +219,9 @@ export class AgentBrain {
           system: [
             { type: "text", text: systemPrefix, cache_control: { type: "ephemeral" } },
           ],
-          messages: [{ role: "user", content: userBody }],
+          messages: [
+            { role: "user", content: userBody + "\n\nRespond with ONLY the JSON object, no preamble, no commentary, no markdown fences. Start your response with { and end with }." },
+          ],
         }),
         signal: controller.signal,
       });
