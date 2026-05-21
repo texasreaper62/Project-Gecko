@@ -168,6 +168,10 @@ export interface AppConfig {
   readonly llmEnabled: boolean;
   readonly llmModel: string;
 
+  // Agent brain (Claude validates EVERY trade with full market context)
+  readonly agentBrainEnabled: boolean;
+  readonly agentBrainMinConviction: number;    // 0-100, default 70
+
   // Trading mode
   readonly liveTrading: boolean;
   readonly killSwitch: boolean;

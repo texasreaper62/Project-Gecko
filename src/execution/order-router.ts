@@ -18,7 +18,8 @@ import { nowIso } from "../utils/time.js";
 import type { AppConfig, TradeSignal } from "../core/types.js";
 import type { SchwabRest } from "../brokers/schwab/rest.js";
 import type { RiskManager } from "../risk/risk-manager.js";
-import type { AccountSnapshot } from "../core/types.js";
+import type { AccountSnapshot, Position } from "../core/types.js";
+import type { AgentBrain, MarketContext } from "../intelligence/agent-brain.js";
 import { buildEquityOrder, buildOptionOrder } from "./order-builder.js";
 
 const log = createLogger("order-router");
@@ -32,7 +33,15 @@ export interface RouterSubmitResult {
   readonly reason: string;
 }
 
+export interface BrainContextProvider {
+  readonly brain: AgentBrain;
+  getContext(signal: TradeSignal): MarketContext;
+  getOpenPositions(): readonly Position[];
+}
+
 export class OrderRouter {
+  private brainProvider: BrainContextProvider | null = null;
+
   constructor(
     private readonly config: AppConfig,
     private readonly rest: SchwabRest,
@@ -40,15 +49,35 @@ export class OrderRouter {
     private readonly accountHash: string,
   ) {}
 
+  // Wire the AI brain. When set, every entry (not close) is validated by Claude
+  // before risk check + execution.
+  setBrain(provider: BrainContextProvider): void {
+    this.brainProvider = provider;
+  }
+
   async submit(signal: TradeSignal, account: AccountSnapshot): Promise<RouterSubmitResult> {
     appendJsonl(SIGNALS_LOG, { ts: nowIso(), signal });
 
-    const riskResult = this.risk.check(signal, account);
+    let approvedSignal = signal;
+    if (this.brainProvider && this.brainProvider.brain.isEnabled()) {
+      const { approved, decision } = await this.brainProvider.brain.decide(
+        signal,
+        account,
+        this.brainProvider.getOpenPositions(),
+        this.brainProvider.getContext(signal),
+      );
+      if (!approved) {
+        return { accepted: false, reason: `brain rejected (conviction ${decision.conviction}): ${decision.reasoning}` };
+      }
+      approvedSignal = approved;
+    }
+
+    const riskResult = this.risk.check(approvedSignal, account);
     if (!riskResult.allowed) {
       return { accepted: false, reason: riskResult.reason };
     }
 
-    return this.dispatch(signal, "live");
+    return this.dispatch(approvedSignal, "live");
   }
 
   // Submit a close order. Skips position-dedup and position-count caps

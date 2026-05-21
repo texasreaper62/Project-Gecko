@@ -37,6 +37,7 @@ import { TelegramNotifier } from "./monitoring/telegram.js";
 import { DiscordNotifier } from "./monitoring/discord.js";
 import { LlmClassifier } from "./intelligence/llm-classifier.js";
 import { SelfTuner } from "./intelligence/self-tuner.js";
+import { AgentBrain } from "./intelligence/agent-brain.js";
 import type {
   AccountSnapshot,
   AppConfig,
@@ -141,6 +142,12 @@ async function main(): Promise<void> {
     enabled: config.llmEnabled && !!config.anthropicApiKey,
   });
   const tuner = new SelfTuner();
+  const brain = new AgentBrain({
+    apiKey: config.anthropicApiKey,
+    model: config.llmModel,
+    enabled: config.agentBrainEnabled && !!config.anthropicApiKey,
+    minConviction: config.agentBrainMinConviction,
+  });
 
   // ----- Execution -----
   const router = new OrderRouter(config, rest, risk, accountHash);
@@ -148,6 +155,23 @@ async function main(): Promise<void> {
   fillWatcher.start();
   const quotes = new QuoteCache();
   const positionMonitor = new PositionMonitor(positions, router, quotes, fillWatcher, config.liveTrading);
+
+  // Wire the AI brain into the router so every entry trade is validated.
+  router.setBrain({
+    brain,
+    getOpenPositions: () => positions.all(),
+    getContext: (signal) => {
+      const p = etParts();
+      const dow = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"][p.dayOfWeek];
+      const spyLast = quotes.getEquityPrice("SPY") ?? undefined;
+      return {
+        timeOfDayEt: `${String(p.hour).padStart(2, "0")}:${String(p.minute).padStart(2, "0")}`,
+        dayOfWeek: dow,
+        spyChangePct: spyLast !== undefined ? undefined : undefined, // populated by orchestrator when reference is available
+        recentBars: undefined,                                       // strategies can enrich signal.metadata with recent bars
+      };
+    },
+  });
 
   // ----- Notifications -----
   const telegram = new TelegramNotifier(config.telegramBotToken, config.telegramChatId);

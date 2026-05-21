@@ -62,6 +62,10 @@ export function loadConfig(): AppConfig {
     llmEnabled: optionalBool("LLM_ENABLED", true),
     llmModel: optional("LLM_MODEL", "claude-sonnet-4-6"),
 
+    // Agent brain
+    agentBrainEnabled: optionalBool("AGENT_BRAIN_ENABLED", true),
+    agentBrainMinConviction: boundedNumber("AGENT_BRAIN_MIN_CONVICTION", 70, 0, 100),
+
     // Mode
     liveTrading: optionalBool("LIVE_TRADING", false),
     killSwitch: optionalBool("KILL_SWITCH", false),
