@@ -38,6 +38,12 @@ const DTE0_TIME_STOP_MIN = 14 * 60;          // 14:00 ET
 const DTE0_IDLE_MS = 30 * 60 * 1000;
 const DTE0_IDLE_NO_MOVE_PCT = 5;             // within 5% of entry = "no movement"
 
+// Trailing stop: once a position is +TRAIL_TRIGGER_R profitable, move the
+// stop to breakeven (entry price). This converts what would have been
+// reversal losers into breakeven exits. Tunable per strategy via metadata
+// flag `trailToBreakeven: false` to opt-out.
+const TRAIL_TRIGGER_R = 1.5;     // ratchet stop to breakeven at +1.5R profit
+
 export class PositionMonitor {
   private timer: ReturnType<typeof setInterval> | null = null;
   private readonly inFlightCloses: Set<string> = new Set();
@@ -91,6 +97,9 @@ export class PositionMonitor {
 
       this.positions.updatePrice(pos.instrument, price);
 
+      // Trail stop to breakeven after +TRAIL_TRIGGER_R profit (if not opted out).
+      this.maybeTrailToBreakeven(pos, price);
+
       const reason = this.shouldClose(pos, price, minsOfDay, now);
       if (!reason) continue;
 
@@ -99,6 +108,41 @@ export class PositionMonitor {
         .catch((err) => log.error("Close submit failed", { key, error: errMsg(err) }))
         .finally(() => this.inFlightCloses.delete(key));
     }
+  }
+
+  // Once a position is +TRAIL_TRIGGER_R profitable, ratchet the stop to
+  // entry (breakeven). Once it's at breakeven, never let it slide back.
+  // This converts deep-in-profit-but-reversing trades from losers to
+  // breakeven exits. Stop never moves AGAINST us — only with us.
+  private maybeTrailToBreakeven(pos: Position, currentPrice: number): void {
+    if (pos.metadata.trailToBreakeven === false) return;
+    if (pos.metadata.stopTrailed === true) return;       // already trailed
+
+    const originalStop = typeof pos.metadata.stop === "number" ? (pos.metadata.stop as number) : null;
+    if (originalStop === null) return;
+    const entry = pos.entryPrice;
+    const stopDist = Math.abs(entry - originalStop);
+    if (stopDist <= 0) return;
+
+    const triggerLevel = pos.side === "LONG"
+      ? entry + TRAIL_TRIGGER_R * stopDist
+      : entry - TRAIL_TRIGGER_R * stopDist;
+
+    const triggered = pos.side === "LONG" ? currentPrice >= triggerLevel : currentPrice <= triggerLevel;
+    if (!triggered) return;
+
+    // Move stop to entry, mark as trailed so we don't re-trail.
+    (pos.metadata as Record<string, unknown>).stop = entry;
+    (pos.metadata as Record<string, unknown>).stopOriginal = originalStop;
+    (pos.metadata as Record<string, unknown>).stopTrailed = true;
+    log.info("Stop trailed to breakeven", {
+      key: instrumentKey(pos.instrument),
+      side: pos.side,
+      entry: entry.toFixed(2),
+      originalStop: originalStop.toFixed(2),
+      currentPrice: currentPrice.toFixed(2),
+      triggerLevel: triggerLevel.toFixed(2),
+    });
   }
 
   private shouldClose(pos: Position, price: number, minsOfDay: number, now: number): string | null {
