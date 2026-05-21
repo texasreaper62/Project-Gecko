@@ -109,6 +109,30 @@ export class OrderRouter {
         log.info("Tier 1 fast-fail", { signalId: signal.id, positives, negatives, latencyMs: Date.now() - t0 });
         return { accepted: false, reason: `tier-1 confluence: ${positives} supporting, ${negatives} opposing` };
       }
+
+      // FAST LANE: if tier 1 is overwhelming, skip Claude entirely and fire.
+      // Saves the ~1.5-2.5 sec brain call on the highest-conviction setups.
+      // Criteria: pattern matcher analog win rate >= 75% AND multi-TF + internals
+      // both strongly supporting (vote >= 0.5 each) AND no opposing votes.
+      const patternCheck = tier1Checks.find((c) => c.name === "pattern-matcher");
+      const tfCheck = tier1Checks.find((c) => c.name === "multi-tf");
+      const intCheck = tier1Checks.find((c) => c.name === "market-internals");
+      const patternWinRateHigh = patternCheck && patternCheck.vote >= 0.5 && patternCheck.confidence >= 0.5;
+      const tfStrong = tfCheck && tfCheck.vote >= 0.5 && tfCheck.confidence >= 0.6;
+      const intStrong = intCheck && intCheck.vote >= 0.5 && intCheck.confidence >= 0.6;
+      if (patternWinRateHigh && tfStrong && intStrong && negatives === 0) {
+        log.info("FAST LANE: skipping Claude (ultra-high conviction)", {
+          signalId: signal.id,
+          tier1LatencyMs: Date.now() - t0,
+        });
+        (signal.metadata as Record<string, unknown>).fastLane = true;
+        const riskResult = this.risk.check(signal, account);
+        if (!riskResult.allowed) {
+          return { accepted: false, reason: riskResult.reason };
+        }
+        log.info("All gates passed (fast lane)", { signalId: signal.id, latencyMs: Date.now() - t0 });
+        return this.dispatch(signal, "live");
+      }
     }
 
     // ---- TIER 2: slow Claude calls IN PARALLEL ----

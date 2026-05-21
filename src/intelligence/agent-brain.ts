@@ -160,6 +160,16 @@ export class AgentBrain {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), DECISION_TIMEOUT_MS);
 
+    // Split prompt into a fixed system prefix (cacheable) and a variable user
+    // portion. Anthropic's prompt cache cuts repeated-prefix latency ~40-50%
+    // and cost ~90%. The system prefix is the role + decision rubric, which
+    // doesn't change per trade. The user message is the trade-specific data.
+    const userBlockStart = prompt.indexOf("=== PROPOSED TRADE ===");
+    const systemPrefix = userBlockStart > 0
+      ? prompt.slice(0, userBlockStart).trim()
+      : SYSTEM_PREFIX_FALLBACK;
+    const userBody = userBlockStart > 0 ? prompt.slice(userBlockStart) : prompt;
+
     let resp: Response;
     try {
       resp = await fetch(ANTHROPIC_URL, {
@@ -172,7 +182,10 @@ export class AgentBrain {
         body: JSON.stringify({
           model: this.config.model,
           max_tokens: 500,
-          messages: [{ role: "user", content: prompt }],
+          system: [
+            { type: "text", text: systemPrefix, cache_control: { type: "ephemeral" } },
+          ],
+          messages: [{ role: "user", content: userBody }],
         }),
         signal: controller.signal,
       });
@@ -201,10 +214,10 @@ function buildPrompt(
   const recentTotal = recent.length;
   const recentPnl = recent.reduce((s, r) => s + r.pnl, 0);
 
+  // The static rubric lives in the system block (cached). Here we only emit
+  // the variable per-trade data, prefixed with the marker that callClaude
+  // uses to split system vs user portions.
   return [
-    `You are the trading brain for a permanent autonomous trading agent. Your job is to validate every proposed trade.`,
-    `Approve only setups with strong conviction. Reject anything questionable. Patience > activity. The agent runs all day; missing one trade is fine, taking a bad one is not.`,
-    ``,
     `=== PROPOSED TRADE ===`,
     `Strategy: ${signal.strategy}`,
     `Description: ${signal.description}`,
@@ -242,25 +255,6 @@ function buildPrompt(
     `=== RECENT PERFORMANCE (last ${recentTotal} closed trades) ===`,
     `Wins: ${recentWins}/${recentTotal} (${recentTotal > 0 ? ((recentWins / recentTotal) * 100).toFixed(0) : "0"}%)`,
     `Cumulative P&L: $${recentPnl.toFixed(2)}`,
-    ``,
-    `=== YOUR JOB ===`,
-    `Evaluate this trade. Consider:`,
-    `1. Setup quality given the strategy's known edge`,
-    `2. Whether the market regime supports this trade type right now`,
-    `3. Risk:reward and stop placement`,
-    `4. Time of day (avoid first/last 15 minutes of session unless explicit edge)`,
-    `5. Recent performance — if losing streak, be more selective; if winning streak, normal selectivity`,
-    `6. Concentration risk if we already have similar open positions`,
-    ``,
-    `Output EXACTLY this JSON, no other text:`,
-    `{`,
-    `  "go": true|false,`,
-    `  "conviction": 0-100,`,
-    `  "sizeMultiplier": 0.25-2.0,`,
-    `  "revisedStop": <number or null>,`,
-    `  "revisedTake": <number or null>,`,
-    `  "reasoning": "<one sentence>"`,
-    `}`,
   ].filter((l) => l !== "").join("\n");
 }
 
@@ -285,6 +279,32 @@ function parseDecision(text: string): AgentDecision {
   const reasoning = typeof parsed.reasoning === "string" ? parsed.reasoning : "";
   return { go, conviction, sizeMultiplier, revisedStop, revisedTake, reasoning };
 }
+
+// System block (cached via Anthropic's ephemeral prompt cache). This text
+// is identical on every call, so cache saves ~40-50% latency and ~90% cost.
+const SYSTEM_PREFIX_FALLBACK = [
+  "You are the trading brain for a permanent autonomous trading agent. Your job is to validate every proposed trade.",
+  "",
+  "Approve only setups with strong conviction. Reject anything questionable. Patience > activity. The agent runs all day; missing one trade is fine, taking a bad one is not.",
+  "",
+  "Evaluate each trade by considering:",
+  "1. Setup quality given the strategy's known edge",
+  "2. Whether the market regime supports this trade type right now",
+  "3. Risk:reward and stop placement",
+  "4. Time of day (avoid first/last 15 minutes of session unless explicit edge)",
+  "5. Recent performance: if losing streak, be more selective; if winning streak, normal selectivity",
+  "6. Concentration risk if we already have similar open positions",
+  "",
+  "Output EXACTLY this JSON shape, no other text:",
+  "{",
+  '  "go": true|false,',
+  '  "conviction": 0-100,',
+  '  "sizeMultiplier": 0.25-2.0,',
+  '  "revisedStop": <number or null>,',
+  '  "revisedTake": <number or null>,',
+  '  "reasoning": "<one sentence>"',
+  "}",
+].join("\n");
 
 function passThrough(): AgentDecision {
   return { go: true, conviction: 100, sizeMultiplier: 1.0, reasoning: "brain disabled, pass-through" };
