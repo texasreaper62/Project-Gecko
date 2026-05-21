@@ -259,7 +259,9 @@ async function main(): Promise<void> {
       stats.signalsAccepted++;
       process.stdout.write(`ACCEPT ${s.strategy} ${s.description}\n  reason: ${result.reason}\n`);
       if (result.orderId) {
-        fillWatcher.watch(result.orderId, s, "open");
+        // Use the approved signal (with brain conviction + sizing changes
+        // baked in) so position metadata reflects the actual state.
+        fillWatcher.watch(result.orderId, result.approvedSignal ?? s, "open");
       }
     } else {
       stats.signalsRejected++;

@@ -233,7 +233,7 @@ async function main(): Promise<void> {
     // Hand off to the fill watcher only when a real order id came back. The
     // dry-run path has no orderId, so the watcher would poll forever.
     if (result.accepted && result.orderId && config.liveTrading) {
-      fillWatcher.watch(result.orderId, signal, "open");
+      fillWatcher.watch(result.orderId, result.approvedSignal ?? signal, "open");
     }
   };
 

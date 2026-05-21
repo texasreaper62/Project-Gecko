@@ -38,6 +38,10 @@ export interface RouterSubmitResult {
   readonly accepted: boolean;
   readonly orderId?: string;
   readonly reason: string;
+  // The fully-modified signal that was actually submitted (brain conviction,
+  // sizing changes, etc baked in). Used by fill-watcher so the position's
+  // metadata reflects the actual approved state.
+  readonly approvedSignal?: TradeSignal;
 }
 
 export interface BrainContextProvider {
@@ -303,14 +307,14 @@ export class OrderRouter {
         brokerReq,
       });
       appendJsonl(ORDERS_LOG, { ts: nowIso(), mode: "dry-run", flow: mode, signal, brokerReq });
-      return { accepted: true, reason: "dry-run (LIVE_TRADING=false)" };
+      return { accepted: true, reason: "dry-run (LIVE_TRADING=false)", approvedSignal: signal };
     }
 
     try {
       const result = await this.broker.placeOrder(brokerReq);
       appendJsonl(ORDERS_LOG, { ts: nowIso(), mode: "live", flow: mode, broker: this.broker.name, signalId: signal.id, orderId: result.orderId, signal });
       log.info("Order submitted", { signalId: signal.id, strategy: signal.strategy, flow: mode, broker: this.broker.name, orderId: result.orderId });
-      return { accepted: true, orderId: result.orderId, reason: "submitted" };
+      return { accepted: true, orderId: result.orderId, reason: "submitted", approvedSignal: signal };
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       log.error("Order submission failed", { signalId: signal.id, flow: mode, error: msg });
