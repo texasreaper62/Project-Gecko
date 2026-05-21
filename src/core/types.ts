@@ -120,7 +120,7 @@ export interface Position {
 
 // -- Strategies --
 
-export type StrategyType = "orb" | "dte0-spy" | "mean-reversion";
+export type StrategyType = "orb" | "dte0-spy" | "mean-reversion" | "pairs-trader" | "earnings-catalyst";
 
 export interface SetupCandidate {
   readonly instrument: Instrument;

@@ -27,6 +27,7 @@ import type { MultiTimeframeValidator } from "../intelligence/multi-tf.js";
 import type { MarketInternals } from "../intelligence/market-internals.js";
 import type { NewsReader } from "../intelligence/news-reader.js";
 import type { PatternMatcher } from "../intelligence/pattern-matcher.js";
+import type { SectorStrength } from "../intelligence/sector-strength.js";
 
 const log = createLogger("order-router");
 
@@ -50,6 +51,7 @@ export interface ConfluenceStack {
   readonly multiTf: MultiTimeframeValidator;
   readonly internals: MarketInternals;
   readonly news: NewsReader;
+  readonly sectorStrength?: SectorStrength;
   readonly patterns: PatternMatcher;
 }
 
@@ -114,6 +116,11 @@ export class OrderRouter {
           underlyingMovePct: typeof signal.metadata.movePct === "number" ? signal.metadata.movePct as number : undefined,
         }),
       ];
+
+      // Add sector-strength as an additional tier-1 vote when available.
+      if (this.confluence.sectorStrength && signal.order.instrument.assetClass === "equity") {
+        tier1Checks.push(this.confluence.sectorStrength.evaluate(signal.order.instrument.symbol, direction));
+      }
 
       // Fail-fast on tier 1.
       // - REJECT if any non-strategy check votes against the trade with confidence.

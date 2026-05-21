@@ -32,6 +32,9 @@ import { OrderRouter } from "../execution/order-router.js";
 import { FillWatcher } from "../execution/fill-watcher.js";
 import { OrbStrategy } from "../strategies/orb.js";
 import { MeanReversionStrategy } from "../strategies/mean-reversion.js";
+import { PairsTraderStrategy } from "../strategies/pairs-trader.js";
+import { EarningsCatalystStrategy } from "../strategies/earnings-catalyst.js";
+import { SectorStrength, SECTOR_ETFS } from "../intelligence/sector-strength.js";
 import { DailyStop } from "../risk/daily-stop.js";
 import { PdtTracker } from "../risk/pdt-tracker.js";
 import { RiskManager } from "../risk/risk-manager.js";
@@ -58,6 +61,7 @@ interface Args {
   equity: number;
   brainEnabled: boolean;
   newsEnabled: boolean;
+  enableExperimental: boolean;
 }
 
 function parseArgs(): Args {
@@ -68,6 +72,7 @@ function parseArgs(): Args {
     equity: 5_000,
     brainEnabled: false,
     newsEnabled: false,
+    enableExperimental: false,
   };
   for (const a of process.argv.slice(2)) {
     if (a.startsWith("--symbols=")) {
@@ -79,6 +84,7 @@ function parseArgs(): Args {
     } else if (a.startsWith("--equity=")) out.equity = Number(a.slice("--equity=".length));
     else if (a === "--brain") out.brainEnabled = true;
     else if (a === "--news") out.newsEnabled = true;
+    else if (a === "--experimental") out.enableExperimental = true;
   }
   return out;
 }
@@ -186,12 +192,16 @@ async function main(): Promise<void> {
   });
   const internals = new MarketInternals(quotes, ["SPY", "QQQ", "IWM"]);
 
+  // Sector strength only wired when experimental is enabled — needs
+  // proper A/B validation before being default in shadow.
+  const sectorStrength = args.enableExperimental ? new SectorStrength(quotes) : undefined;
   router.setConfluence({
     engine: confluence,
     multiTf,
     internals,
     news: newsReader,
     patterns: patternMatcher,
+    sectorStrength,
   });
 
   // Conviction-based sizing: brain conviction drives risk per trade.
@@ -217,6 +227,19 @@ async function main(): Promise<void> {
 
   const meanReversion = new MeanReversionStrategy(config, broker, ["SPY", "QQQ"]);
   meanReversion.setAccountProvider(() => accountSnapshot());
+
+  // Pairs trader and earnings catalyst are built but disabled by default in
+  // shadow until each is A/B tested against the proven ORB+MR baseline. The
+  // last attempt of adding them all at once produced a regression from
+  // +20.7% to -22% on a 30-day sample.
+  const pairsTrader = args.enableExperimental ? new PairsTraderStrategy(config, broker) : null;
+  pairsTrader?.setAccountProvider(() => accountSnapshot());
+
+  const earningsCatalyst = args.enableExperimental
+    ? new EarningsCatalystStrategy(config, broker, args.symbols.filter((s) => s !== "SPY" && s !== "QQQ"))
+    : null;
+  earningsCatalyst?.setAccountProvider(() => accountSnapshot());
+
 
   // Counters for the end-of-run report.
   const stats = {
@@ -244,6 +267,8 @@ async function main(): Promise<void> {
   };
   orb.setSignalHandler((s) => { handleSignal(s).catch(() => {}); });
   meanReversion.setSignalHandler((s) => { handleSignal(s).catch(() => {}); });
+  pairsTrader?.setSignalHandler((s) => { handleSignal(s).catch(() => {}); });
+  earningsCatalyst?.setSignalHandler((s) => { handleSignal(s).catch(() => {}); });
 
   // ----- Account snapshot updates from ShadowBroker -----
   let cached: AccountSnapshot | null = null;
@@ -276,6 +301,8 @@ async function main(): Promise<void> {
       }
       orb.handleEquityTick(ticks);
       meanReversion.handleEquityTick(ticks);
+      pairsTrader?.handleEquityTick(ticks);
+      earningsCatalyst?.handleEquityTick(ticks);
       // Refresh regime every tick (cheap; recomputes once per minute internally).
       regimeDetector.refresh();
       // Synchronous exit check on every tick batch (cheap; no-op when no open positions).
@@ -292,6 +319,11 @@ async function main(): Promise<void> {
 
   await orb.start();
   await meanReversion.start();
+  if (pairsTrader) await pairsTrader.start();
+  if (earningsCatalyst) await earningsCatalyst.start();
+  // Subscribe to sector ETFs so SectorStrength has data (only used if
+  // experimental is enabled).
+  if (args.enableExperimental) await broker.subscribeEquities([...SECTOR_ETFS]);
   positionMonitor.start();
 
   // ----- Run the replay with per-day candidate refresh -----
@@ -319,6 +351,8 @@ async function main(): Promise<void> {
   await sleep(args.brainEnabled || args.newsEnabled ? 30_000 : 4_500);
   orb.stop();
   meanReversion.stop();
+  pairsTrader?.stop();
+  earningsCatalyst?.stop();
   positionMonitor.stop();
   fillWatcher.stop();
   broker.stop();
