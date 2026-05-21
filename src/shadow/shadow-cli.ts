@@ -31,6 +31,7 @@ import { PositionMonitor } from "../execution/position-monitor.js";
 import { OrderRouter } from "../execution/order-router.js";
 import { FillWatcher } from "../execution/fill-watcher.js";
 import { OrbStrategy } from "../strategies/orb.js";
+import { MeanReversionStrategy } from "../strategies/mean-reversion.js";
 import { DailyStop } from "../risk/daily-stop.js";
 import { PdtTracker } from "../risk/pdt-tracker.js";
 import { RiskManager } from "../risk/risk-manager.js";
@@ -214,6 +215,9 @@ async function main(): Promise<void> {
   const orb = new OrbStrategy(config, broker);
   orb.setAccountProvider(() => accountSnapshot());
 
+  const meanReversion = new MeanReversionStrategy(config, broker, ["SPY", "QQQ"]);
+  meanReversion.setAccountProvider(() => accountSnapshot());
+
   // Counters for the end-of-run report.
   const stats = {
     signalsEmitted: 0,
@@ -222,14 +226,13 @@ async function main(): Promise<void> {
     rejectByReason: new Map<string, number>(),
   };
 
-  orb.setSignalHandler(async (s: TradeSignal) => {
+  const handleSignal = async (s: TradeSignal): Promise<void> => {
     stats.signalsEmitted++;
     const snap = accountSnapshot();
     const result = await router.submit(s, snap);
     if (result.accepted) {
       stats.signalsAccepted++;
       process.stdout.write(`ACCEPT ${s.strategy} ${s.description}\n  reason: ${result.reason}\n`);
-      // Register the fill watcher so position tracker hydrates on fill.
       if (result.orderId) {
         fillWatcher.watch(result.orderId, s, "open");
       }
@@ -238,7 +241,9 @@ async function main(): Promise<void> {
       const bucket = bucketReason(result.reason);
       stats.rejectByReason.set(bucket, (stats.rejectByReason.get(bucket) ?? 0) + 1);
     }
-  });
+  };
+  orb.setSignalHandler((s) => { handleSignal(s).catch(() => {}); });
+  meanReversion.setSignalHandler((s) => { handleSignal(s).catch(() => {}); });
 
   // ----- Account snapshot updates from ShadowBroker -----
   let cached: AccountSnapshot | null = null;
@@ -270,6 +275,7 @@ async function main(): Promise<void> {
         if (t.symbol === "SPY") regimeDetector.recordSpy(t.last, t.timestamp);
       }
       orb.handleEquityTick(ticks);
+      meanReversion.handleEquityTick(ticks);
       // Refresh regime every tick (cheap; recomputes once per minute internally).
       regimeDetector.refresh();
       // Synchronous exit check on every tick batch (cheap; no-op when no open positions).
@@ -285,6 +291,7 @@ async function main(): Promise<void> {
   process.stdout.write(`Pre-computed gap candidates: ${candidatesByDay.size} days have qualifying gappers\n`);
 
   await orb.start();
+  await meanReversion.start();
   positionMonitor.start();
 
   // ----- Run the replay with per-day candidate refresh -----
@@ -311,6 +318,7 @@ async function main(): Promise<void> {
   // wait until pending router calls have all returned + extra slack.
   await sleep(args.brainEnabled || args.newsEnabled ? 30_000 : 4_500);
   orb.stop();
+  meanReversion.stop();
   positionMonitor.stop();
   fillWatcher.stop();
   broker.stop();

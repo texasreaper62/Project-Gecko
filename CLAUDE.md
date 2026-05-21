@@ -10,7 +10,10 @@ You are working on **Gecko**, a personal day-trading bot for US equities and sho
 - **Language:** TypeScript (strict mode)
 - **Runtime:** Node.js 20 LTS (developer uses 22.x; both work)
 - **Process manager (deployment):** PM2 on a Linux VPS (to be provisioned)
-- **Previous incarnation:** The `main` branch holds the Polymarket prediction-market arbitrage bot this codebase used to be. That project is shelved; this branch (`claude/june-trading-strategy-GOVeW`) is the new Schwab-based system.
+- **Primary broker:** Interactive Brokers (IBKR) via Client Portal Web API.
+  Operator has committed to IBKR. Schwab code stays in the repo as a fallback
+  during IBKR account onboarding and can be deleted once IBKR is validated.
+- **Previous incarnation:** The `main` branch holds the Polymarket prediction-market arbitrage bot this codebase used to be. That project is shelved; this branch (`claude/june-trading-strategy-GOVeW`) is the new equity/option trading system.
 
 ## What this system does
 

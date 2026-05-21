@@ -128,6 +128,16 @@ export class PositionMonitor {
       }
     }
 
+    // Generic per-position hold-max-minutes (set by strategy metadata, e.g.
+    // mean-reversion uses 15min, microscalper uses 10min, etc.).
+    const holdMaxMin = typeof pos.metadata.holdMaxMin === "number" ? pos.metadata.holdMaxMin as number : null;
+    if (holdMaxMin !== null) {
+      const holdMs = now - pos.openTimestamp;
+      if (holdMs > holdMaxMin * 60 * 1000) {
+        return `${pos.strategy} hold-max ${holdMaxMin}min reached`;
+      }
+    }
+
     return null;
   }
 

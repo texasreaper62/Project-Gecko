@@ -55,7 +55,7 @@ function validateBroker(val: string): "schwab" | "ibkr" {
 }
 
 export function loadConfig(): AppConfig {
-  const broker = validateBroker(optional("BROKER", "schwab"));
+  const broker = validateBroker(optional("BROKER", "ibkr"));
   const isSchwab = broker === "schwab";
   return {
     // Broker selection
