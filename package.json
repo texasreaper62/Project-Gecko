@@ -12,7 +12,8 @@
     "auth:ibkr": "node --import tsx src/brokers/ibkr/auth-cli.ts",
     "backtest": "node --import tsx src/backtest/backtest-cli.ts",
     "backtest:yahoo": "node --import tsx src/backtest/backtest-yahoo-cli.ts",
-    "shadow": "node --import tsx src/shadow/shadow-cli.ts"
+    "shadow": "node --import tsx src/shadow/shadow-cli.ts",
+    "trace": "node --import tsx src/monitoring/trace-cli.ts"
   },
   "dependencies": {
     "dotenv": "^16",
