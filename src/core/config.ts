@@ -49,13 +49,26 @@ function validateLogLevel(val: string): LogLevel {
   return val as LogLevel;
 }
 
+function validateBroker(val: string): "schwab" | "ibkr" {
+  if (val === "schwab" || val === "ibkr") return val;
+  throw new Error(`BROKER must be 'schwab' or 'ibkr', got: ${val}`);
+}
+
 export function loadConfig(): AppConfig {
+  const broker = validateBroker(optional("BROKER", "schwab"));
+  const isSchwab = broker === "schwab";
   return {
-    // Schwab API
-    schwabClientId: required("SCHWAB_CLIENT_ID"),
-    schwabClientSecret: required("SCHWAB_CLIENT_SECRET"),
+    // Broker selection
+    broker,
+
+    // Schwab API (required only when BROKER=schwab)
+    schwabClientId: isSchwab ? required("SCHWAB_CLIENT_ID") : optional("SCHWAB_CLIENT_ID", ""),
+    schwabClientSecret: isSchwab ? required("SCHWAB_CLIENT_SECRET") : optional("SCHWAB_CLIENT_SECRET", ""),
     schwabRedirectUri: optional("SCHWAB_REDIRECT_URI", "https://localhost:8443/callback"),
-    schwabAccountHash: required("SCHWAB_ACCOUNT_HASH"),
+    schwabAccountHash: isSchwab ? required("SCHWAB_ACCOUNT_HASH") : optional("SCHWAB_ACCOUNT_HASH", ""),
+
+    // IBKR
+    ibkrBaseUrl: optional("IBKR_BASE_URL", "https://localhost:5000/v1/api"),
 
     // LLM
     anthropicApiKey: optional("ANTHROPIC_API_KEY", ""),

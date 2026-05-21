@@ -163,6 +163,12 @@ export interface AppConfig {
   readonly schwabRedirectUri: string;
   readonly schwabAccountHash: string;          // account number hash for trading
 
+  // Broker selection
+  readonly broker: "schwab" | "ibkr";
+
+  // IBKR
+  readonly ibkrBaseUrl: string;          // default https://localhost:5000/v1/api
+
   // LLM (Anthropic Claude for setup classification)
   readonly anthropicApiKey: string;
   readonly llmEnabled: boolean;

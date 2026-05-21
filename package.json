@@ -9,6 +9,7 @@
     "dev": "node --import tsx src/index.ts",
     "start": "node dist/index.js",
     "auth": "node --import tsx src/brokers/schwab/auth-cli.ts",
+    "auth:ibkr": "node --import tsx src/brokers/ibkr/auth-cli.ts",
     "backtest": "node --import tsx src/backtest/backtest-cli.ts",
     "backtest:yahoo": "node --import tsx src/backtest/backtest-yahoo-cli.ts"
   },
