@@ -113,10 +113,14 @@ export class IbkrAuth {
 
   // Hit /tickle to keep the session alive. Captures the session token if
   // it rotates.
+  //
+  // NOTE: must be GET. POST to /tickle is rejected by IBKR's edge (Akamai)
+  // with an HTML "Bad Request" response. Verified empirically against a
+  // freshly-authenticated local gateway (May 2026, server build 10.46.1f).
   async tickle(): Promise<IbkrTickleResponse | null> {
     try {
       const resp = await fetch(`${this.getBaseUrl()}/tickle`, {
-        method: "POST",
+        method: "GET",
         headers: this.authHeaders(),
       });
       if (!resp.ok) {
@@ -137,10 +141,11 @@ export class IbkrAuth {
   }
 
   // Check /iserver/auth/status -- the canonical "am I logged in?" call.
+  // GET, not POST. POST is rejected by IBKR's edge.
   async authStatus(): Promise<IbkrAuthStatus> {
     try {
       const resp = await fetch(`${this.getBaseUrl()}/iserver/auth/status`, {
-        method: "POST",
+        method: "GET",
         headers: this.authHeaders(),
       });
       if (!resp.ok) {
@@ -154,11 +159,12 @@ export class IbkrAuth {
   }
 
   // Re-issue session if it died. /iserver/reauthenticate kicks it back to life
-  // if the underlying OAuth tokens are still valid.
+  // if the underlying OAuth tokens are still valid. GET, not POST (Akamai
+  // rejects POST on the session-management endpoints).
   async reauthenticate(): Promise<boolean> {
     try {
       const resp = await fetch(`${this.getBaseUrl()}/iserver/reauthenticate`, {
-        method: "POST",
+        method: "GET",
         headers: this.authHeaders(),
       });
       return resp.ok;
