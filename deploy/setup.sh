@@ -74,7 +74,9 @@ fi
 
 cd "$PROJECT_DIR"
 echo "    Installing npm dependencies..."
-npm ci --omit=dev || npm install --omit=dev
+# Bot runs via tsx (devDependency) and builds via tsc (devDependency),
+# so we need dev deps installed. Use full install, not --omit=dev.
+npm ci || npm install
 echo "    Building..."
 npm run build
 mkdir -p logs data
