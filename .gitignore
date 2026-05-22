@@ -3,6 +3,6 @@ dist/
 .env
 keys/
 logs/
-data/
+/data/
 *.log
 .claude/
