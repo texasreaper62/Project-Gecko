@@ -85,6 +85,16 @@ async function main(): Promise<void> {
   }
   log.info("Broker initialized", { broker: broker.name, latencyTargetMs: broker.orderLatencyTargetMs });
 
+  // Authenticate the broker and resolve the trading account *before* any
+  // call that uses it. Stream handler is wired later — the stream stays
+  // idle (no subscriptions yet) until subscribeAccountActivity().
+  try {
+    await broker.start();
+  } catch (err) {
+    process.stderr.write(`FATAL: ${err instanceof Error ? err.message : String(err)}\n`);
+    process.exit(1);
+  }
+
   // For historical data + scanner that still uses Schwab REST directly, we
   // also instantiate a SchwabRest where possible. Yahoo backtest path uses
   // its own fetcher; here we only need SchwabRest when BROKER=schwab.
@@ -279,8 +289,6 @@ async function main(): Promise<void> {
     }
   });
 
-  log.info("Starting broker stream");
-  await broker.start();
   await broker.subscribeAccountActivity();
 
   // ----- Daily orchestration -----

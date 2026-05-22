@@ -53,13 +53,17 @@ export class IbkrAuth {
   }
 
   // Returns the headers to include on every authenticated REST call.
+  // For the local-gateway flow the gateway holds the IBKR session itself.
+  // Sending `Authorization: Bearer local-gateway` causes the gateway to
+  // forward an invalid OAuth token to IBKR's edge, which Akamai rejects
+  // with HTML "Bad Request". Skip the header in that mode.
   authHeaders(): Record<string, string> {
     const headers: Record<string, string> = {
       Accept: "application/json",
       "Content-Type": "application/json",
       "User-Agent": "Gecko/1.0",
     };
-    if (this.accessToken) {
+    if (this.accessToken && this.accessToken !== "local-gateway") {
       headers.Authorization = `Bearer ${this.accessToken}`;
     }
     if (this.sessionCookie) {
