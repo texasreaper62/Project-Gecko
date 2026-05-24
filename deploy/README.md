@@ -7,7 +7,7 @@ Should work on any Ubuntu 22.04+ VPS with at least 1 vCPU / 2GB RAM.
 
 ```bash
 # On the VPS (as root or a sudo user):
-curl -fsSL https://raw.githubusercontent.com/texasreaper62/Project-Gecko/claude/june-trading-strategy-GOVeW/deploy/setup.sh | bash
+curl -fsSL https://raw.githubusercontent.com/texasreaper62/Project-Gecko/claude/dazzling-pasteur-aerOX/deploy/setup.sh | bash
 
 # Then edit secrets:
 cd ~/project-gecko && cp .env.example .env && nano .env
@@ -31,13 +31,13 @@ cd ~/project-gecko && cp .env.example .env && nano .env
 ### 0. SSH into the VPS
 
 ```bash
-ssh root@207.246.93.167   # or your IP
+ssh root@45.77.220.39   # or your IP
 ```
 
 ### 1. Run the bootstrap
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/texasreaper62/Project-Gecko/claude/june-trading-strategy-GOVeW/deploy/setup.sh | bash
+curl -fsSL https://raw.githubusercontent.com/texasreaper62/Project-Gecko/claude/dazzling-pasteur-aerOX/deploy/setup.sh | bash
 ```
 
 The script installs everything, clones the repo to `~/project-gecko`, builds,
@@ -60,33 +60,44 @@ Required:
 
 ### 3. First-time IBKR auth (one-time, interactive)
 
-IBKR's Gateway requires a browser-based login the first time. Easiest way:
+IBKR's Gateway requires a browser-based login the first time AND after every gateway restart (the session lives in the Java process's memory and dies with it).
 
-**Option A — SSH tunnel from your laptop:**
+**Important: log out of IBKR everywhere first.** Website, IBKR Mobile, TWS desktop. IBKR allows only one active session per account, and a leftover session on the website will cause "Authorization failed" on the gateway login. Wait ~2 minutes after logging out before retrying.
+
+**Option A — SSH tunnel from your laptop (recommended):**
+
+If the gateway isn't already running under PM2 (first-time install), start it manually first. If it IS running under PM2, skip the foreground start — PM2's instance is on port 5000 already.
 
 ```bash
 # On your laptop, NOT the VPS:
-ssh -L 5000:localhost:5000 root@207.246.93.167
+ssh -L 5000:localhost:5000 root@45.77.220.39
 ```
 
-Leave that terminal open. On the VPS, start the gateway in the foreground:
+Leave that terminal open. Don't type anything else in it — it's just holding the tunnel.
 
-```bash
-cd ~/clientportal.gw && bin/run.sh root/conf.yaml
-```
+In your laptop's browser, open `https://localhost:5000`:
+1. Cert warning → Advanced → Proceed to localhost (unsafe)
+2. Toggle **Live** vs **Paper** to match your account type (top-right of the login form)
+3. Enter IBKR username + password
+4. Approve 2FA if prompted (SMS code or IBKR Key push)
+5. **Wait until the page shows "Client login succeeds"** — don't proceed until you see that exact message.
 
-In your laptop's browser, open `https://localhost:5000`. Accept the self-signed
-cert warning. Log in with your IBKR credentials. You should see
-"Client login succeeds."
-
-From another VPS terminal:
+From a separate SSH session on the VPS:
 
 ```bash
 cd ~/project-gecko && npm run auth:ibkr
 ```
 
-This captures the session token to `data/ibkr-tokens.json`. The bot reads
-that file at startup.
+Press Enter at the prompt. The CLI tickles the gateway and persists the session
+sentinel to `data/ibkr-tokens.json`. The bot reads that on startup.
+
+Verify with a direct curl (note: **GET, not POST** — POST returns Akamai HTML "Bad Request"):
+
+```bash
+curl -k -sS https://localhost:5000/v1/api/tickle | head -c 400
+```
+
+Should return JSON starting with `{"session":"..."` and include `"authenticated":true`.
 
 **Option B — temporarily open port 5000 to your home IP only:**
 
@@ -94,7 +105,7 @@ that file at startup.
 sudo ufw allow from <your-home-ip> to any port 5000 proto tcp
 ```
 
-Then browse directly to `https://207.246.93.167:5000` from your machine.
+Then browse directly to `https://45.77.220.39:5000` from your machine.
 Close the port again after: `sudo ufw delete allow from <your-home-ip> to any port 5000`.
 
 ### 4. Start everything under PM2
@@ -155,18 +166,35 @@ pm2 restart gecko-bot
 
 ## Troubleshooting
 
-**Gateway keeps dying with "competing session":**
-- Someone else (or another machine) logged into your IBKR account
-- Log them out, restart: `pm2 restart ibkr-gateway`
+**Bot logs `FATAL: IBKR session not authenticated` in a tight restart loop:**
+- The gateway has no active session. Either (a) you restarted the gateway and didn't re-login, (b) the session timed out (6 min idle), or (c) browser login was never completed cleanly.
+- Fix: `pm2 stop gecko-bot` (stop the bleed), then redo Step 3 above (tunnel + browser login + `npm run auth:ibkr`), then `pm2 start gecko-bot`.
 
-**"No IBKR tokens" on bot start:**
-- Run step 3 again — session token expired or got wiped
-- Sessions die after ~24 hours of idle; the bot's tickle keepalive prevents this in normal ops
+**curl to `https://localhost:5000/v1/api/tickle` returns HTML "Bad Request" / "errors.edgesuite.net":**
+- Two possible causes:
+  1. You used `-X POST`. The endpoint requires GET — IBKR's Akamai edge rejects POST on `/tickle`, `/iserver/auth/status`, and `/iserver/reauthenticate`. Remove the `-X POST`.
+  2. The gateway has no active session (per the previous item). Redo browser login.
+
+**Gateway log shows "competing session" or login UI says "Another session is active":**
+- You're logged into IBKR somewhere else (website, IBKR Mobile, TWS). Log out of all of them, wait ~2 minutes, then redo the gateway login.
+
+**Gateway login form returns "Authorization failed" even with correct creds:**
+- Almost always a session conflict (see previous). If you just logged into the IBKR website to verify credentials, that website session is now blocking the gateway. Log out of the website first.
+- Confirm credentials independently at `https://www.interactivebrokers.com/sso/Login`. If that fails too, it's an IBKR account problem, not ours.
+
+**Bot crashes with `IBKR GET /portfolio//summary: HTTP 401`** (note the empty path component):
+- This means `getAccountSnapshot()` was called before `broker.start()` resolved the account ID. `src/index.ts` is supposed to call `broker.start()` immediately after `createBroker()` — verify that ordering hasn't regressed.
+
+**`npm run build` fails with `tsc: not found` or imports can't be resolved:**
+- Dev deps weren't installed. The bot runs via `tsx` (devDependency) and builds via `tsc` (devDependency). Don't use `npm ci --omit=dev`. Run `npm install` and rebuild.
+
+**`src/data/*.ts` files keep getting dropped from commits:**
+- Check `.gitignore`. The `data/` entry must be anchored to repo root as `/data/`, otherwise it matches `src/data/` too.
 
 **Bot consuming all RAM:**
 - `pm2 restart gecko-bot` will reset
 - Inspect `pm2 logs` for memory-pressure indicators
-- Consider bumping VPS to 4GB if memory_restart is firing daily
+- Bump VPS RAM if `memory_restart` fires daily (current 8 GB box has plenty of headroom)
 
 **Anthropic API rate-limited (HTTP 429):**
 - Concurrency limiter in agent-brain.ts caps at 4 simultaneous calls
@@ -174,13 +202,12 @@ pm2 restart gecko-bot
 
 ## VPS specs notes
 
-Your current Vultr instance: 1 vCPU / 2GB RAM / 55GB SSD / New Jersey.
+Current Vultr instance: **Gecko-Prod, 2 vCPU / 8 GB RAM / 50 GB SSD / New Jersey, $8.99/mo.**
 
 For our workload:
-- **CPU:** plenty. Bot is I/O bound on Claude calls and Schwab/IBKR API.
-- **RAM:** tight. Java IBKR Gateway uses ~400MB, Node.js bot ~250-350MB,
-  OS + buffers ~500MB. ~700MB headroom. Watch `free -h` after a week. If
-  steady-state usage hits 1.8GB, upgrade to 4GB.
+- **CPU:** plenty. Bot is I/O bound on Claude calls and IBKR API.
+- **RAM:** comfortable. Java IBKR Gateway uses ~400MB, Node.js bot ~250-350MB,
+  OS + buffers ~500MB. Plenty of headroom on 8 GB.
 - **Disk:** plenty. Logs + outcomes.jsonl grow ~1-5MB/day.
 - **Location:** excellent. NJ datacenter is ~5-15ms to IBKR (Stamford, CT)
   and AWS us-east-1 where Anthropic's API lives.
