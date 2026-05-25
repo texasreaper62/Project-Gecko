@@ -22,6 +22,10 @@ export interface WsManagerConfig {
   readonly pongTimeout?: number;
   readonly maxReconnectDelay?: number;
   readonly initialReconnectDelay?: number;
+  // For wss://localhost connections to local services with self-signed
+  // certs. Scoped per-connection; does NOT affect the process-global TLS
+  // posture. Defaults to true (validate). Set false only for local gateway.
+  readonly rejectUnauthorized?: boolean;
 }
 
 export type FeedStatus = "connected" | "connecting" | "disconnected" | "error";

@@ -23,8 +23,13 @@ const log = createLogger("broker-factory");
 export async function createBroker(config: AppConfig): Promise<Broker> {
   if (config.broker === "ibkr") {
     log.info("Initializing IBKR broker", { baseUrl: config.ibkrBaseUrl });
-    // Allow self-signed cert from the local clientportal.gw.
-    process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
+    // Self-signed cert handling for the local gateway is scoped per-call
+    // via brokers/ibkr/local-dispatcher.ts and the WsManager
+    // rejectUnauthorized option. We do NOT mutate the process-global
+    // NODE_TLS_REJECT_UNAUTHORIZED — doing so would silently disable cert
+    // validation for every other outbound HTTPS in the process (Anthropic,
+    // Telegram, Discord, Yahoo, etc.) and leak high-value credentials to
+    // any on-path attacker presenting a forged cert.
     const auth = new IbkrAuth({ baseUrl: config.ibkrBaseUrl });
     const loaded = await auth.load();
     if (!loaded) {

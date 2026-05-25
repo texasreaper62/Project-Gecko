@@ -27,9 +27,8 @@ async function main(): Promise<void> {
   const config = loadConfig();
   setLogLevel(config.logLevel);
 
-  // Allow self-signed local TLS for the gateway. Set per-invocation so we
-  // don't pollute the rest of the bot's TLS posture.
-  process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
+  // Self-signed TLS for the local gateway is now scoped per-call inside
+  // IbkrAuth via brokers/ibkr/local-dispatcher.ts — no env mutation needed.
 
   const baseUrl = config.ibkrBaseUrl;
   const auth = new IbkrAuth({ baseUrl });

@@ -21,6 +21,7 @@
 
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { localGatewayDispatcher } from "./local-dispatcher.js";
 import { createLogger } from "../../core/logger.js";
 import type { IbkrAuthStatus, IbkrTickleResponse, PersistedIbkrTokens } from "./types.js";
 
@@ -119,10 +120,12 @@ export class IbkrAuth {
   // freshly-authenticated local gateway (May 2026, server build 10.46.1f).
   async tickle(): Promise<IbkrTickleResponse | null> {
     try {
-      const resp = await fetch(`${this.getBaseUrl()}/tickle`, {
+      const init: RequestInit & { dispatcher?: unknown } = {
         method: "GET",
         headers: this.authHeaders(),
-      });
+        dispatcher: localGatewayDispatcher,
+      };
+      const resp = await fetch(`${this.getBaseUrl()}/tickle`, init);
       if (!resp.ok) {
         log.warn("Tickle failed", { status: resp.status });
         return null;
@@ -144,10 +147,12 @@ export class IbkrAuth {
   // GET, not POST. POST is rejected by IBKR's edge.
   async authStatus(): Promise<IbkrAuthStatus> {
     try {
-      const resp = await fetch(`${this.getBaseUrl()}/iserver/auth/status`, {
+      const init: RequestInit & { dispatcher?: unknown } = {
         method: "GET",
         headers: this.authHeaders(),
-      });
+        dispatcher: localGatewayDispatcher,
+      };
+      const resp = await fetch(`${this.getBaseUrl()}/iserver/auth/status`, init);
       if (!resp.ok) {
         return { authenticated: false, competing: false, connected: false, message: `HTTP ${resp.status}` };
       }
@@ -163,10 +168,12 @@ export class IbkrAuth {
   // rejects POST on the session-management endpoints).
   async reauthenticate(): Promise<boolean> {
     try {
-      const resp = await fetch(`${this.getBaseUrl()}/iserver/reauthenticate`, {
+      const init: RequestInit & { dispatcher?: unknown } = {
         method: "GET",
         headers: this.authHeaders(),
-      });
+        dispatcher: localGatewayDispatcher,
+      };
+      const resp = await fetch(`${this.getBaseUrl()}/iserver/reauthenticate`, init);
       return resp.ok;
     } catch {
       return false;

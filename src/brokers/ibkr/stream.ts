@@ -54,7 +54,14 @@ export class IbkrStream {
       .replace(/^http(s?):\/\//, (_m, s) => `ws${s ? "s" : ""}://`)
       .replace(/\/v1\/api\/?$/, "") + "/v1/api/ws";
 
-    this.ws = new WsManager({ url: wsUrl, name: "ibkr-stream" });
+    // Local gateway uses a self-signed cert; scope the bypass to this
+    // connection only rather than touching the process-global TLS posture.
+    const isLocalGateway = /^wss?:\/\/(localhost|127\.0\.0\.1)(:|\/|$)/.test(wsUrl);
+    this.ws = new WsManager({
+      url: wsUrl,
+      name: "ibkr-stream",
+      rejectUnauthorized: !isLocalGateway,
+    });
     this.ws.setMessageHandler((raw) => this.onMessage(raw));
     this.ws.setConnectedHandler(() => {
       this.authed = false;

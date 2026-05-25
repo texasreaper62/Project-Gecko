@@ -20,6 +20,7 @@
   },
   "dependencies": {
     "dotenv": "^16",
+    "undici": "^6",
     "ws": "^8"
   },
   "devDependencies": {

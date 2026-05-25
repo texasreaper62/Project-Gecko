@@ -36,6 +36,7 @@ export class WsManager {
       pongTimeout: config.pongTimeout ?? DEFAULT_PONG_TIMEOUT,
       maxReconnectDelay: config.maxReconnectDelay ?? DEFAULT_MAX_RECONNECT_DELAY,
       initialReconnectDelay: config.initialReconnectDelay ?? DEFAULT_INITIAL_RECONNECT_DELAY,
+      rejectUnauthorized: config.rejectUnauthorized ?? true,
     };
     this.reconnectDelay = this.config.initialReconnectDelay;
     this.log = createLogger(this.config.name);
@@ -67,7 +68,9 @@ export class WsManager {
 
     let ws: WebSocket;
     try {
-      ws = new WebSocket(this.config.url);
+      ws = new WebSocket(this.config.url, {
+        rejectUnauthorized: this.config.rejectUnauthorized,
+      });
     } catch (err) {
       this.log.error("Failed to create WebSocket", {
         error: err instanceof Error ? err.message : String(err),

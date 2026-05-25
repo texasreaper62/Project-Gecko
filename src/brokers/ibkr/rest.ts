@@ -7,9 +7,9 @@
 // list with confirmation messages we have to echo back via POST /iserver/reply/{id}.
 // placeOrder() auto-handles that loop transparently.
 
-import * as https from "node:https";
 import { createLogger } from "../../core/logger.js";
 import type { IbkrAuth } from "./auth.js";
+import { localGatewayDispatcher } from "./local-dispatcher.js";
 import type {
   IbkrAccount,
   IbkrContractSearchResult,
@@ -27,9 +27,6 @@ import type {
 } from "./types.js";
 
 const log = createLogger("ibkr-rest");
-
-// Local gateway uses a self-signed certificate. We accept it for localhost.
-const LOCAL_AGENT = new https.Agent({ rejectUnauthorized: false });
 
 // Default fields requested for equity snapshots (Last, Bid, Ask, Volume, Change%).
 const DEFAULT_EQUITY_FIELDS = "31,84,86,87,83";
@@ -256,17 +253,18 @@ export class IbkrRest {
 
   private async request<T>(method: string, path: string, body?: unknown): Promise<T> {
     const url = `${this.auth.getBaseUrl()}${path}`;
+    // Per-request dispatcher: scopes self-signed-cert acceptance to the
+    // local gateway only. Removing NODE_TLS_REJECT_UNAUTHORIZED=0 (which
+    // was process-global) means every other outbound HTTPS (Anthropic,
+    // Telegram, Discord, Yahoo) now validates certs normally.
     const init: RequestInit & { dispatcher?: unknown } = {
       method,
       headers: this.auth.authHeaders(),
+      dispatcher: localGatewayDispatcher,
     };
     if (body !== undefined) {
       init.body = JSON.stringify(body);
     }
-    // Node's global fetch doesn't expose the agent option directly. For self-
-    // signed local certs we set NODE_TLS_REJECT_UNAUTHORIZED=0 in dev or use
-    // a custom undici dispatcher. Simplest: assume the gateway is reachable.
-    void LOCAL_AGENT; // ensure import retained
 
     const resp = await fetch(url, init);
     if (!resp.ok) {
