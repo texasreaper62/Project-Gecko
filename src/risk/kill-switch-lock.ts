@@ -23,10 +23,46 @@ export interface KillSwitchReason {
   readonly source: "uncaught-exception" | "unhandled-rejection" | "daily-stop" | "weekly-stop" | "monthly-stop" | "peak-to-trough" | "reconciliation-mismatch" | "manual" | "gateway-down" | "broker-disconnect";
   readonly reason: string;
   readonly stack?: string;
+  // When present and `Date.now() >= cooldownUntilMs`, the lock auto-clears
+  // on the next bot boot. Used for weekly (48h) and monthly (7d)
+  // drawdown trips that should resume automatically after a sleep period.
+  // Operator errors (uncaught/unhandled) and peak-to-trough trips set no
+  // cooldown — those require a manual unlock.
+  readonly cooldownUntilMs?: number;
 }
 
 export function isLocked(): boolean {
   return fs.existsSync(LOCK_FILE);
+}
+
+// Check whether an existing lock is past its cooldown window. Returns true
+// if the lock should auto-clear on this boot.
+export function isCooldownExpired(nowMs: number = Date.now()): boolean {
+  const lock = readLock();
+  if (!lock) return false;
+  if (typeof lock.cooldownUntilMs !== "number") return false;
+  return nowMs >= lock.cooldownUntilMs;
+}
+
+// Auto-clear a cooldown-expired lock. Logs the auto-clear to the audit
+// stream. Does nothing if no lock present or cooldown not yet expired.
+export function autoClearIfExpired(nowMs: number = Date.now()): boolean {
+  if (!isLocked()) return false;
+  if (!isCooldownExpired(nowMs)) return false;
+  const prior = readLock();
+  try {
+    fs.unlinkSync(LOCK_FILE);
+    appendAudit({ event: "kill-switch-cooldown-expired", priorReason: prior?.reason, prior });
+    log.info("Kill switch cooldown expired — lock auto-cleared", {
+      priorReason: prior?.reason,
+      priorSource: prior?.source,
+      cooldownUntilMs: prior?.cooldownUntilMs,
+    });
+    return true;
+  } catch (err) {
+    log.error("Failed to auto-clear expired lock", { error: err instanceof Error ? err.message : String(err) });
+    return false;
+  }
 }
 
 export function readLock(): KillSwitchReason | null {

@@ -33,7 +33,8 @@ import { PositionTracker } from "./execution/position-tracker.js";
 import { PositionMonitor } from "./execution/position-monitor.js";
 import { OrderRouter } from "./execution/order-router.js";
 import { FillWatcher } from "./execution/fill-watcher.js";
-import { isLocked as killSwitchLocked, readLock as readKillSwitchLock, trip as tripKillSwitch } from "./risk/kill-switch-lock.js";
+import { autoClearIfExpired as autoClearKillSwitch, isLocked as killSwitchLocked, readLock as readKillSwitchLock, trip as tripKillSwitch } from "./risk/kill-switch-lock.js";
+import { DrawdownTracker } from "./risk/drawdown-tracker.js";
 import { TelegramNotifier } from "./monitoring/telegram.js";
 import { DiscordNotifier } from "./monitoring/discord.js";
 import { LlmClassifier } from "./intelligence/llm-classifier.js";
@@ -76,10 +77,16 @@ async function main(): Promise<void> {
     llmEnabled: config.llmEnabled,
   });
 
-  // Refuse to start if the kill switch is locked. Operator must clear via
-  // `npm run unlock -- --by=... --reason=...` after manual review. This is
-  // the friction that prevents an emotional `pm2 restart` from re-arming a
-  // bot that just tripped a real risk event.
+  // Auto-clear cooldown-expired locks (weekly/monthly DD trips that have
+  // served their sleep period). Operator-triggered locks and peak-to-trough
+  // trips do not have a cooldown and are NOT cleared here — they require
+  // explicit `npm run unlock`.
+  autoClearKillSwitch();
+
+  // Refuse to start if the kill switch is still locked. Operator must clear
+  // via `npm run unlock -- --by=... --reason=...` after manual review. This
+  // is the friction that prevents an emotional `pm2 restart` from re-arming
+  // a bot that just tripped a real risk event.
   if (killSwitchLocked()) {
     const lock = readKillSwitchLock();
     process.stderr.write(`FATAL: kill-switch lock present at data/kill-switch.lock\n`);
@@ -214,10 +221,18 @@ async function main(): Promise<void> {
     : null;
 
   // ----- Account snapshot polling -----
+  // Drawdown tracker persists to data/risk-state.json. On every account
+  // refresh we hand it the current equity and it enforces weekly (-6%,
+  // 48h cooldown), monthly (-10%, 7-day cooldown), and peak-to-trough
+  // (-20%, manual unlock) limits via the kill-switch lock.
+  const drawdownTracker = new DrawdownTracker();
   const accountState: { current: AccountSnapshot | null } = { current: null };
   const refreshAccount = async (): Promise<void> => {
     try {
       accountState.current = await broker.getAccountSnapshot();
+      if (accountState.current) {
+        drawdownTracker.update(accountState.current.equity);
+      }
     } catch (err) {
       log.warn("Account snapshot refresh failed", {
         error: err instanceof Error ? err.message : String(err),

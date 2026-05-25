@@ -16,7 +16,9 @@
     "stress": "node --import tsx src/shadow/stress-tests.ts",
     "trace": "node --import tsx src/monitoring/trace-cli.ts",
     "report": "node --import tsx src/monitoring/daily-report-cli.ts",
-    "unlock": "node --import tsx src/risk/unlock-cli.ts"
+    "unlock": "node --import tsx src/risk/unlock-cli.ts",
+    "tuner:list": "node --import tsx src/intelligence/tuner-promote-cli.ts --list",
+    "tuner:promote": "node --import tsx src/intelligence/tuner-promote-cli.ts"
   },
   "dependencies": {
     "dotenv": "^16",
