@@ -13,8 +13,12 @@ import type {
 } from "../../core/types.js";
 import type {
   Broker,
+  BrokerBracketRequest,
+  BrokerBracketResult,
+  BrokerOpenOrder,
   BrokerOrderRequest,
   BrokerOrderStatus,
+  BrokerPositionSnapshot,
   BrokerStreamHandler,
   BrokerSubmitResult,
   HistoricalBarsQuery,
@@ -92,6 +96,28 @@ export class SchwabBroker implements Broker {
       : buildOptionOrder(toOrderShape(req));
     const result = await this.rest.placeOrder(this.accountHash, payload);
     return { orderId: result.orderId };
+  }
+
+  // Schwab supports OCO and trigger-OCO via orderStrategyType "OCO" /
+  // "TRIGGER" but the path is more involved than IBKR's native bracket.
+  // For now the Schwab adapter is a fallback that is not wired to live
+  // trading; throw an explicit error so any code path that hits it is
+  // visible. When Schwab is reactivated, fill this in with a proper
+  // TRIGGER + OCO order tree built by order-builder.
+  async placeBracket(_req: BrokerBracketRequest): Promise<BrokerBracketResult> {
+    throw new Error("SchwabBroker.placeBracket not implemented; Schwab is fallback-only at v1");
+  }
+
+  async getPositions(): Promise<readonly BrokerPositionSnapshot[]> {
+    // Schwab is not wired for v1 live trading; return empty so the
+    // reconciliation step on boot is a no-op rather than a crash.
+    log.warn("SchwabBroker.getPositions called but not implemented; returning []");
+    return [];
+  }
+
+  async getOpenOrders(): Promise<readonly BrokerOpenOrder[]> {
+    log.warn("SchwabBroker.getOpenOrders called but not implemented; returning []");
+    return [];
   }
 
   async cancelOrder(orderId: string): Promise<void> {

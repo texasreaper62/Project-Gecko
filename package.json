@@ -15,7 +15,8 @@
     "shadow": "node --import tsx src/shadow/shadow-cli.ts",
     "stress": "node --import tsx src/shadow/stress-tests.ts",
     "trace": "node --import tsx src/monitoring/trace-cli.ts",
-    "report": "node --import tsx src/monitoring/daily-report-cli.ts"
+    "report": "node --import tsx src/monitoring/daily-report-cli.ts",
+    "unlock": "node --import tsx src/risk/unlock-cli.ts"
   },
   "dependencies": {
     "dotenv": "^16",

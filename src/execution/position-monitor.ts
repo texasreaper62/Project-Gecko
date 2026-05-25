@@ -181,15 +181,25 @@ export class PositionMonitor {
   }
 
   private shouldClose(pos: Position, price: number, minsOfDay: number, now: number): string | null {
-    const stop = typeof pos.metadata.stop === "number" ? (pos.metadata.stop as number) : null;
-    const take = typeof pos.metadata.take === "number" ? (pos.metadata.take as number) : null;
-
-    if (pos.side === "LONG") {
-      if (stop !== null && price <= stop) return `stop ${price.toFixed(2)} <= ${stop.toFixed(2)}`;
-      if (take !== null && price >= take) return `take ${price.toFixed(2)} >= ${take.toFixed(2)}`;
-    } else {
-      if (stop !== null && price >= stop) return `stop ${price.toFixed(2)} >= ${stop.toFixed(2)}`;
-      if (take !== null && price <= take) return `take ${price.toFixed(2)} <= ${take.toFixed(2)}`;
+    // Price-based stop/take are BROKER-SIDE in live mode: OrderRouter
+    // submits via placeBracket so IBKR holds the STP and LMT children in
+    // an OCA group, and they fire even if the bot dies. The bot evaluating
+    // those checks here in live mode would race the broker and at worst
+    // send a market-close into an already-flat position (which IBKR turns
+    // into an unintended short).
+    //
+    // In dry-run (LIVE_TRADING=false) and shadow mode, no real broker is
+    // holding the stop, so client-side evaluation is still required.
+    if (!this.liveTrading) {
+      const stop = typeof pos.metadata.stop === "number" ? (pos.metadata.stop as number) : null;
+      const take = typeof pos.metadata.take === "number" ? (pos.metadata.take as number) : null;
+      if (pos.side === "LONG") {
+        if (stop !== null && price <= stop) return `stop ${price.toFixed(2)} <= ${stop.toFixed(2)}`;
+        if (take !== null && price >= take) return `take ${price.toFixed(2)} >= ${take.toFixed(2)}`;
+      } else {
+        if (stop !== null && price >= stop) return `stop ${price.toFixed(2)} >= ${stop.toFixed(2)}`;
+        if (take !== null && price <= take) return `take ${price.toFixed(2)} <= ${take.toFixed(2)}`;
+      }
     }
 
     // Engine-specific time and idle stops.

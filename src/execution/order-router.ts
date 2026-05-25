@@ -300,22 +300,53 @@ export class OrderRouter {
   private async dispatch(signal: TradeSignal, mode: "live" | "close"): Promise<RouterSubmitResult> {
     const brokerReq: BrokerOrderRequest = toBrokerOrder(signal.order);
 
+    // Opening signals with a stop AND a take-profit go through the native
+    // bracket path so the stop/target live on the broker's books. A bot
+    // crash or gateway disconnect cannot leave the position naked because
+    // the stop is server-side. Closes (position-monitor exits, time stops,
+    // etc.) submit as plain orders — there's nothing to bracket.
+    const useBracket = mode === "live"
+      && Number.isFinite(signal.stopPrice)
+      && Number.isFinite(signal.takeProfitPrice)
+      && signal.stopPrice > 0
+      && signal.takeProfitPrice > 0;
+
     if (!this.config.liveTrading) {
       log.info("Dry-run: order built but not submitted", {
         signalId: signal.id,
         strategy: signal.strategy,
         mode,
         broker: this.broker.name,
+        bracket: useBracket,
         brokerReq,
       });
-      appendJsonl(ORDERS_LOG, { ts: nowIso(), mode: "dry-run", flow: mode, signal, brokerReq });
+      appendJsonl(ORDERS_LOG, { ts: nowIso(), mode: "dry-run", flow: mode, signal, brokerReq, bracket: useBracket });
       return { accepted: true, reason: "dry-run (LIVE_TRADING=false)", approvedSignal: signal };
     }
 
     try {
+      if (useBracket) {
+        const result = await this.broker.placeBracket({
+          entry: brokerReq,
+          stopPrice: signal.stopPrice,
+          takeProfitPrice: signal.takeProfitPrice,
+          stopTif: "GTC",
+          takeProfitTif: "GTC",
+        });
+        appendJsonl(ORDERS_LOG, {
+          ts: nowIso(), mode: "live", flow: mode, broker: this.broker.name, signalId: signal.id,
+          entryOrderId: result.entryOrderId, stopOrderId: result.stopOrderId, takeProfitOrderId: result.takeProfitOrderId,
+          bracket: true, signal,
+        });
+        log.info("Bracket submitted", {
+          signalId: signal.id, strategy: signal.strategy, flow: mode, broker: this.broker.name,
+          entryOrderId: result.entryOrderId, stopOrderId: result.stopOrderId, takeProfitOrderId: result.takeProfitOrderId,
+        });
+        return { accepted: true, orderId: result.entryOrderId, reason: "submitted (bracket)", approvedSignal: signal };
+      }
       const result = await this.broker.placeOrder(brokerReq);
-      appendJsonl(ORDERS_LOG, { ts: nowIso(), mode: "live", flow: mode, broker: this.broker.name, signalId: signal.id, orderId: result.orderId, signal });
-      log.info("Order submitted", { signalId: signal.id, strategy: signal.strategy, flow: mode, broker: this.broker.name, orderId: result.orderId });
+      appendJsonl(ORDERS_LOG, { ts: nowIso(), mode: "live", flow: mode, broker: this.broker.name, signalId: signal.id, orderId: result.orderId, signal, bracket: false });
+      log.info("Order submitted", { signalId: signal.id, strategy: signal.strategy, flow: mode, broker: this.broker.name, orderId: result.orderId, bracket: false });
       return { accepted: true, orderId: result.orderId, reason: "submitted", approvedSignal: signal };
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);

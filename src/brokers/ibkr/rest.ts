@@ -183,27 +183,43 @@ export class IbkrRest {
   // if IBKR returns a list of messages we have to acknowledge, we POST to
   // /iserver/reply/{id} with { confirmed: true } up to 3 times before giving up.
   async placeOrder(accountId: string, order: IbkrOrderRequest): Promise<IbkrOrderPlaced> {
-    const path = `/iserver/account/${accountId}/orders`;
-    const envelope = { orders: [order] };
-    let response = await this.post<IbkrPlaceOrderResponse>(path, envelope);
+    const results = await this.placeOrderBatch(accountId, [order]);
+    return results[0];
+  }
 
-    for (let i = 0; i < 3; i++) {
+  // Submit N orders in a single envelope so children land atomically with the
+  // parent (native IBKR bracket / OCA). The endpoint returns an N-element
+  // response; any slot may be an IbkrOrderReply asking us to acknowledge a
+  // message before the order completes. We re-post to /iserver/reply/{id}
+  // until every slot resolves to an IbkrOrderPlaced or we exhaust hops.
+  async placeOrderBatch(accountId: string, orders: readonly IbkrOrderRequest[]): Promise<readonly IbkrOrderPlaced[]> {
+    if (orders.length === 0) return [];
+    const path = `/iserver/account/${accountId}/orders`;
+    let response = await this.post<IbkrPlaceOrderResponse>(path, { orders: [...orders] });
+
+    for (let hop = 0; hop < 6; hop++) {
       if (!Array.isArray(response) || response.length === 0) {
-        throw new Error(`placeOrder: empty response`);
+        throw new Error(`placeOrderBatch: empty response`);
       }
-      const first = response[0];
-      if (isOrderPlaced(first)) {
-        log.info("Order placed", { orderId: first.order_id, status: first.order_status });
-        return first;
-      }
-      if (isOrderReply(first)) {
-        log.debug("Order has reply prompt", { replyId: first.id, msgCount: first.message?.length ?? 0 });
-        response = await this.post<IbkrPlaceOrderResponse>(`/iserver/reply/${first.id}`, { confirmed: true });
-        continue;
-      }
-      throw new Error(`placeOrder: unknown response shape: ${JSON.stringify(first).slice(0, 200)}`);
+      const reply = response.find(isOrderReply);
+      if (!reply) break;
+      log.debug("Batch has reply prompt", { replyId: reply.id, msgCount: reply.message?.length ?? 0 });
+      response = await this.post<IbkrPlaceOrderResponse>(`/iserver/reply/${reply.id}`, { confirmed: true });
     }
-    throw new Error(`placeOrder: confirmation loop did not resolve`);
+
+    const placed: IbkrOrderPlaced[] = [];
+    for (const slot of response) {
+      if (isOrderPlaced(slot)) {
+        placed.push(slot);
+      } else {
+        throw new Error(`placeOrderBatch: unresolved slot after reply loop: ${JSON.stringify(slot).slice(0, 200)}`);
+      }
+    }
+    if (placed.length !== orders.length) {
+      throw new Error(`placeOrderBatch: expected ${orders.length} placed, got ${placed.length}`);
+    }
+    log.info("Order batch placed", { count: placed.length, orderIds: placed.map((p) => p.order_id) });
+    return placed;
   }
 
   async cancelOrder(accountId: string, orderId: string): Promise<void> {

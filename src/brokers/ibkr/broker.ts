@@ -10,11 +10,16 @@ import { createLogger } from "../../core/logger.js";
 import type {
   AccountSnapshot,
   Bar,
+  EquityInstrument,
 } from "../../core/types.js";
 import type {
   Broker,
+  BrokerBracketRequest,
+  BrokerBracketResult,
+  BrokerOpenOrder,
   BrokerOrderRequest,
   BrokerOrderStatus,
+  BrokerPositionSnapshot,
   BrokerStreamHandler,
   BrokerSubmitResult,
   HistoricalBarsQuery,
@@ -99,6 +104,125 @@ export class IbkrBroker implements Broker {
     };
     const placed = await this.rest.placeOrder(this.accountId, ibkrReq);
     return { orderId: placed.order_id, raw: placed };
+  }
+
+  // Native IBKR bracket: entry + child stop + child take-profit, all in one
+  // /orders envelope so the children attach to the parent server-side. The
+  // stop and take-profit live on IBKR's books — they survive a bot crash, a
+  // gateway restart, and a VPS outage. This is the only safe primitive for
+  // any signal that has a stop and a target.
+  async placeBracket(req: BrokerBracketRequest): Promise<BrokerBracketResult> {
+    const conid = await this.resolveConid(req.entry.instrument);
+    const cOID = `b-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+    const entrySide = mapSide(req.entry.side);
+    const closeSide: IbkrOrderRequest["side"] = entrySide === "BUY" ? "SELL" : "BUY";
+    const entry: IbkrOrderRequest = {
+      acctId: this.accountId,
+      conid,
+      orderType: mapOrderType(req.entry.orderType),
+      side: entrySide,
+      tif: req.entry.tif,
+      quantity: req.entry.quantity,
+      price: req.entry.limitPrice,
+      auxPrice: req.entry.stopPrice,
+      useAdaptive: true,
+      cOID,
+    };
+    const stop: IbkrOrderRequest = {
+      acctId: this.accountId,
+      conid,
+      orderType: "STP",
+      side: closeSide,
+      tif: req.stopTif ?? "GTC",
+      quantity: req.entry.quantity,
+      auxPrice: req.stopPrice,
+      parentId: cOID,
+    };
+    const takeProfit: IbkrOrderRequest = {
+      acctId: this.accountId,
+      conid,
+      orderType: "LMT",
+      side: closeSide,
+      tif: req.takeProfitTif ?? "GTC",
+      quantity: req.entry.quantity,
+      price: req.takeProfitPrice,
+      parentId: cOID,
+    };
+    const results = await this.rest.placeOrderBatch(this.accountId, [entry, stop, takeProfit]);
+    if (results.length !== 3) {
+      throw new Error(`placeBracket: expected 3 orders, got ${results.length}`);
+    }
+    return {
+      entryOrderId: results[0].order_id,
+      stopOrderId: results[1].order_id,
+      takeProfitOrderId: results[2].order_id,
+      raw: results,
+    };
+  }
+
+  // Boot-time reconciliation. Returns the broker's view of positions so the
+  // bot can align its in-memory state before any strategy fires. v1 only
+  // reconciles equity positions; option positions are logged as warnings
+  // because parsing IBKR's contractDesc into an OSI symbol reliably needs a
+  // /trsrv/secdef round-trip per row (added in v2 when options trade).
+  async getPositions(): Promise<readonly BrokerPositionSnapshot[]> {
+    const raw = await this.rest.getPositions(this.accountId);
+    const out: BrokerPositionSnapshot[] = [];
+    for (const p of raw) {
+      if (!Number.isFinite(p.position) || p.position === 0) continue;
+      const assetClass = (p.assetClass ?? "STK").toUpperCase();
+      if (assetClass === "STK") {
+        const symbol = (p.contractDesc ?? "").trim().toUpperCase();
+        if (!symbol) {
+          log.warn("Equity position with empty contractDesc", { conid: p.conid, qty: p.position });
+          continue;
+        }
+        const instrument: EquityInstrument = { assetClass: "equity", symbol };
+        out.push({
+          instrument,
+          quantity: p.position,
+          avgCost: p.avgCost,
+          marketPrice: p.mktPrice,
+          unrealizedPnl: p.unrealizedPnl,
+        });
+        this.conidCache.set(symbol, p.conid);
+        this.conidToSymbol.set(p.conid, symbol);
+      } else {
+        log.warn("Skipping non-equity position in reconciliation (v1 equity-only)", {
+          conid: p.conid,
+          assetClass,
+          desc: p.contractDesc,
+          qty: p.position,
+        });
+      }
+    }
+    return out;
+  }
+
+  async getOpenOrders(): Promise<readonly BrokerOpenOrder[]> {
+    const raw = await this.rest.getLiveOrders({ accountId: this.accountId, force: true });
+    const out: BrokerOpenOrder[] = [];
+    for (const o of raw) {
+      const status = (o.status ?? "").toUpperCase();
+      if (status.includes("FILLED") || status.includes("CANCEL") || status.includes("REJECT") || status.includes("EXPIRE")) {
+        continue;       // we only want still-live orders
+      }
+      const secType = (o.secType ?? "STK").toUpperCase();
+      if (secType !== "STK") continue;     // v1 equity-only
+      const symbol = (o.ticker ?? "").toUpperCase();
+      if (!symbol) continue;
+      const instrument: EquityInstrument = { assetClass: "equity", symbol };
+      out.push({
+        orderId: o.orderId,
+        instrument,
+        side: o.side === "B" || o.side === "BUY" ? "BUY" : "SELL",
+        quantity: o.totalSize ?? 0,
+        remaining: o.remainingQuantity ?? o.totalSize ?? 0,
+        orderType: "LIMIT",       // best-effort; full parsing not needed for v1 reconciliation
+        status,
+      });
+    }
+    return out;
   }
 
   async cancelOrder(orderId: string): Promise<void> {

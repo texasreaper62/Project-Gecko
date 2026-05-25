@@ -6,3 +6,4 @@ logs/
 /data/
 *.log
 .claude/
+/docs/council-review.md

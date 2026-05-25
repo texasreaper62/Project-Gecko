@@ -46,11 +46,56 @@ export interface BrokerOrderRequest {
   readonly tif: "DAY" | "GTC" | "IOC";
 }
 
+// Native broker-side bracket: parent entry + child stop + child take-profit,
+// where the two children are linked in an OCA group server-side. This is
+// the only safe primitive for risk management — client-monitored stops fail
+// when the bot dies or the broker disconnects.
+export interface BrokerBracketRequest {
+  readonly entry: BrokerOrderRequest;
+  readonly stopPrice: number;
+  readonly takeProfitPrice: number;
+  readonly stopTif?: "DAY" | "GTC";
+  readonly takeProfitTif?: "DAY" | "GTC";
+}
+
+export interface BrokerBracketResult {
+  readonly entryOrderId: string;
+  readonly stopOrderId: string;
+  readonly takeProfitOrderId: string;
+  readonly raw?: unknown;
+}
+
 export interface BrokerOrderStatus {
   readonly orderId: string;
   readonly status: "WORKING" | "FILLED" | "PARTIAL" | "CANCELED" | "REJECTED" | "EXPIRED" | "UNKNOWN";
   readonly filledQuantity: number;
   readonly avgPrice: number;
+}
+
+// Snapshot of a position the broker reports holding. Used for boot-time
+// reconciliation: the bot must align its in-memory state with the broker's
+// truth before any strategy fires.
+export interface BrokerPositionSnapshot {
+  readonly instrument: EquityInstrument | OptionInstrument;
+  readonly quantity: number;            // signed: positive = long, negative = short
+  readonly avgCost: number;
+  readonly marketPrice?: number;
+  readonly unrealizedPnl?: number;
+}
+
+// Snapshot of a working order the broker reports as live. Used for
+// boot-time reconciliation alongside positions.
+export interface BrokerOpenOrder {
+  readonly orderId: string;
+  readonly instrument: EquityInstrument | OptionInstrument;
+  readonly side: "BUY" | "SELL" | "BUY_TO_OPEN" | "SELL_TO_OPEN" | "BUY_TO_CLOSE" | "SELL_TO_CLOSE";
+  readonly quantity: number;
+  readonly remaining: number;
+  readonly orderType: "MARKET" | "LIMIT" | "STOP" | "STOP_LIMIT";
+  readonly limitPrice?: number;
+  readonly stopPrice?: number;
+  readonly status: string;
+  readonly parentOrderId?: string;
 }
 
 export interface OptionChainQuery {
@@ -99,8 +144,17 @@ export interface Broker {
 
   // Orders
   placeOrder(req: BrokerOrderRequest): Promise<BrokerSubmitResult>;
+  // Native broker-side bracket. Entry + stop + take-profit submitted as a
+  // single OCA group so the stop/target live on the broker even if the bot
+  // dies. Every entry that has a stop+target SHOULD go through this path.
+  placeBracket(req: BrokerBracketRequest): Promise<BrokerBracketResult>;
   cancelOrder(orderId: string): Promise<void>;
   getOrderStatus(orderId: string): Promise<BrokerOrderStatus | null>;
+
+  // Boot-time reconciliation. Called BEFORE any strategy fires so the bot
+  // sees what the broker thinks it holds, not what its local JSONL says.
+  getPositions(): Promise<readonly BrokerPositionSnapshot[]>;
+  getOpenOrders(): Promise<readonly BrokerOpenOrder[]>;
 
   // Market data
   getOptionChain(q: OptionChainQuery): Promise<NormalizedOptionChain | null>;

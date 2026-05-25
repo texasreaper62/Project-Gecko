@@ -33,6 +33,7 @@ import { PositionTracker } from "./execution/position-tracker.js";
 import { PositionMonitor } from "./execution/position-monitor.js";
 import { OrderRouter } from "./execution/order-router.js";
 import { FillWatcher } from "./execution/fill-watcher.js";
+import { isLocked as killSwitchLocked, readLock as readKillSwitchLock, trip as tripKillSwitch } from "./risk/kill-switch-lock.js";
 import { TelegramNotifier } from "./monitoring/telegram.js";
 import { DiscordNotifier } from "./monitoring/discord.js";
 import { LlmClassifier } from "./intelligence/llm-classifier.js";
@@ -75,6 +76,53 @@ async function main(): Promise<void> {
     llmEnabled: config.llmEnabled,
   });
 
+  // Refuse to start if the kill switch is locked. Operator must clear via
+  // `npm run unlock -- --by=... --reason=...` after manual review. This is
+  // the friction that prevents an emotional `pm2 restart` from re-arming a
+  // bot that just tripped a real risk event.
+  if (killSwitchLocked()) {
+    const lock = readKillSwitchLock();
+    process.stderr.write(`FATAL: kill-switch lock present at data/kill-switch.lock\n`);
+    process.stderr.write(`  source:    ${lock?.source ?? "unknown"}\n`);
+    process.stderr.write(`  reason:    ${lock?.reason ?? "unknown"}\n`);
+    process.stderr.write(`  timestamp: ${lock?.timestamp ?? "unknown"}\n`);
+    process.stderr.write(`Clear with: npm run unlock -- --by="<name>" --reason="<justification>"\n`);
+    process.exit(1);
+  }
+
+  // Trap unhandled errors. Either flavor trips the kill-switch lock so PM2's
+  // auto-restart loop will not silently re-arm the bot; the operator has to
+  // investigate and explicitly unlock. Best-effort logging happens before
+  // exit so we always have a breadcrumb.
+  process.on("uncaughtException", (err) => {
+    const reason = err instanceof Error ? err.message : String(err);
+    const stack = err instanceof Error ? err.stack : undefined;
+    try {
+      log.error("Uncaught exception — tripping kill switch", { error: reason });
+    } catch { /* logger may be unsafe inside a crash */ }
+    tripKillSwitch({
+      timestamp: new Date().toISOString(),
+      source: "uncaught-exception",
+      reason,
+      stack,
+    });
+    process.exit(1);
+  });
+  process.on("unhandledRejection", (reason) => {
+    const msg = reason instanceof Error ? reason.message : String(reason);
+    const stack = reason instanceof Error ? reason.stack : undefined;
+    try {
+      log.error("Unhandled promise rejection — tripping kill switch", { error: msg });
+    } catch { /* ignore */ }
+    tripKillSwitch({
+      timestamp: new Date().toISOString(),
+      source: "unhandled-rejection",
+      reason: msg,
+      stack,
+    });
+    process.exit(1);
+  });
+
   // ----- Broker (Schwab or IBKR per config) -----
   let broker;
   try {
@@ -92,6 +140,62 @@ async function main(): Promise<void> {
     await broker.start();
   } catch (err) {
     process.stderr.write(`FATAL: ${err instanceof Error ? err.message : String(err)}\n`);
+    process.exit(1);
+  }
+
+  // Boot-time reconciliation: align the bot's in-memory view with what the
+  // broker actually holds, BEFORE any strategy can fire. The conservative
+  // v1 policy is "halt on any surprise" — if the broker reports ANY pre-
+  // existing position or live order, we trip the kill switch and refuse to
+  // start. The operator must investigate (was it a leftover from a crashed
+  // session? a manual trade? a partial fill the bot didn't record?) and
+  // then either flatten manually or explicitly clear the lock with a
+  // reason. This prevents the failure mode the council ops review flagged:
+  // "Node process exits between POST /orders and JSONL append; order fills;
+  // PM2 restarts; position-tracker is empty; strategy re-enters same name."
+  try {
+    const [brokerPositions, brokerOpenOrders] = await Promise.all([
+      broker.getPositions(),
+      broker.getOpenOrders(),
+    ]);
+    log.info("Boot reconciliation", {
+      brokerPositions: brokerPositions.length,
+      brokerOpenOrders: brokerOpenOrders.length,
+    });
+    if (brokerPositions.length > 0 || brokerOpenOrders.length > 0) {
+      const posSummary = brokerPositions.map((p) => ({
+        sym: p.instrument.assetClass === "equity" ? p.instrument.symbol : p.instrument.osiSymbol,
+        qty: p.quantity,
+        avgCost: p.avgCost,
+      }));
+      const orderSummary = brokerOpenOrders.map((o) => ({
+        orderId: o.orderId,
+        sym: o.instrument.assetClass === "equity" ? o.instrument.symbol : o.instrument.osiSymbol,
+        side: o.side,
+        remaining: o.remaining,
+        status: o.status,
+      }));
+      log.error("Reconciliation found pre-existing broker state — refusing to start", {
+        positions: posSummary,
+        orders: orderSummary,
+      });
+      tripKillSwitch({
+        timestamp: new Date().toISOString(),
+        source: "reconciliation-mismatch",
+        reason: `Broker reports ${brokerPositions.length} position(s) and ${brokerOpenOrders.length} open order(s) at boot. Investigate and either flatten or clear the lock with an explicit reason.`,
+      });
+      process.stderr.write(`FATAL: pre-existing broker state at boot. See data/kill-switch.lock for details.\n`);
+      process.exit(1);
+    }
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    log.error("Boot reconciliation failed", { error: msg });
+    tripKillSwitch({
+      timestamp: new Date().toISOString(),
+      source: "reconciliation-mismatch",
+      reason: `getPositions/getOpenOrders failed at boot: ${msg}`,
+    });
+    process.stderr.write(`FATAL: reconciliation failed at boot — kill switch tripped.\n`);
     process.exit(1);
   }
 
@@ -327,12 +431,8 @@ async function main(): Promise<void> {
   };
   process.on("SIGINT", () => shutdown("SIGINT"));
   process.on("SIGTERM", () => shutdown("SIGTERM"));
-
-  process.on("unhandledRejection", (reason) => {
-    log.error("Unhandled promise rejection", {
-      error: reason instanceof Error ? reason.message : String(reason),
-    });
-  });
+  // uncaughtException + unhandledRejection are wired earlier in main() so
+  // they fire even if startup fails before reaching this point.
 }
 
 interface DailyLoopArgs {

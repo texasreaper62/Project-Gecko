@@ -18,19 +18,45 @@ You are working on **Gecko**, a personal day-trading bot for US equities and sho
 
 ## What this system does
 
-Three layers stacked into one bot:
+A single-strategy automated equity trader at v1, with optional pre-validated additions at v2+. ORB-only is the only strategy that has documented retail-accessible edge after costs (Zarattini & Aziz 2023 et al.) and the only one specified completely enough to backtest.
 
-**Engine A -- Opening Range Breakout (equities, the workhorse)**
-Premarket scanner finds liquid stocks gapping >2% on news. After 9:30 ET open, the 9:30-9:45 ET high/low defines the opening range. Long breakouts above range high (or short below range low) with stop at the opposite side or VWAP, take profit at 2R, time-stop 11:30 ET. Risk 1% of account per trade.
+**Engine A -- Opening Range Breakout (equities, the only live strategy at v1)**
+Premarket scanner finds liquid stocks gapping >3% on **measurable** filters (no "news catalyst" without paid wire feed -- Yahoo RSS is 5-30 min late, structurally puts the bot on the wrong side of trades). Filters that survive: premarket relative volume >5x 20-day average, premarket high held into 9:25 ET, sector RS positive, premarket VWAP not lost in last 15 min. After 9:30 ET open, the 9:30-9:45 ET high/low defines the opening range. Marketable-limit (1-2c through inside) entry on 1-min close above range high. Reject names with effective spread >0.3% at the breakout bar -- slippage on $5-20 gappers can eat 15-30% of the R target. Stop at opposite OR edge (or VWAP if tighter). Take profit at 2R. Time-stop 11:30 ET. Risk 1% of account per trade. **Every stop must be a server-side IBKR STP order inside an OCA bracket -- never client-monitored** (a 401'd bot must not leave a position naked).
 
-**Engine B -- 0DTE SPY options (the amplifier)**
-Triggers only on strong-trend mornings (SPY moved >1% in first 60 min with breadth confirming). Buys ATM 0DTE SPY calls/puts on pullback to 5-min VWAP. Hard limit: 1-2 contracts per trade, max 2 trades/day. Exit at +50% or -50% or 14:00 ET.
+**Pre-validated v2 candidates (NOT live at v1)**
+The original plan included failed-breakdown reversal, HOD continuation, 0DTE SPY directional, and 2-5 day swing. None of these are fully specified (no entry triggers, no stop placement, no targets) and none have backtested numbers under realistic slippage. They are placeholders, not strategies. Each must clear: full specification, 250+ shadow trades showing positive expectancy after fees and slippage, and demonstration that it is not just an ORB regime restatement (the council reviewers noted ORB + 0DTE share the same "trending morning" regime with correlation 0.6-0.8 in drawdowns).
 
-**Intelligence layer**
-- **LLM premarket classifier (Anthropic Claude API):** scores premarket gappers 0-10 for ORB setup quality given news context. Filters universe down to top N candidates. Cheap (~$3/day), runs async, doesn't block execution.
-- **Self-tuner:** after every N closed trades, recomputes win rates per setup bucket (gap size, VIX regime, time of day) and adjusts thresholds within bounds.
+**Intelligence layer (active at v1)**
+- **LLM premarket classifier (Anthropic Claude Sonnet 4.6):** scores premarket gappers 0-10 for ORB setup quality. **Falls back to deterministic top-N by gap% + premarket relative volume on API failure**. Bot must not block on Claude.
+- **Per-trade brain (Anthropic Opus 4.7):** validates each signal with market context. **Defaults to "veto" on timeout** -- never trades on a missing brain response.
+- **Self-tuner (bounded, manual-promotion only for first 60 days live):** writes parameter proposals to `data/tuner-proposals.jsonl`. Operator promotes via CLI. Hard bounds: stop distance ∈ [0.5R, 1.5R baseline], position size ∈ [50%, 150% baseline]. No update without ≥30 closed trades in the bucket.
 
-Critical context: the operator needs to grow a $2-10k account in the **June 4 - June 12, 2026** window to fund a SpaceX IPO position. The SEC eliminated the $25k PDT minimum effective June 4, 2026 (confirmed: SEC approval April 14, 2026, FINRA filing FINRA-2025-017). Schwab's deadline to implement is October 20, 2027 -- they may not enable day-one. **This bot is built to take advantage of the rule change, but the operator must confirm Schwab has implemented before running unrestricted day trades.**
+## Goal and risk framing
+
+The council reviewers (four independent specialist agents -- quant, strategy, ops, red-team -- see `docs/council-review.md`) unanimously rejected the original "$10K → $100K in 12 months at 75% probability" framing. The honest probability of 10x in 12 months for a competent retail operator running this bot, after fully-loaded costs, is **2-5%**, not 75%. The 75% claim implies a Sharpe ratio of ~30; Renaissance Medallion runs ~6-8 net.
+
+The bot is therefore built to maximize expected value, not to chase an absolute threshold. Realistic 12-month outcome distribution from a $10K start with honest strategy expectancy and disciplined execution:
+
+| Percentile | Ending equity | Interpretation |
+|---|---|---|
+| 25th | $7-11K | Drawdown or breakeven (cost drag wins) |
+| 50th | $13-17K | 1.3-1.7x -- modest win |
+| 75th | $20-28K | 2-2.8x -- strong year, top-decile retail |
+| 90th | $35-50K | 3.5-5x -- exceptional |
+| 95th | $55-80K | Top 5% retail bot outcome |
+| 99th | $100K+ | The 10x tail outcome -- real but rare |
+
+10x is a tail outcome at 1-3%, not a target. Operating to the 10x target encourages over-leverage and parameter drift; operating to maximize EV gives you the best shot at the tail anyway.
+
+**Kill criteria (hard, non-negotiable, no operator override):**
+- Daily: -3% equity → halt for the day
+- Weekly: -6% equity → 48h cooldown, mandatory parameter audit before resume
+- Monthly: -10% equity → 7-day cooldown, full strategy review before resume
+- Peak-to-trough: -20% from session high → permanent halt, full plan re-pitch required to resume
+- Statistical: 30 consecutive trading days below baseline expectancy → 14-day pause to investigate
+- Reconciliation: any unreconciled position on bot boot → halt until manual resolution
+
+**Capital exposure framing:** $10K is committed as discretionary risk capital that can go to zero without material lifestyle impact. The operator (not the council) bears full outcome responsibility; the council (per the red-team reviewer's reframing) is being **informed**, not asked to approve.
 
 ## Architecture
 

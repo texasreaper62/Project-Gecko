@@ -16,8 +16,12 @@ import type {
 } from "../core/types.js";
 import type {
   Broker,
+  BrokerBracketRequest,
+  BrokerBracketResult,
+  BrokerOpenOrder,
   BrokerOrderRequest,
   BrokerOrderStatus,
+  BrokerPositionSnapshot,
   BrokerStreamHandler,
   BrokerSubmitResult,
   HistoricalBarsQuery,
@@ -123,6 +127,29 @@ export class ShadowBroker implements Broker {
       orderId, sym, side: req.side, qty: req.quantity, fillPrice, dollarCost,
     });
     return { orderId };
+  }
+
+  // Shadow doesn't need a real OCA — there's no live broker holding the
+  // stop. Just place the entry and pretend the stop/target sit alongside.
+  // The shadow harness's position monitor handles stop/target evaluation
+  // against replayed bars in the simulator.
+  async placeBracket(req: BrokerBracketRequest): Promise<BrokerBracketResult> {
+    const entry = await this.placeOrder(req.entry);
+    const stopId = `shadow-stop-${this.orderCounter}-${Date.now()}`;
+    const tpId = `shadow-tp-${this.orderCounter}-${Date.now()}`;
+    return {
+      entryOrderId: entry.orderId,
+      stopOrderId: stopId,
+      takeProfitOrderId: tpId,
+    };
+  }
+
+  async getPositions(): Promise<readonly BrokerPositionSnapshot[]> {
+    return [];     // shadow starts each run fresh
+  }
+
+  async getOpenOrders(): Promise<readonly BrokerOpenOrder[]> {
+    return [];
   }
 
   async cancelOrder(orderId: string): Promise<void> {
