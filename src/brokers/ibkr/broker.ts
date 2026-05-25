@@ -16,6 +16,7 @@ import type {
   Broker,
   BrokerBracketRequest,
   BrokerBracketResult,
+  BrokerHealthStatus,
   BrokerOpenOrder,
   BrokerOrderRequest,
   BrokerOrderStatus,
@@ -227,6 +228,24 @@ export class IbkrBroker implements Broker {
 
   async cancelOrder(orderId: string): Promise<void> {
     await this.rest.cancelOrder(this.accountId, orderId);
+  }
+
+  async healthCheck(): Promise<BrokerHealthStatus> {
+    // Two layers: tickle keeps the soft session alive; authStatus is the
+    // canonical "am I logged in" verdict. We do both because tickle alone
+    // can return non-401 while the underlying auth is dead.
+    try {
+      const tickled = await this.auth.tickle();
+      const status = await this.auth.authStatus();
+      const ok = !!tickled && status.authenticated && status.connected;
+      const message = ok
+        ? `IBKR session healthy (authenticated, connected)`
+        : `IBKR session degraded — tickle=${!!tickled}, authenticated=${status.authenticated}, connected=${status.connected}, msg=${status.message || "n/a"}`;
+      return { ok, authenticated: status.authenticated, connected: status.connected, message };
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      return { ok: false, authenticated: false, connected: false, message: `IBKR health check threw: ${msg}` };
+    }
   }
 
   async getOrderStatus(orderId: string): Promise<BrokerOrderStatus | null> {

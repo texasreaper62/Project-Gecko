@@ -15,6 +15,7 @@ import type {
   Broker,
   BrokerBracketRequest,
   BrokerBracketResult,
+  BrokerHealthStatus,
   BrokerOpenOrder,
   BrokerOrderRequest,
   BrokerOrderStatus,
@@ -118,6 +119,12 @@ export class SchwabBroker implements Broker {
   async getOpenOrders(): Promise<readonly BrokerOpenOrder[]> {
     log.warn("SchwabBroker.getOpenOrders called but not implemented; returning []");
     return [];
+  }
+
+  async healthCheck(): Promise<BrokerHealthStatus> {
+    // Stub: Schwab is fallback-only at v1. If reactivated, ping
+    // /trader/v1/accounts to verify the OAuth token is still alive.
+    return { ok: true, authenticated: true, connected: true, message: "SchwabBroker.healthCheck: stub (fallback path, not wired)" };
   }
 
   async cancelOrder(orderId: string): Promise<void> {

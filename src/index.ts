@@ -413,6 +413,7 @@ async function main(): Promise<void> {
   // ----- Daily orchestration -----
   await runDailyLoop({
     config,
+    broker,
     scanner,
     llm,
     tuner,
@@ -427,6 +428,7 @@ async function main(): Promise<void> {
         discord.sendEmbed("Gecko", msg, 0x00aaff),
       ]);
     },
+    telegram,
   });
 
   // Graceful shutdown
@@ -452,6 +454,7 @@ async function main(): Promise<void> {
 
 interface DailyLoopArgs {
   readonly config: AppConfig;
+  readonly broker: import("./brokers/broker.js").Broker;
   readonly scanner: PremarketScanner | null;
   readonly llm: LlmClassifier;
   readonly tuner: SelfTuner;
@@ -461,10 +464,11 @@ interface DailyLoopArgs {
   readonly positionMonitor: PositionMonitor;
   readonly refreshAccount: () => Promise<void>;
   readonly notifyStartup: (msg: string) => Promise<void>;
+  readonly telegram: TelegramNotifier;
 }
 
 async function runDailyLoop(args: DailyLoopArgs): Promise<void> {
-  const { config, scanner, llm, tuner, orb, meanReversion, dte0, positionMonitor, refreshAccount, notifyStartup } = args;
+  const { config, scanner, llm, tuner, orb, meanReversion, dte0, positionMonitor, refreshAccount, notifyStartup, broker, telegram } = args;
 
   positionMonitor.start();
   await notifyStartup(`Started. live=${config.liveTrading} orb=${config.orbEnabled} dte0=${config.dte0Enabled}`);
@@ -473,6 +477,7 @@ async function runDailyLoop(args: DailyLoopArgs): Promise<void> {
   // do the work. This loop just orchestrates the daily phase transitions.
   let scannedToday: string | null = null;
   let startedToday: string | null = null;
+  let healthCheckedToday: string | null = null;
 
   // Run forever. Daily phases are gated by ET time.
   while (true) {
@@ -483,6 +488,34 @@ async function runDailyLoop(args: DailyLoopArgs): Promise<void> {
     if (!isWeekdayET()) {
       await sleep(60_000);
       continue;
+    }
+
+    // Pre-open broker health check at 08:50 ET. If the IBKR session is
+    // dead (typically because the daily 24h reset has passed and operator
+    // hasn't re-logged in via browser), fire a CRITICAL Telegram alert
+    // with a one-line playbook. Operator has ~40 min to fix before the
+    // 09:30 ET ORB window opens.
+    if (healthCheckedToday !== today && minsOfDay >= 8 * 60 + 50 && minsOfDay < 9 * 60) {
+      try {
+        const health = await broker.healthCheck();
+        if (!health.ok) {
+          log.error("Pre-open broker health check FAILED", { message: health.message });
+          await telegram.sendAlert(
+            "Gecko: IBKR session dead — re-auth needed before 09:30 ET",
+            `Health: ${health.message}\n\nPlaybook:\n` +
+              `1. ssh -L 5000:localhost:5000 root@<vps-ip>\n` +
+              `2. Browser: https://localhost:5000 → log in → "Client login succeeds"\n` +
+              `3. ssh root@<vps-ip> ; cd ~/project-gecko && npm run auth:ibkr\n` +
+              `4. pm2 restart gecko-bot`,
+          ).catch(() => { /* alert path is best-effort */ });
+        } else {
+          log.info("Pre-open broker health check OK", { message: health.message });
+        }
+        healthCheckedToday = today;
+      } catch (err) {
+        log.error("Pre-open broker health check threw", { error: errMsg(err) });
+        // Don't mark healthCheckedToday — let the next loop iteration retry.
+      }
     }
 
     // Premarket scan window: 09:00-09:25 ET.

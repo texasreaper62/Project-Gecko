@@ -18,6 +18,7 @@ import type {
   Broker,
   BrokerBracketRequest,
   BrokerBracketResult,
+  BrokerHealthStatus,
   BrokerOpenOrder,
   BrokerOrderRequest,
   BrokerOrderStatus,
@@ -150,6 +151,10 @@ export class ShadowBroker implements Broker {
 
   async getOpenOrders(): Promise<readonly BrokerOpenOrder[]> {
     return [];
+  }
+
+  async healthCheck(): Promise<BrokerHealthStatus> {
+    return { ok: true, authenticated: true, connected: true, message: "shadow broker" };
   }
 
   async cancelOrder(orderId: string): Promise<void> {

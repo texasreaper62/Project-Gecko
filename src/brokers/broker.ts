@@ -83,6 +83,17 @@ export interface BrokerPositionSnapshot {
   readonly unrealizedPnl?: number;
 }
 
+// Session/connection health for the pre-open check. `connected` means
+// the broker is reachable. `authenticated` means we can place orders.
+// Both must be true for the bot to operate. `message` is human-readable
+// detail surfaced into the Telegram alert.
+export interface BrokerHealthStatus {
+  readonly ok: boolean;
+  readonly authenticated: boolean;
+  readonly connected: boolean;
+  readonly message: string;
+}
+
 // Snapshot of a working order the broker reports as live. Used for
 // boot-time reconciliation alongside positions.
 export interface BrokerOpenOrder {
@@ -155,6 +166,12 @@ export interface Broker {
   // sees what the broker thinks it holds, not what its local JSONL says.
   getPositions(): Promise<readonly BrokerPositionSnapshot[]>;
   getOpenOrders(): Promise<readonly BrokerOpenOrder[]>;
+
+  // Session-health probe. Used by the pre-open auth check to surface a
+  // dead session via Telegram before market open, giving the operator
+  // time to re-login manually. Returns false + diagnostic message when
+  // a fresh browser login is needed.
+  healthCheck(): Promise<BrokerHealthStatus>;
 
   // Market data
   getOptionChain(q: OptionChainQuery): Promise<NormalizedOptionChain | null>;
