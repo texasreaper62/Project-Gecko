@@ -88,6 +88,15 @@ export interface HistoricalBarsQuery {
   readonly extendedHours?: boolean;
 }
 
+// Runtime guard for call sites that accept either a raw SchwabRest client
+// (legacy data path, richer batch endpoints) or any Broker adapter. SchwabRest
+// has none of these methods, so checking two is unambiguous.
+export function isBroker(x: unknown): x is Broker {
+  return typeof x === "object" && x !== null
+    && typeof (x as Broker).getHistoricalBars === "function"
+    && typeof (x as Broker).placeOrder === "function";
+}
+
 // The shape every broker adapter must satisfy.
 export interface Broker {
   // Lifecycle

@@ -15,6 +15,7 @@
 
 import * as fs from "node:fs";
 import { createLogger } from "../core/logger.js";
+import { isBroker, type Broker } from "../brokers/broker.js";
 import type { AppConfig, EquityInstrument } from "../core/types.js";
 import type { SchwabRest } from "../brokers/schwab/rest.js";
 import type { HistoricalBars } from "../data/historical.js";
@@ -58,9 +59,11 @@ export interface GapCandidate {
 }
 
 export class PremarketScanner {
+  // Quote source is SchwabRest when BROKER=schwab (true batch quotes) or any
+  // Broker adapter otherwise (per-symbol snapshots with a concurrency cap).
   constructor(
     private readonly config: AppConfig,
-    private readonly rest: SchwabRest,
+    private readonly quoteSource: SchwabRest | Broker,
     private readonly historical: HistoricalBars,
   ) {}
 
@@ -148,10 +151,34 @@ export class PremarketScanner {
 
   private async batchQuotes(symbols: readonly string[], chunkSize: number): Promise<Record<string, { quote: { lastPrice: number; totalVolume?: number } }>> {
     const merged: Record<string, { quote: { lastPrice: number; totalVolume?: number } }> = {};
+
+    if (isBroker(this.quoteSource)) {
+      // Broker path: no batch quote endpoint, so fan out per symbol with a
+      // small concurrency cap. Missing quotes just drop out of the universe.
+      const broker = this.quoteSource;
+      const concurrency = 5;
+      let cursor = 0;
+      const worker = async (): Promise<void> => {
+        while (cursor < symbols.length) {
+          const sym = symbols[cursor++];
+          try {
+            const t = await broker.getQuote(sym);
+            if (t && Number.isFinite(t.last) && t.last > 0) {
+              merged[sym.toUpperCase()] = { quote: { lastPrice: t.last, totalVolume: t.volume ?? 0 } };
+            }
+          } catch (err) {
+            log.debug("Broker quote failed", { symbol: sym, error: errMsg(err) });
+          }
+        }
+      };
+      await Promise.all(Array.from({ length: concurrency }, () => worker()));
+      return merged;
+    }
+
     for (let i = 0; i < symbols.length; i += chunkSize) {
       const chunk = symbols.slice(i, i + chunkSize);
       try {
-        const batch = await this.rest.getQuotes(chunk);
+        const batch = await this.quoteSource.getQuotes(chunk);
         for (const [sym, q] of Object.entries(batch)) {
           merged[sym] = q as { quote: { lastPrice: number; totalVolume?: number } };
         }

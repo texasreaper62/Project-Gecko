@@ -2,7 +2,7 @@
 # Bootstrap a fresh Ubuntu 24.04 VPS for project-gecko.
 #
 # Usage (on the VPS, as root or with sudo):
-#   curl -fsSL https://raw.githubusercontent.com/texasreaper62/Project-Gecko/claude/june-trading-strategy-GOVeW/deploy/setup.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/cdayAI/Project-Gecko/main/deploy/setup.sh | bash
 # or after cloning:
 #   bash deploy/setup.sh
 #
@@ -22,8 +22,8 @@
 
 set -euo pipefail
 
-REPO_URL="${REPO_URL:-https://github.com/texasreaper62/Project-Gecko.git}"
-REPO_BRANCH="${REPO_BRANCH:-claude/june-trading-strategy-GOVeW}"
+REPO_URL="${REPO_URL:-https://github.com/cdayAI/Project-Gecko.git}"
+REPO_BRANCH="${REPO_BRANCH:-main}"
 PROJECT_DIR="${PROJECT_DIR:-$HOME/project-gecko}"
 GATEWAY_DIR="${GATEWAY_DIR:-$HOME/clientportal.gw}"
 GATEWAY_URL="${GATEWAY_URL:-https://download2.interactivebrokers.com/portal/clientportal.gw.zip}"

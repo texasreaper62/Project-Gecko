@@ -7,7 +7,7 @@ Should work on any Ubuntu 22.04+ VPS with at least 1 vCPU / 2GB RAM.
 
 ```bash
 # On the VPS (as root or a sudo user):
-curl -fsSL https://raw.githubusercontent.com/texasreaper62/Project-Gecko/claude/june-trading-strategy-GOVeW/deploy/setup.sh | bash
+curl -fsSL https://raw.githubusercontent.com/cdayAI/Project-Gecko/main/deploy/setup.sh | bash
 
 # Then edit secrets:
 cd ~/project-gecko && cp .env.example .env && nano .env
@@ -37,7 +37,7 @@ ssh root@207.246.93.167   # or your IP
 ### 1. Run the bootstrap
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/texasreaper62/Project-Gecko/claude/june-trading-strategy-GOVeW/deploy/setup.sh | bash
+curl -fsSL https://raw.githubusercontent.com/cdayAI/Project-Gecko/main/deploy/setup.sh | bash
 ```
 
 The script installs everything, clones the repo to `~/project-gecko`, builds,

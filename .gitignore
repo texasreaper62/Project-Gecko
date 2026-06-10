@@ -3,6 +3,8 @@ dist/
 .env
 keys/
 logs/
-data/
+# Root-anchored: the runtime JSONL dir only. An unanchored data/ also
+# matched src/data/ and kept the entire data layer out of the repo.
+/data/
 *.log
 .claude/

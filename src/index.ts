@@ -220,15 +220,17 @@ async function main(): Promise<void> {
   const discord = new DiscordNotifier(config.discordWebhookUrl);
 
   // ----- Stream data routing -----
-  // Historical bars + scanner + options-chain currently only have Schwab
-  // backends. When BROKER=ibkr these become no-ops (return null/empty).
-  const historical = schwabRestForScanner ? new HistoricalBars(schwabRestForScanner) : null;
-  const scanner = schwabRestForScanner && historical ? new PremarketScanner(config, schwabRestForScanner, historical) : null;
-  const chainMonitor = schwabRestForScanner ? new OptionsChainMonitor(schwabRestForScanner) : null;
+  // Historical bars + scanner + options-chain prefer the raw Schwab REST
+  // client when BROKER=schwab (batch quotes, full chains) and fall back to
+  // the broker-agnostic adapter otherwise, so Engines A and B run under IBKR.
+  const dataSource = schwabRestForScanner ?? broker;
+  const historical = new HistoricalBars(dataSource);
+  const scanner = new PremarketScanner(config, dataSource, historical);
+  const chainMonitor = new OptionsChainMonitor(dataSource);
   const orb = new OrbStrategy(config, broker);
   orb.setEconomicCalendar(new EconomicCalendar());
   orb.setWalkForward(tuner.getWalkForward());
-  const dte0 = chainMonitor ? new Dte0SpyStrategy(config, broker, chainMonitor) : null;
+  const dte0 = new Dte0SpyStrategy(config, broker, chainMonitor);
   const meanReversion = new MeanReversionStrategy(config, broker, ["SPY", "QQQ"]);
 
   orb.setAccountProvider(() => accountState.current);
