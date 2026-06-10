@@ -7,6 +7,7 @@
 
 import { createLogger } from "../core/logger.js";
 import { etDate } from "../utils/time.js";
+import { isBroker, type Broker, type NormalizedOptionContract } from "../brokers/broker.js";
 import type { OptionInstrument } from "../core/types.js";
 import type { SchwabRest } from "../brokers/schwab/rest.js";
 import type { SchwabOptionContract } from "../brokers/schwab/types.js";
@@ -34,14 +35,20 @@ export interface AtmContract {
 }
 
 export class OptionsChainMonitor {
-  constructor(private readonly rest: SchwabRest) {}
+  // Chain source is SchwabRest when BROKER=schwab (full chain in one call)
+  // or any Broker adapter otherwise (normalized ATM ring).
+  constructor(private readonly source: SchwabRest | Broker) {}
 
   // Fetch today's 0DTE pair for the underlying. If no 0DTE expiration exists
   // (e.g. SPY only lists Mon/Wed/Fri 0DTEs historically; weeklies expanded
   // in 2022; daily for SPY is now universal), returns null.
   async getZeroDtePair(underlyingSymbol: string): Promise<AtmPair | null> {
     const today = etDate();
-    const chain = await this.rest.getOptionChain({
+    if (isBroker(this.source)) {
+      return this.getZeroDtePairViaBroker(this.source, underlyingSymbol, today);
+    }
+    const rest = this.source;
+    const chain = await rest.getOptionChain({
       symbol: underlyingSymbol,
       contractType: "ALL",
       strikeCount: 20,
@@ -79,6 +86,44 @@ export class OptionsChainMonitor {
       expiration: today,
       call: this.toAtmContract(underlyingSymbol, atmCall, "CALL"),
       put: this.toAtmContract(underlyingSymbol, atmPut, "PUT"),
+    };
+  }
+
+  // Broker-interface path (IBKR). The adapter returns an ATM ring of
+  // normalized contracts for the requested window; filter to contracts that
+  // expire today and pick the nearest strike on each side.
+  private async getZeroDtePairViaBroker(
+    broker: Broker,
+    underlyingSymbol: string,
+    today: string,
+  ): Promise<AtmPair | null> {
+    const chain = await broker.getOptionChain({
+      underlying: underlyingSymbol,
+      fromDate: today,
+      toDate: today,
+      contractType: "BOTH",
+    });
+    if (!chain || chain.underlyingPrice <= 0) {
+      log.warn("0DTE chain: no chain or underlying price", { symbol: underlyingSymbol });
+      return null;
+    }
+
+    const calls = chain.calls.filter((c) => c.instrument.expiration === today);
+    const puts = chain.puts.filter((c) => c.instrument.expiration === today);
+    if (calls.length === 0 || puts.length === 0) {
+      log.info("No 0DTE expiration available", { symbol: underlyingSymbol, today });
+      return null;
+    }
+
+    const atmCall = nearestNormalized(calls, chain.underlyingPrice);
+    const atmPut = nearestNormalized(puts, chain.underlyingPrice);
+    if (!atmCall || !atmPut) return null;
+
+    return {
+      underlyingPrice: chain.underlyingPrice,
+      expiration: today,
+      call: normalizedToAtm(atmCall),
+      put: normalizedToAtm(atmPut),
     };
   }
 
@@ -125,6 +170,38 @@ export class OptionsChainMonitor {
       volume: c.totalVolume,
     };
   }
+}
+
+function nearestNormalized(
+  contracts: readonly NormalizedOptionContract[],
+  underlying: number,
+): NormalizedOptionContract | null {
+  let best: NormalizedOptionContract | null = null;
+  let bestDist = Infinity;
+  for (const c of contracts) {
+    if (!Number.isFinite(c.instrument.strike)) continue;
+    const d = Math.abs(c.instrument.strike - underlying);
+    if (d < bestDist) {
+      bestDist = d;
+      best = c;
+    }
+  }
+  return best;
+}
+
+function normalizedToAtm(c: NormalizedOptionContract): AtmContract {
+  return {
+    instrument: c.instrument,
+    mid: c.mid,
+    bid: c.bid,
+    ask: c.ask,
+    delta: c.delta ?? 0,
+    gamma: c.gamma ?? 0,
+    theta: c.theta ?? 0,
+    iv: c.iv ?? 0,
+    openInterest: c.openInterest ?? 0,
+    volume: c.volume ?? 0,
+  };
 }
 
 function nearestStrike(
