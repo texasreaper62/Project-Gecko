@@ -1,6 +1,12 @@
 {
   "name": "gecko",
   "version": "0.2.0",
+  "description": "Automated day-trading bot for US equities and 0DTE options (IBKR Client Portal API, Claude-assisted trade validation)",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/cdayAI/Project-Gecko.git"
+  },
   "private": true,
   "type": "module",
   "main": "dist/index.js",
