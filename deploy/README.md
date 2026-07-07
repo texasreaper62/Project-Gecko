@@ -31,7 +31,7 @@ cd ~/project-gecko && cp .env.example .env && nano .env
 ### 0. SSH into the VPS
 
 ```bash
-ssh root@207.246.93.167   # or your IP
+ssh root@<your-vps-ip>   # or your IP
 ```
 
 ### 1. Run the bootstrap
@@ -66,7 +66,7 @@ IBKR's Gateway requires a browser-based login the first time. Easiest way:
 
 ```bash
 # On your laptop, NOT the VPS:
-ssh -L 5000:localhost:5000 root@207.246.93.167
+ssh -L 5000:localhost:5000 root@<your-vps-ip>
 ```
 
 Leave that terminal open. On the VPS, start the gateway in the foreground:
@@ -94,7 +94,7 @@ that file at startup.
 sudo ufw allow from <your-home-ip> to any port 5000 proto tcp
 ```
 
-Then browse directly to `https://207.246.93.167:5000` from your machine.
+Then browse directly to `https://<your-vps-ip>:5000` from your machine.
 Close the port again after: `sudo ufw delete allow from <your-home-ip> to any port 5000`.
 
 ### 4. Start everything under PM2
@@ -151,7 +151,7 @@ pm2 restart gecko-bot
 - [ ] At least 5 days of LIVE_TRADING=false (dry-run) with signals firing
 - [ ] Telegram alerts arriving on every signal accept/reject
 - [ ] `df -h` shows >5GB free on disk
-- [ ] Auto-backups enabled in Vultr console (you have this)
+- [ ] Auto-backups enabled in your provider's console
 
 ## Troubleshooting
 
@@ -174,9 +174,9 @@ pm2 restart gecko-bot
 
 ## VPS specs notes
 
-Your current Vultr instance: 1 vCPU / 2GB RAM / 55GB SSD / New Jersey.
+Reference instance: 1 vCPU / 2GB RAM / 55GB SSD (Vultr, New Jersey).
 
-For our workload:
+For this workload:
 - **CPU:** plenty. Bot is I/O bound on Claude calls and Schwab/IBKR API.
 - **RAM:** tight. Java IBKR Gateway uses ~400MB, Node.js bot ~250-350MB,
   OS + buffers ~500MB. ~700MB headroom. Watch `free -h` after a week. If
